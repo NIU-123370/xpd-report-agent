@@ -1,38 +1,81 @@
-### 3 分钟了解如何进入开发
+# xpd-report-agent
 
-欢迎使用云效代码管理 Codeup，通过阅读以下内容，你可以快速熟悉 Codeup ，并立即开始今天的工作。
+`xpd-report-agent` 验证 Hermes Agent 通过自定义 `db-query` 插件查询 SQLite 电商
+数据库的完整链路，并提供 FastAPI Wrapper 和静态聊天页面。
 
-### 提交**文件**
+数据库问题遵循以下工具链路：
 
-Codeup 支持两种方式进行代码提交：网页端提交，以及本地 Git 客户端提交。
+```text
+db_get_schema_ddl
+-> db_schema_search
+-> db_get_table_profile
+-> db_get_join_paths
+-> db_validate_sql
+-> db_execute_sql
+```
 
-* 如需体验本地命令行操作，请先安装 Git 工具，安装方法参见[安装Git](https://help.aliyun.com/document_detail/153800.html)。
+## 开发环境
 
-* 如需体验 SSH 方式克隆和提交代码，请先在平台账号内配置 SSH 公钥，配置方法参见[配置 SSH 密钥](https://help.aliyun.com/document_detail/153709.html)。
+项目要求 Python 3.12 和 [uv](https://docs.astral.sh/uv/)。
 
-* 如需体验 HTTP 方式克隆和提交代码，请先在平台账号内配置克隆账密，配置方法参见[配置 HTTPS 克隆账号密码](https://help.aliyun.com/document_detail/153710.html)。
+```bash
+uv sync
+uv run pytest
+uv run ruff check .
+```
 
-现在，你可以在 Codeup 中提交代码文件了，跟着文档「[__提交第一行代码__](https://help.aliyun.com/document_detail/153707.html?spm=a2c4g.153710.0.0.3c213774PFSMIV#6a5dbb1063ai5)」一起操作试试看吧。
+创建并检查示例数据库：
 
-<img src="https://img.alicdn.com/imgextra/i3/O1CN013zHrNR1oXgGu8ccvY_!!6000000005235-0-tps-2866-1268.jpg" width="100%" />
+```bash
+uv run python scripts/create_demo_db.py
+uv run python scripts/inspect_db.py
+```
 
+## 配置
 
-### 进行代码检测
+```bash
+cp configs/local.env.example configs/local.env
+```
 
-开发过程中，为了更好的维护你的代码质量，你可以开启 Codeup 内置开箱即用的「[代码检测服务](https://help.aliyun.com/document_detail/434321.html)」，开启后提交或合并请求的变更将自动触发检测，识别代码编写规范和安全漏洞问题，并及时提供结果报表和修复建议。
+编辑 `configs/local.env`，至少设置 `HERMES_LLM_API_KEY`。进程环境变量优先于配置
+文件；根目录 `.env` 仅作为历史项目兼容入口。
 
-<img src="https://img.alicdn.com/imgextra/i2/O1CN01BRzI1I1IO0CR2i4Aw_!!6000000000882-0-tps-2862-1362.jpg" width="100%" />
+`HERMES_GATEWAY_API_KEY` 是本地 Hermes Gateway 的 bearer token，
+`HERMES_LLM_API_KEY` 是模型供应商密钥，两者用途不同。真实密钥不得提交。
 
-### 开展代码评审
+## 启动
 
-功能开发完毕后，通常你需要发起「[代码评审并执行合并](https://help.aliyun.com/document_detail/153872.html)」，Codeup 支持多人协作的代码评审服务，你可以通过「[保护分支设置合并规则](https://help.aliyun.com/document_detail/153873.html?spm=a2c4g.203108.0.0.430765d1l9tTRR#p-4on-aep-l5q)」策略及「[__合并请求设置__](https://help.aliyun.com/document_detail/153874.html?spm=a2c4g.153871.0.0.3d38686cJpcdJI)」对合并过程进行流程化管控，同时提供在线代码评审及冲突解决能力，让评审过程更加流畅。
+先准备 Hermes 插件、Skill、依赖和配置：
 
-<img src="https://img.alicdn.com/imgextra/i1/O1CN01MaBDFH1WWcGnQqMHy_!!6000000002796-0-tps-2592-1336.jpg" width="100%" />
+```bash
+scripts/services/hermes.sh prepare
+```
 
-### 成员协作
+统一管理 Hermes Gateway 和 FastAPI：
 
-是时候邀请成员一起编写卓越的代码工程了，请点击左下角「成员」邀请你的小伙伴开始协作吧！
+```bash
+scripts/launch.sh start
+scripts/launch.sh status
+scripts/launch.sh restart
+scripts/launch.sh stop
+```
 
-### 更多
+也可以只管理单个服务：
 
-Git 使用教学、高级功能指引等更多说明，参见[Codeup帮助文档](https://help.aliyun.com/document_detail/153402.html)。
+```bash
+scripts/launch.sh start hermes
+scripts/launch.sh start fastapi
+```
+
+启动完成后打开 `http://127.0.0.1:8000/`。
+
+## 目录
+
+- `src/xpd_report_agent/`：应用、Hermes 插件和运行时代码。
+- `configs/`：可提交的配置模板；`local.env` 仅供本地使用。
+- `scripts/`：数据库工具和服务管理入口。
+- `skills/`：Hermes Skill。
+- `tests/`：自动化测试。
+- `docs/prds/`：产品需求文档。
+- `docs/plans/`：设计和实施计划。
+- `docs/archs/`：系统架构和代码说明。

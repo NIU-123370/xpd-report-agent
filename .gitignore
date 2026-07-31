@@ -136,3 +136,16 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# Local editor and operating-system files
+.DS_Store
+.idea/
+*.swp
+*.swo
+
+# xpd-report-agent local runtime state
+configs/local.env
+data/*.sqlite
+!data/.gitkeep
+logs/
+.run/

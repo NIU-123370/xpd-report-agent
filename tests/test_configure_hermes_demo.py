@@ -1,0 +1,84 @@
+from __future__ import annotations
+
+import yaml
+
+from xpd_report_agent.runtime.hermes_config import configure_config
+
+
+def test_configure_config_enables_db_query_for_api_server(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {"enabled": ["other"], "disabled": ["db-query"]},
+                "platform_toolsets": {"cli": ["terminal"]},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = configure_config(config_path, model_config={})
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert result["api_server_toolsets"] == ["db_query"]
+    assert "db-query" in data["plugins"]["enabled"]
+    assert "db-query" not in data["plugins"]["disabled"]
+    assert data["platform_toolsets"]["api_server"] == ["db_query"]
+    assert "db_query" in data["known_plugin_toolsets"]["api_server"]
+
+
+def test_configure_config_writes_model_config_without_leaking_key(tmp_path):
+    config_path = tmp_path / "config.yaml"
+
+    result = configure_config(
+        config_path,
+        model_config={
+            "default": "qwen3.7-max",
+            "provider": "custom",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "api_mode": "chat_completions",
+            "api_key": "secret-key",
+        },
+        require_model_key=True,
+    )
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert result["model_configured"] is True
+    assert data["model"] == {
+        "default": "qwen3.7-max",
+        "provider": "custom",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "api_mode": "chat_completions",
+        "api_key": "secret-key",
+    }
+    assert "secret-key" not in str(result)
+
+
+def test_configure_config_preserves_existing_model_key_when_env_key_empty(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"model": {"api_key": "existing-key"}}, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    configure_config(
+        config_path,
+        model_config={"default": "qwen3.7-max", "api_key": ""},
+        require_model_key=True,
+    )
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert data["model"]["default"] == "qwen3.7-max"
+    assert data["model"]["api_key"] == "existing-key"
+
+
+def test_configure_config_requires_model_key(tmp_path):
+    config_path = tmp_path / "config.yaml"
+
+    try:
+        configure_config(config_path, model_config={"default": "qwen3.7-max"}, require_model_key=True)
+    except RuntimeError as exc:
+        assert "HERMES_LLM_API_KEY" in str(exc)
+    else:
+        raise AssertionError("Expected missing model api_key to fail.")

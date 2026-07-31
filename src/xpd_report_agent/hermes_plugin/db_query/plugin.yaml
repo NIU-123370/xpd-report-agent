@@ -1,0 +1,16 @@
+name: db-query
+version: 0.1.0
+description: SQLite database query tools for Hermes Agent multi-table SQL verification.
+kind: standalone
+pip_dependencies:
+  - sqlglot>=25.0.0
+  - pyyaml>=6.0.0
+provides_tools:
+  - db_get_schema_ddl
+  - db_schema_search
+  - db_get_table_profile
+  - db_get_join_paths
+  - db_validate_sql
+  - db_execute_sql
+requires_env:
+  - HERMES_DEMO_SQLITE_PATH

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>xpd-report-agent</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace" aria-label="xpd-report-agent">
+        <aside class="sidebar">
+          <div class="brand">
+            <div class="mark" aria-hidden="true">H</div>
+            <div>
+              <h1>xpd-report-agent</h1>
+              <p id="statusText">Checking</p>
+            </div>
+          </div>
+
+          <div class="examples" aria-label="Example questions">
+            <button type="button" data-example="最近30天每个品牌的GMV是多少？">品牌 GMV</button>
+            <button type="button" data-example="最近30天各类目的GMV和订单数是多少？">类目表现</button>
+            <button type="button" data-example="最近30天各渠道的GMV、订单数和客单价是多少？">渠道分析</button>
+            <button type="button" data-example="最近60天各品牌的退款金额和退款率是多少？">退款率</button>
+            <button type="button" data-example="最近90天复购客户数和复购率是多少？">复购客户</button>
+          </div>
+
+          <label class="toggle">
+            <input id="streamToggle" type="checkbox" checked />
+            <span>Streaming</span>
+          </label>
+        </aside>
+
+        <section class="chat-panel">
+          <div id="messages" class="messages" aria-live="polite"></div>
+
+          <form id="chatForm" class="composer">
+            <textarea
+              id="messageInput"
+              rows="2"
+              placeholder="输入数据问题"
+              autocomplete="off"
+            ></textarea>
+            <button id="sendButton" type="submit" aria-label="Send">
+              <span aria-hidden="true">→</span>
+            </button>
+          </form>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
