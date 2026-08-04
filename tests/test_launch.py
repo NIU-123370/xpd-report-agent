@@ -20,7 +20,11 @@ def test_normalize_env_derives_gateway_and_fastapi_variables(tmp_path):
             "HERMES_GATEWAY_HOST": "127.0.0.2",
             "HERMES_GATEWAY_PORT": "9000",
             "HERMES_GATEWAY_API_KEY": "gateway-secret",
-            "HERMES_DEMO_SQLITE_PATH": "data/demo.sqlite",
+            "MYSQL_HOST": "127.0.0.2",
+            "MYSQL_PORT": "3307",
+            "MYSQL_USER": "report_reader",
+            "MYSQL_PASSWORD": "mysql-secret",
+            "MYSQL_DATABASE": "reports",
         },
         root=tmp_path,
     )
@@ -29,9 +33,11 @@ def test_normalize_env_derives_gateway_and_fastapi_variables(tmp_path):
     assert config.env["API_SERVER_PORT"] == "9000"
     assert config.env["API_SERVER_KEY"] == "gateway-secret"
     assert config.env["LAUNCH_MANAGED"] == "true"
-    assert config.env["HERMES_DEMO_SQLITE_PATH"] == str(
-        (tmp_path / "data/demo.sqlite").resolve()
-    )
+    assert config.env["MYSQL_HOST"] == "127.0.0.2"
+    assert config.env["MYSQL_PORT"] == "3307"
+    assert config.env["MYSQL_USER"] == "report_reader"
+    assert config.env["MYSQL_PASSWORD"] == "mysql-secret"
+    assert config.env["MYSQL_DATABASE"] == "reports"
 
 
 def test_normalize_env_does_not_map_legacy_variables(tmp_path):

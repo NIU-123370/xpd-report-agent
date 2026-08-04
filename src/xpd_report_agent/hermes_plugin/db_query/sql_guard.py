@@ -5,7 +5,7 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
-from .db import connect_readonly, load_schema
+from .db import connect_readonly, get_mysql_config, load_schema
 
 FORBIDDEN_NODE_TYPES = tuple(
     getattr(exp, name)
@@ -35,7 +35,7 @@ def validate_sql(sql: str) -> dict[str, Any]:
         return {"ok": False, "error": "SQL is empty"}
 
     try:
-        parsed = sqlglot.parse(clean_sql, read="sqlite")
+        parsed = sqlglot.parse(clean_sql, read="mysql")
     except Exception as exc:
         return {"ok": False, "error": f"SQL parse error: {exc}"}
 
@@ -78,7 +78,7 @@ def validate_sql(sql: str) -> dict[str, Any]:
     return {
         "ok": True,
         "used_tables": sorted(table_check["used_tables"]),
-        "normalized_sql": tree.sql(dialect="sqlite", pretty=True),
+        "normalized_sql": tree.sql(dialect="mysql", pretty=True),
         "explain": explain.get("plan", []),
     }
 
@@ -115,13 +115,14 @@ def _check_tables(tree: exp.Expression) -> dict[str, Any]:
     cte_names = {cte.alias_or_name for cte in tree.find_all(exp.CTE) if cte.alias_or_name}
 
     used_tables = set()
+    database = get_mysql_config()["database"]
     invalid_qualified_tables = []
     for table in tree.find_all(exp.Table):
         table_name = table.name
         if not table_name:
             continue
-        if table.db and table.db not in {"main"}:
-            invalid_qualified_tables.append(table.sql(dialect="sqlite"))
+        if table.db and table.db != database:
+            invalid_qualified_tables.append(table.sql(dialect="mysql"))
         if table_name not in cte_names:
             used_tables.add(table_name)
 
@@ -145,7 +146,9 @@ def explain_query(sql: str) -> dict[str, Any]:
     conn = None
     try:
         conn = connect_readonly()
-        rows = conn.execute(f"EXPLAIN QUERY PLAN {sql.strip().rstrip(';')}").fetchall()
+        with conn.cursor() as cursor:
+            cursor.execute(f"EXPLAIN {sql.strip().rstrip(';')}")
+            rows = cursor.fetchall()
         return {
             "ok": True,
             "plan": [dict(r) for r in rows],
@@ -153,7 +156,7 @@ def explain_query(sql: str) -> dict[str, Any]:
     except Exception as exc:
         return {
             "ok": False,
-            "error": f"SQLite EXPLAIN failed: {exc}",
+            "error": f"MySQL EXPLAIN failed: {exc}",
         }
     finally:
         if conn:
@@ -167,4 +170,4 @@ def clamp_max_rows(max_rows: int) -> int:
 def wrap_with_limit(sql: str, max_rows: int) -> str:
     clean_sql = sql.strip().rstrip(";")
     safe_max_rows = clamp_max_rows(max_rows)
-    return f"SELECT * FROM ({clean_sql}) AS _hermes_sqlite_query LIMIT {safe_max_rows + 1}"
+    return f"SELECT * FROM ({clean_sql}) AS _hermes_mysql_query LIMIT {safe_max_rows + 1}"

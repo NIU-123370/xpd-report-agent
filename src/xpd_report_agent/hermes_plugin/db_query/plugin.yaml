@@ -1,10 +1,11 @@
 name: db-query
 version: 0.1.0
-description: SQLite database query tools for Hermes Agent multi-table SQL verification.
+description: MySQL report database query tools for Hermes Agent multi-table SQL verification.
 kind: standalone
 pip_dependencies:
   - sqlglot>=25.0.0
   - pyyaml>=6.0.0
+  - pymysql>=1.1.0
 provides_tools:
   - db_get_schema_ddl
   - db_schema_search
@@ -13,4 +14,8 @@ provides_tools:
   - db_validate_sql
   - db_execute_sql
 requires_env:
-  - HERMES_DEMO_SQLITE_PATH
+  - MYSQL_HOST
+  - MYSQL_PORT
+  - MYSQL_USER
+  - MYSQL_PASSWORD
+  - MYSQL_DATABASE

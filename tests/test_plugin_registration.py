@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import yaml
 
-from xpd_report_agent.hermes_plugin.db_query import register, schemas, tools
+from xpd_report_agent.hermes_plugin.db_query import (
+    MYSQL_REQUIRED_ENV,
+    register,
+    schemas,
+    tools,
+)
 
 
 class FakeContext:
@@ -25,7 +30,7 @@ def test_register_includes_schema_ddl_tool():
     entry = next(item for item in ctx.tools if item["name"] == "db_get_schema_ddl")
     assert entry["schema"] == schemas.DB_GET_SCHEMA_DDL
     assert entry["handler"] == tools.db_get_schema_ddl
-    assert entry["requires_env"] == ["HERMES_DEMO_SQLITE_PATH"]
+    assert entry["requires_env"] == MYSQL_REQUIRED_ENV
 
 
 def test_plugin_manifest_lists_schema_ddl_first():

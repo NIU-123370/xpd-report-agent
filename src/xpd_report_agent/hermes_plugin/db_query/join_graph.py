@@ -86,8 +86,8 @@ def find_join_paths(tables: list[str]) -> dict[str, Any]:
         "ok": True,
         "join_paths": paths,
         "guidance": [
-            "一对多 JOIN 后统计订单数时，应使用 COUNT(DISTINCT orders.order_id)。",
-            "统计 GMV 时优先从 order_items 聚合。",
-            "退款与订单明细直接 JOIN 可能导致重复，需要注意退款粒度。",
+            "场次商品表通过 live_session_id 关联场次结束汇总表。",
+            "场次结束汇总表是一场一行；JOIN 商品明细后场次指标会重复，必须先聚合商品或避免重复求和。",
+            "商品日表与场次商品表可按 item_id 和直播日期做分析关联，但不是严格外键关系。",
         ],
     }

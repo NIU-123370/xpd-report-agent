@@ -27,13 +27,19 @@ export FASTAPI_HOST="${FASTAPI_HOST:-127.0.0.1}"
 export FASTAPI_PORT="${FASTAPI_PORT:-8000}"
 export FASTAPI_RELOAD="${FASTAPI_RELOAD:-false}"
 
+PROJECT_PYTHON="${PROJECT_PYTHON:-$ROOT/.venv/bin/python}"
+if [ ! -x "$PROJECT_PYTHON" ]; then
+  echo "Project Python was not found: $PROJECT_PYTHON" >&2
+  exit 1
+fi
+
 if [ "$FASTAPI_RELOAD" = "true" ]; then
-  exec uv run uvicorn xpd_report_agent.api.main:app \
+  exec "$PROJECT_PYTHON" -m uvicorn xpd_report_agent.api.main:app \
     --reload \
     --host "$FASTAPI_HOST" \
     --port "$FASTAPI_PORT"
 fi
 
-exec uv run uvicorn xpd_report_agent.api.main:app \
+exec "$PROJECT_PYTHON" -m uvicorn xpd_report_agent.api.main:app \
   --host "$FASTAPI_HOST" \
   --port "$FASTAPI_PORT"

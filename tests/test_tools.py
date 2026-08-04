@@ -9,44 +9,105 @@ def decode(payload: str) -> dict:
     return json.loads(payload)
 
 
-def test_db_get_schema_ddl_tool_returns_ddl_relationships_and_metrics(demo_db_path):
+class FakeCursor:
+    def __init__(self, rows):
+        self.rows = rows
+        self.sql = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sql = sql
+
+    def fetchall(self):
+        return self.rows
+
+
+class FakeConnection:
+    def __init__(self, rows):
+        self.rows = rows
+        self.closed = False
+
+    def cursor(self):
+        return FakeCursor(self.rows)
+
+    def close(self):
+        self.closed = True
+
+
+def test_db_get_schema_ddl_returns_mysql_tables_relationships_and_metrics(
+    report_schema, monkeypatch
+):
+    monkeypatch.setattr(
+        tools,
+        "get_schema_ddl",
+        lambda: (
+            "CREATE TABLE `tb_live_goods_daily_stats` (...);\n"
+            "CREATE TABLE `tb_session_endtime_stats` (...);"
+        ),
+    )
+
     result = decode(tools.db_get_schema_ddl({}))
 
     assert result["ok"] is True
-    assert "CREATE TABLE customers" in result["ddl"]
-    assert "CREATE TABLE orders" in result["ddl"]
-    assert "CREATE TABLE refunds" in result["ddl"]
-    assert "orders.customer_id = customers.customer_id" in result["relationships"]
-    assert "order_items.product_id = products.product_id" in result["relationships"]
-    assert result["metrics"]["GMV"] == "SUM(order_items.quantity * order_items.unit_price)"
-    assert "退款率" in result["metrics"]
+    assert "tb_live_goods_daily_stats" in result["ddl"]
+    assert "tb_session_endtime_stats" in result["ddl"]
+    assert (
+        "tb_live_goods_session_stats.live_session_id = "
+        "tb_session_endtime_stats.live_session_id"
+    ) in result["relationships"]
+    assert result["metrics"]["成交金额"] == "SUM(pay_amt)"
 
 
-def test_db_schema_search_tool_returns_json(demo_db_path):
-    result = decode(tools.db_schema_search({"question": "按城市统计最近30天的订单数和GMV"}))
+def test_db_schema_search_returns_taobao_report_tables(report_schema):
+    result = decode(tools.db_schema_search({"question": "按天查看商品销售额趋势"}))
 
     assert result["ok"] is True
-    assert result["tables"]
-    assert any(item["table"] == "customers" for item in result["tables"])
+    assert any(
+        item["table"] == "tb_live_goods_daily_stats" for item in result["tables"]
+    )
 
 
-def test_db_get_table_profile_includes_samples(demo_db_path):
+def test_db_get_table_profile_includes_samples(report_schema, monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "get_sample_rows",
+        lambda table, limit=3: [{"live_session_id": "session-1", "pay_amt": "100.00"}],
+    )
+
     result = decode(
         tools.db_get_table_profile(
-            {"tables": ["orders", "customers"], "include_samples": True}
+            {"tables": ["tb_session_endtime_stats"], "include_samples": True}
         )
     )
 
     assert result["ok"] is True
-    assert result["tables"]["orders"]["ok"] is True
-    assert result["tables"]["orders"]["sample_rows"]
+    profile = result["tables"]["tb_session_endtime_stats"]
+    assert profile["ok"] is True
+    assert profile["sample_rows"]
 
 
-def test_db_execute_sql_revalidates_and_truncates(demo_db_path):
+def test_db_execute_sql_revalidates_and_truncates(report_schema, monkeypatch):
+    connection = FakeConnection(
+        [
+            {"item_id": "1", "pay_amt": "100.00"},
+            {"item_id": "2", "pay_amt": "80.00"},
+            {"item_id": "3", "pay_amt": "60.00"},
+        ]
+    )
+    monkeypatch.setattr(tools, "connect_readonly", lambda: connection)
+
     result = decode(
         tools.db_execute_sql(
             {
-                "sql": "SELECT customer_id, customer_name FROM customers ORDER BY customer_id",
+                "sql": (
+                    "SELECT item_id, pay_amt FROM tb_live_goods_daily_stats "
+                    "ORDER BY pay_amt DESC"
+                ),
                 "max_rows": 2,
             }
         )
@@ -55,11 +116,14 @@ def test_db_execute_sql_revalidates_and_truncates(demo_db_path):
     assert result["ok"] is True
     assert result["row_count"] == 2
     assert result["truncated"] is True
-    assert result["columns"] == ["customer_id", "customer_name"]
+    assert result["columns"] == ["item_id", "pay_amt"]
+    assert connection.closed is True
 
 
-def test_db_execute_sql_rejects_invalid_sql(demo_db_path):
-    result = decode(tools.db_execute_sql({"sql": "SELECT * FROM customers"}))
+def test_db_execute_sql_rejects_invalid_sql(report_schema):
+    result = decode(
+        tools.db_execute_sql({"sql": "SELECT * FROM tb_live_goods_daily_stats"})
+    )
 
     assert result["ok"] is False
     assert "validation" in result
@@ -72,8 +136,9 @@ def test_sql_tools_report_missing_sqlglot(monkeypatch):
         lambda: (None, tools.SQLGLOT_MISSING_ERROR),
     )
 
-    validate_result = decode(tools.db_validate_sql({"sql": "SELECT customer_id FROM customers"}))
-    execute_result = decode(tools.db_execute_sql({"sql": "SELECT customer_id FROM customers"}))
+    sql = "SELECT item_id FROM tb_live_goods_daily_stats"
+    validate_result = decode(tools.db_validate_sql({"sql": sql}))
+    execute_result = decode(tools.db_execute_sql({"sql": sql}))
 
     assert validate_result["ok"] is False
     assert "sqlglot" in validate_result["error"]

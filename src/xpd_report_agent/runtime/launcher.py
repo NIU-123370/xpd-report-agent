@@ -45,9 +45,24 @@ NEW_ENV_KEYS = {
     "HERMES_LLM_BASE_URL",
     "HERMES_LLM_API_MODE",
     "HERMES_LLM_API_KEY",
-    "HERMES_DEMO_SQLITE_PATH",
+    "MYSQL_HOST",
+    "MYSQL_PORT",
+    "MYSQL_USER",
+    "MYSQL_PASSWORD",
+    "MYSQL_DATABASE",
     "HERMES_BOOTSTRAP_ON_START",
     "HERMES_REQUIRE_LLM_API_KEY",
+    "XPD_SESSION_SIGNING_SECRET",
+    "XPD_SESSION_ENABLED",
+    "XPD_MEMORY_ENABLED",
+    "XPD_PERIODIC_REFLECTION_ENABLED",
+    "XPD_FINAL_REFLECTION_ENABLED",
+    "XPD_REFLECTION_INTERVAL",
+    "XPD_SESSION_IDLE_MINUTES",
+    "XPD_MEMORY_CHAR_LIMIT",
+    "XPD_USER_CHAR_LIMIT",
+    "XPD_MEMORY_CONSOLIDATION_RATIO",
+    "XPD_REFLECTION_STATE_PATH",
     "FASTAPI_HOST",
     "FASTAPI_PORT",
     "FASTAPI_RELOAD",
@@ -66,6 +81,19 @@ DEFAULTS = {
     "HERMES_LLM_API_KEY": "",
     "HERMES_BOOTSTRAP_ON_START": "false",
     "HERMES_REQUIRE_LLM_API_KEY": "true",
+    "XPD_SESSION_ENABLED": "true",
+    "XPD_MEMORY_ENABLED": "true",
+    "XPD_PERIODIC_REFLECTION_ENABLED": "true",
+    "XPD_FINAL_REFLECTION_ENABLED": "true",
+    "XPD_REFLECTION_INTERVAL": "3",
+    "XPD_SESSION_IDLE_MINUTES": "30",
+    "XPD_MEMORY_CHAR_LIMIT": "2200",
+    "XPD_USER_CHAR_LIMIT": "1375",
+    "XPD_MEMORY_CONSOLIDATION_RATIO": "0.8",
+    "MYSQL_HOST": "127.0.0.1",
+    "MYSQL_PORT": "3306",
+    "MYSQL_USER": "root",
+    "MYSQL_DATABASE": "taobao_reports_test",
     "FASTAPI_HOST": "127.0.0.1",
     "FASTAPI_PORT": "8000",
     "FASTAPI_RELOAD": "false",
@@ -124,11 +152,6 @@ def normalize_env(raw_env: dict[str, str], *, root: Path = ROOT) -> RuntimeConfi
 
     for key, value in DEFAULTS.items():
         normalized.setdefault(key, value)
-
-    db_path = Path(normalized.get("HERMES_DEMO_SQLITE_PATH", "data/demo_ecommerce.sqlite")).expanduser()
-    if not db_path.is_absolute():
-        db_path = root / db_path
-    normalized["HERMES_DEMO_SQLITE_PATH"] = str(db_path.resolve())
 
     env = dict(os.environ)
     env.update(normalized)

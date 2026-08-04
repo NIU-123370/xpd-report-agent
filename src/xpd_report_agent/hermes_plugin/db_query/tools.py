@@ -10,12 +10,12 @@ from .join_graph import find_join_paths
 from .schema_index import TABLE_DESCRIPTIONS, search_schema
 
 BUSINESS_METRICS = {
-    "GMV": "SUM(order_items.quantity * order_items.unit_price)",
-    "订单数": "COUNT(DISTINCT orders.order_id)",
-    "有效订单": "orders.status IN ('paid', 'shipped', 'completed')",
-    "支付金额": "SUM(payments.amount), where payments.status = 'success'",
-    "退款金额": "SUM(refunds.refund_amount), where refunds.status = 'success'",
-    "退款率": "退款金额 / GMV",
+    "成交金额": "SUM(pay_amt)",
+    "支付订单数": "SUM(pay_ord_cnt)",
+    "支付买家数": "SUM(pay_byr_cnt)",
+    "退款金额": "SUM(refund_amt)",
+    "退款率": "SUM(refund_amt) / NULLIF(SUM(pay_amt), 0)",
+    "商品支付转化率": "pay_byr_cnt / item_click_uv；优先使用源字段 pay_conversion_rate",
 }
 
 SQLGLOT_MISSING_ERROR = (
@@ -151,7 +151,9 @@ def db_execute_sql(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
         limited_sql = sql_guard.wrap_with_limit(sql, max_rows=max_rows)
         conn = connect_readonly()
         try:
-            rows = conn.execute(limited_sql).fetchall()
+            with conn.cursor() as cursor:
+                cursor.execute(limited_sql)
+                rows = list(cursor.fetchall())
         finally:
             conn.close()
 

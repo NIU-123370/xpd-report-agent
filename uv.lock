@@ -232,6 +232,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pymysql"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c9/bc/1c6a92f385940f727daeecf3bacaf186e03875dff57197801046c583bcf0/pymysql-1.2.0.tar.gz", hash = "sha256:6c7b17ca686988104d7426c27895b455cdeea3e9d3ceb1270f0c3704fead8c33", size = 49021, upload-time = "2026-05-19T08:26:22.302Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/bd/2534e130295c8cfd4f0a2e31623baab7502278f1e97bcfe61db75656a77f/pymysql-1.2.0-py3-none-any.whl", hash = "sha256:62169ce6d5510f08e140c5e7990ee884a9764024e4a9a27b2cc11f1099322ae0", size = 45716, upload-time = "2026-05-19T08:26:20.974Z" },
+]
+
+[[package]]
 name = "pyyaml"
 version = "6.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -338,6 +347,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "pydantic" },
+    { name = "pymysql" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "sqlglot" },
@@ -350,6 +360,7 @@ dev = [
     { name = "ruff" },
 ]
 hermes-plugin = [
+    { name = "pymysql" },
     { name = "pyyaml" },
     { name = "sqlglot" },
 ]
@@ -359,6 +370,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "pymysql", specifier = ">=1.1.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "sqlglot", specifier = ">=25.0.0" },
@@ -371,6 +383,7 @@ dev = [
     { name = "ruff", specifier = ">=0.12.0" },
 ]
 hermes-plugin = [
+    { name = "pymysql", specifier = ">=1.1.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "sqlglot", specifier = ">=25.0.0" },
 ]

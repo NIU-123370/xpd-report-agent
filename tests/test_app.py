@@ -42,7 +42,10 @@ class FakeAsyncClient:
                         {
                             "name": "db_query",
                             "enabled": True,
-                            "tools": app_main.REQUIRED_DB_TOOLS,
+                            "tools": [
+                                *app_main.REQUIRED_DB_TOOLS,
+                                *app_main.REQUIRED_MEMORY_TOOLS,
+                            ],
                         }
                     ],
                 }
@@ -90,7 +93,7 @@ def test_health_reports_missing_key(monkeypatch):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["ok"] is True
+    assert body["ok"] is False
     assert body["hermes_api_key_configured"] is False
     assert body["db_query"]["ok"] is False
 
@@ -108,6 +111,8 @@ def test_health_reports_db_query_tools(monkeypatch):
     assert body["db_query"]["ok"] is True
     assert body["db_query"]["missing_tools"] == []
     assert body["db_query"]["available_tools"] == app_main.REQUIRED_DB_TOOLS
+    assert body["memory"]["ok"] is True
+    assert body["memory"]["available_tools"] == app_main.REQUIRED_MEMORY_TOOLS
 
 
 def test_health_reports_missing_db_query_tools(monkeypatch):

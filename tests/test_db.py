@@ -1,47 +1,53 @@
 from __future__ import annotations
 
-from xpd_report_agent.hermes_plugin.db_query.db import (
-    get_sample_rows,
-    load_schema,
-    quote_ident,
-)
+import pytest
+
+from xpd_report_agent.hermes_plugin.db_query import db
 
 
-def test_load_schema_reads_tables_columns_and_foreign_keys(demo_db_path):
-    schema = load_schema()
+def test_get_mysql_config_reads_connection_environment(monkeypatch):
+    monkeypatch.setenv("MYSQL_HOST", "127.0.0.2")
+    monkeypatch.setenv("MYSQL_PORT", "3307")
+    monkeypatch.setenv("MYSQL_USER", "report_reader")
+    monkeypatch.setenv("MYSQL_PASSWORD", "secret")
+    monkeypatch.setenv("MYSQL_DATABASE", "reports")
 
-    assert set(schema["tables"]) == {
-        "customers",
-        "categories",
-        "products",
-        "orders",
-        "order_items",
-        "payments",
-        "refunds",
+    assert db.get_mysql_config() == {
+        "host": "127.0.0.2",
+        "port": 3307,
+        "user": "report_reader",
+        "password": "secret",
+        "database": "reports",
     }
-    assert schema["tables"]["orders"]["row_count"] > 0
-    assert "order_id" in schema["tables"]["orders"]["primary_key"]
-    assert {
-        "from_table": "orders",
-        "from_column": "customer_id",
-        "to_table": "customers",
-        "to_column": "customer_id",
-    } in schema["foreign_keys"]
 
 
-def test_get_sample_rows_validates_table_names(demo_db_path):
-    rows = get_sample_rows("customers", limit=2)
+def test_get_mysql_config_requires_database(monkeypatch):
+    monkeypatch.delenv("MYSQL_DATABASE", raising=False)
 
-    assert len(rows) == 2
-    assert {"customer_id", "customer_name", "city", "signup_date"} <= set(rows[0])
+    with pytest.raises(RuntimeError, match="MYSQL_DATABASE"):
+        db.get_mysql_config()
 
 
-def test_quote_ident_rejects_unsafe_identifiers():
-    assert quote_ident("order_items") == '"order_items"'
+def test_connect_readonly_uses_dict_cursor_and_read_only_session(monkeypatch):
+    monkeypatch.setenv("MYSQL_DATABASE", "reports")
+    captured = {}
+    connection = object()
 
-    try:
-        quote_ident("orders; drop table orders")
-    except ValueError as exc:
-        assert "Unsafe identifier" in str(exc)
-    else:
-        raise AssertionError("unsafe identifier was accepted")
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return connection
+
+    monkeypatch.setattr(db.pymysql, "connect", fake_connect)
+
+    assert db.connect_readonly() is connection
+    assert captured["database"] == "reports"
+    assert captured["autocommit"] is True
+    assert captured["cursorclass"] is db.DictCursor
+    assert captured["init_command"] == "SET SESSION TRANSACTION READ ONLY"
+
+
+def test_quote_ident_uses_mysql_backticks_and_rejects_unsafe_names():
+    assert db.quote_ident("tb_live_goods_daily_stats") == "`tb_live_goods_daily_stats`"
+
+    with pytest.raises(ValueError, match="Unsafe identifier"):
+        db.quote_ident("reports; drop table reports")

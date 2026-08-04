@@ -5,91 +5,90 @@ from xpd_report_agent.hermes_plugin.db_query.sql_guard import (
     wrap_with_limit,
 )
 
-BRAND_REFUND_SQL = """
-WITH brand_gmv AS (
+SESSION_PRODUCT_SQL = """
+WITH product_sales AS (
     SELECT
-        p.brand_name AS brand_name,
-        COUNT(DISTINCT o.order_id) AS order_count,
-        SUM(oi.quantity * oi.unit_price) AS gmv
-    FROM orders o
-    JOIN order_items oi
-        ON o.order_id = oi.order_id
-    JOIN products p
-        ON oi.product_id = p.product_id
-    WHERE o.order_date >= date('now', '-30 day')
-      AND o.status IN ('paid', 'shipped', 'completed')
-    GROUP BY p.brand_name
-),
-brand_refund AS (
-    SELECT
-        p.brand_name AS brand_name,
-        SUM(r.refund_amount) AS refund_amount
-    FROM refunds r
-    JOIN order_items oi
-        ON r.order_item_id = oi.order_item_id
-    JOIN products p
-        ON oi.product_id = p.product_id
-    JOIN orders o
-        ON r.order_id = o.order_id
-    WHERE o.order_date >= date('now', '-30 day')
-      AND r.status = 'success'
-    GROUP BY p.brand_name
+        live_session_id,
+        item_id,
+        SUM(pay_amt) AS pay_amt
+    FROM tb_live_goods_session_stats
+    WHERE live_start_time >= CURRENT_DATE - INTERVAL 30 DAY
+    GROUP BY live_session_id, item_id
 )
 SELECT
-    g.brand_name,
-    g.order_count,
-    ROUND(g.gmv, 2) AS gmv,
-    ROUND(COALESCE(r.refund_amount, 0), 2) AS refund_amount,
-    ROUND(COALESCE(r.refund_amount, 0) / NULLIF(g.gmv, 0), 4) AS refund_rate
-FROM brand_gmv g
-LEFT JOIN brand_refund r
-    ON g.brand_name = r.brand_name
-ORDER BY g.gmv DESC
+    p.live_session_id,
+    p.item_id,
+    p.pay_amt,
+    s.live_start_time
+FROM product_sales AS p
+JOIN tb_session_endtime_stats AS s
+    ON p.live_session_id = s.live_session_id
+ORDER BY p.pay_amt DESC
 """
 
 
-def test_validate_sql_allows_cte_query_and_tracks_real_tables(demo_db_path):
-    result = validate_sql(BRAND_REFUND_SQL)
+def test_validate_sql_allows_mysql_cte_and_tracks_real_tables(report_schema):
+    result = validate_sql(SESSION_PRODUCT_SQL)
 
     assert result["ok"] is True
-    assert set(result["used_tables"]) == {"orders", "order_items", "products", "refunds"}
+    assert set(result["used_tables"]) == {
+        "tb_live_goods_session_stats",
+        "tb_session_endtime_stats",
+    }
+    assert "INTERVAL '30' DAY" in result["normalized_sql"]
     assert result["explain"]
 
 
-def test_validate_sql_allows_count_star(demo_db_path):
-    result = validate_sql("SELECT COUNT(*) AS customer_count FROM customers")
+def test_validate_sql_allows_count_star(report_schema):
+    result = validate_sql(
+        "SELECT COUNT(*) AS session_count FROM tb_session_endtime_stats"
+    )
 
     assert result["ok"] is True
-    assert result["used_tables"] == ["customers"]
+    assert result["used_tables"] == ["tb_session_endtime_stats"]
 
 
-def test_validate_sql_rejects_select_wildcard(demo_db_path):
-    result = validate_sql("SELECT * FROM orders")
+def test_validate_sql_rejects_select_wildcard(report_schema):
+    result = validate_sql("SELECT * FROM tb_live_goods_daily_stats")
 
     assert result["ok"] is False
     assert "SELECT *" in result["error"]
 
 
-def test_validate_sql_rejects_dml_and_pragma(demo_db_path):
-    delete_result = validate_sql("DELETE FROM orders WHERE order_id = 1")
-    pragma_result = validate_sql("PRAGMA table_info(orders)")
+def test_validate_sql_rejects_dml_and_commands(report_schema):
+    delete_result = validate_sql(
+        "DELETE FROM tb_live_goods_daily_stats WHERE item_id = '1'"
+    )
+    show_result = validate_sql("SHOW TABLES")
 
     assert delete_result["ok"] is False
     assert "Forbidden SQL operation" in delete_result["error"]
-    assert pragma_result["ok"] is False
+    assert show_result["ok"] is False
 
 
-def test_validate_sql_rejects_unknown_tables_and_multiple_statements(demo_db_path):
-    unknown_result = validate_sql("SELECT order_id FROM missing_orders")
-    multi_result = validate_sql("SELECT order_id FROM orders; SELECT customer_id FROM customers")
+def test_validate_sql_rejects_unknown_cross_database_and_multiple_statements(report_schema):
+    unknown_result = validate_sql("SELECT item_id FROM missing_reports")
+    cross_db_result = validate_sql(
+        "SELECT item_id FROM other_database.tb_live_goods_daily_stats"
+    )
+    multi_result = validate_sql(
+        "SELECT item_id FROM tb_live_goods_daily_stats; "
+        "SELECT live_session_id FROM tb_session_endtime_stats"
+    )
 
     assert unknown_result["ok"] is False
     assert "Unknown or disallowed tables" in unknown_result["error"]
+    assert cross_db_result["ok"] is False
+    assert "Cross-database" in cross_db_result["error"]
     assert multi_result["ok"] is False
     assert "Only one SQL statement" in multi_result["error"]
 
 
 def test_wrap_with_limit_clamps_max_rows():
-    limited = wrap_with_limit("SELECT customer_id FROM customers", max_rows=50000)
+    limited = wrap_with_limit(
+        "SELECT item_id FROM tb_live_goods_daily_stats",
+        max_rows=50000,
+    )
 
+    assert "_hermes_mysql_query" in limited
     assert limited.endswith("LIMIT 1001")

@@ -18,7 +18,27 @@
             </div>
           </div>
 
+          <section class="history" aria-label="历史记录">
+            <div class="section-heading">
+              <h2>历史记录</h2>
+              <button id="newChatButton" class="icon-button" type="button" title="新建对话">
+                <span aria-hidden="true">＋</span>
+                <span class="sr-only">新建对话</span>
+              </button>
+            </div>
+            <div id="sessionList" class="session-list" aria-live="polite"></div>
+          </section>
+
+          <button id="memoryViewButton" class="memory-entry" type="button">
+            <span aria-hidden="true">M</span>
+            <span>
+              <strong>Agent 记忆</strong>
+              <small>查看 MEMORY.md / USER.md</small>
+            </span>
+          </button>
+
           <div class="examples" aria-label="Example questions">
+            <p class="section-label">示例问题</p>
             <button type="button" data-example="最近30天每个品牌的GMV是多少？">品牌 GMV</button>
             <button type="button" data-example="最近30天各类目的GMV和订单数是多少？">类目表现</button>
             <button type="button" data-example="最近30天各渠道的GMV、订单数和客单价是多少？">渠道分析</button>
@@ -32,7 +52,18 @@
           </label>
         </aside>
 
-        <section class="chat-panel">
+        <section id="chatPanel" class="chat-panel">
+          <header class="chat-header">
+            <div class="chat-title">
+              <span>当前对话</span>
+              <h2 id="currentSessionTitle">新对话</h2>
+            </div>
+            <div class="chat-actions">
+              <button id="renameChatButton" type="button">重命名</button>
+              <button id="endChatButton" type="button">结束对话</button>
+            </div>
+          </header>
+
           <div id="messages" class="messages" aria-live="polite"></div>
 
           <form id="chatForm" class="composer">
@@ -46,6 +77,26 @@
               <span aria-hidden="true">→</span>
             </button>
           </form>
+        </section>
+
+        <section id="memoryPanel" class="memory-panel" aria-label="Agent 记忆" hidden>
+          <header class="chat-header">
+            <div class="chat-title">
+              <span>Hermes 长期记忆</span>
+              <h2>Agent 记忆文件</h2>
+            </div>
+            <div class="chat-actions">
+              <button id="refreshMemoryButton" type="button">刷新</button>
+              <button id="backToChatButton" type="button">返回对话</button>
+            </div>
+          </header>
+
+          <div class="memory-content">
+            <p class="memory-help">
+              这里原样展示 Hermes 当前使用的两个记忆文件。刷新后可观察反思写入带来的变化。
+            </p>
+            <div id="memoryFiles" class="memory-files" aria-live="polite"></div>
+          </div>
         </section>
       </section>
     </main>

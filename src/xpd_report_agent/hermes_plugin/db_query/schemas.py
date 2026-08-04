@@ -1,6 +1,6 @@
 DB_GET_SCHEMA_DDL = {
     "name": "db_get_schema_ddl",
-    "description": "Get the SQLite demo database DDL and table relationship summary. Call this first, before any other db-query tool, when answering SQLite database questions.",
+    "description": "Get the MySQL report database DDL and table relationship summary. Call this first, before any other db-query tool, when answering MySQL database questions.",
     "parameters": {
         "type": "object",
         "properties": {},
@@ -10,7 +10,7 @@ DB_GET_SCHEMA_DDL = {
 
 DB_SCHEMA_SEARCH = {
     "name": "db_schema_search",
-    "description": "Search relevant SQLite tables, columns, business meanings, and metrics for a natural language database question. Use only after db_get_schema_ddl has been called for the question.",
+    "description": "Search relevant MySQL tables, columns, business meanings, and metrics for a natural language database question. Use only after db_get_schema_ddl has been called for the question.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -30,7 +30,7 @@ DB_SCHEMA_SEARCH = {
 
 DB_GET_TABLE_PROFILE = {
     "name": "db_get_table_profile",
-    "description": "Get metadata for selected SQLite tables, including columns, primary keys, foreign keys, indexes, row counts, and sample rows.",
+    "description": "Get metadata for selected MySQL tables, including columns, primary keys, foreign keys, indexes, row counts, and sample rows.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -50,7 +50,7 @@ DB_GET_TABLE_PROFILE = {
 
 DB_GET_JOIN_PATHS = {
     "name": "db_get_join_paths",
-    "description": "Find join paths between SQLite tables using foreign key metadata.",
+    "description": "Find join paths between MySQL tables using foreign key metadata.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -66,7 +66,7 @@ DB_GET_JOIN_PATHS = {
 
 DB_VALIDATE_SQL = {
     "name": "db_validate_sql",
-    "description": "Validate SQLite SQL before execution. Only safe read-only SELECT queries are allowed.",
+    "description": "Validate MySQL SQL before execution. Only safe read-only SELECT queries are allowed.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -81,7 +81,7 @@ DB_VALIDATE_SQL = {
 
 DB_EXECUTE_SQL = {
     "name": "db_execute_sql",
-    "description": "Execute validated read-only SQLite SQL and return result rows.",
+    "description": "Execute validated read-only MySQL SQL and return result rows.",
     "parameters": {
         "type": "object",
         "properties": {

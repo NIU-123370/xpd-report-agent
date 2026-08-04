@@ -14,6 +14,38 @@ MODEL_ENV_MAP = {
     "api_key": "HERMES_LLM_API_KEY",
 }
 
+API_SERVER_TOOLSETS = ["db_query", "session_search", "memory"]
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def memory_config_from_env() -> dict:
+    periodic_reflection_enabled = _env_bool("XPD_PERIODIC_REFLECTION_ENABLED", True)
+    interval = max(1, _env_int("XPD_REFLECTION_INTERVAL", 3))
+    return {
+        "memory_enabled": _env_bool("XPD_MEMORY_ENABLED", True),
+        "user_profile_enabled": _env_bool("XPD_MEMORY_ENABLED", True),
+        "memory_char_limit": max(256, _env_int("XPD_MEMORY_CHAR_LIMIT", 2200)),
+        "user_char_limit": max(256, _env_int("XPD_USER_CHAR_LIMIT", 1375)),
+        "nudge_interval": interval if periodic_reflection_enabled else 0,
+        "flush_min_turns": interval,
+    }
+
 
 def model_config_from_env() -> dict[str, str]:
     return {
@@ -56,6 +88,7 @@ def configure_config(
     config_path: Path,
     *,
     model_config: dict[str, str] | None = None,
+    memory_config: dict | None = None,
     require_model_key: bool = False,
 ) -> dict:
     config_path = config_path.expanduser().resolve()
@@ -73,12 +106,18 @@ def configure_config(
         plugins["disabled"] = [item for item in disabled if item != "db-query"]
 
     platform_toolsets = data.setdefault("platform_toolsets", {})
-    platform_toolsets["api_server"] = ["db_query"]
+    platform_toolsets["api_server"] = list(API_SERVER_TOOLSETS)
 
     known_plugin_toolsets = data.setdefault("known_plugin_toolsets", {})
     api_server_toolsets = known_plugin_toolsets.setdefault("api_server", [])
     if "db_query" not in api_server_toolsets:
         api_server_toolsets.append("db_query")
+
+    resolved_memory_config = (
+        memory_config if memory_config is not None else memory_config_from_env()
+    )
+    memory = data.setdefault("memory", {})
+    memory.update(resolved_memory_config)
 
     model_configured = _apply_model_config(
         data,
@@ -96,12 +135,13 @@ def configure_config(
         "config_path": str(config_path),
         "plugins_enabled": plugins["enabled"],
         "api_server_toolsets": platform_toolsets["api_server"],
+        "memory": memory,
         "model_configured": model_configured,
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Configure Hermes for the SQLite demo.")
+    parser = argparse.ArgumentParser(description="Configure Hermes for the MySQL report agent.")
     parser.add_argument(
         "--config",
         default="~/.hermes/config.yaml",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import yaml
 
-from xpd_report_agent.runtime.hermes_config import configure_config
+from xpd_report_agent.runtime.hermes_config import API_SERVER_TOOLSETS, configure_config
 
 
 def test_configure_config_enables_db_query_for_api_server(tmp_path):
@@ -21,11 +21,19 @@ def test_configure_config_enables_db_query_for_api_server(tmp_path):
     result = configure_config(config_path, model_config={})
     data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-    assert result["api_server_toolsets"] == ["db_query"]
+    assert result["api_server_toolsets"] == API_SERVER_TOOLSETS
     assert "db-query" in data["plugins"]["enabled"]
     assert "db-query" not in data["plugins"]["disabled"]
-    assert data["platform_toolsets"]["api_server"] == ["db_query"]
+    assert data["platform_toolsets"]["api_server"] == API_SERVER_TOOLSETS
     assert "db_query" in data["known_plugin_toolsets"]["api_server"]
+    assert data["memory"] == {
+        "memory_enabled": True,
+        "user_profile_enabled": True,
+        "memory_char_limit": 2200,
+        "user_char_limit": 1375,
+        "nudge_interval": 3,
+        "flush_min_turns": 3,
+    }
 
 
 def test_configure_config_writes_model_config_without_leaking_key(tmp_path):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Literal
 
@@ -12,6 +14,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from xpd_report_agent.api.prompts import REPORT_SYSTEM_PROMPT
 from xpd_report_agent.paths import PROJECT_ROOT
 
 ROOT = PROJECT_ROOT
@@ -26,6 +29,7 @@ REQUIRED_DB_TOOLS = [
     "db_validate_sql",
     "db_execute_sql",
 ]
+REQUIRED_MEMORY_TOOLS = ["session_search", "memory"]
 
 file_env = {
     **dotenv_values(LEGACY_ENV_PATH),
@@ -35,31 +39,39 @@ for key, value in file_env.items():
     if key and value is not None:
         os.environ.setdefault(key, value)
 
-app = FastAPI(title="xpd-report-agent", version="0.1.0")
+SYSTEM_PROMPT = REPORT_SYSTEM_PROMPT
+
+# Import after local configuration has been loaded into os.environ. The
+# session/reflection module resolves its durable paths lazily from that config.
+from xpd_report_agent.api.memories import (  # noqa: E402
+    router as memories_router,
+)
+from xpd_report_agent.api.sessions import (  # noqa: E402
+    idle_session_sweeper,
+    resume_reflection_jobs,
+)
+from xpd_report_agent.api.sessions import (  # noqa: E402
+    router as sessions_router,
+)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await resume_reflection_jobs()
+    sweeper = asyncio.create_task(idle_session_sweeper(), name="xpd-idle-session-sweeper")
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweeper
+
+
+app = FastAPI(title="xpd-report-agent", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-SYSTEM_PROMPT = """
-你是数据查询验证助手。
-
-当用户提出数据库、报表、销售、订单、商品、客户、支付、退款相关问题时：
-1. 只能通过 db-query 工具理解和查询 SQLite 数据库；
-2. 不要使用 execute_code、terminal、shell、file editing 或 browser 工具；
-3. 第一个工具调用必须是 db_get_schema_ddl；在它返回前，不要调用任何其他工具；
-4. 必须使用 db_schema_search 检索相关表；
-5. 必须使用 db_get_table_profile 获取表结构；
-6. 多表查询必须使用 db_get_join_paths；
-7. 必须生成 SQLite SELECT SQL；
-8. 必须调用 db_validate_sql；
-9. 只有校验通过后才能调用 db_execute_sql；
-10. 不能编造数据库结果。
-
-最终回答包含：
-- 结论
-- 查询假设
-- 结果摘要
-- SQL
-- 注意事项
-""".strip()
+app.include_router(sessions_router)
+app.include_router(memories_router)
 
 
 class ChatMessage(BaseModel):
@@ -148,6 +160,17 @@ def extract_available_db_tools(toolsets_json: dict) -> list[str]:
     return ordered + extras
 
 
+def extract_available_memory_tools(toolsets_json: dict) -> list[str]:
+    tools = set()
+    for toolset in toolsets_json.get("data") or []:
+        if not toolset.get("enabled"):
+            continue
+        for tool_name in toolset.get("tools") or []:
+            if tool_name in REQUIRED_MEMORY_TOOLS:
+                tools.add(tool_name)
+    return [tool_name for tool_name in REQUIRED_MEMORY_TOOLS if tool_name in tools]
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -156,7 +179,7 @@ async def index() -> FileResponse:
 @app.get("/health")
 async def health() -> dict:
     result = {
-        "ok": True,
+        "ok": False,
         "hermes_base_url": hermes_base_url(),
         "hermes_api_key_configured": bool(hermes_api_key()),
         "hermes": {"ok": False, "status_code": None, "error": None},
@@ -168,15 +191,24 @@ async def health() -> dict:
             "toolsets_status_code": None,
             "error": None,
         },
+        "memory": {
+            "ok": False,
+            "required_tools": REQUIRED_MEMORY_TOOLS,
+            "available_tools": [],
+            "missing_tools": REQUIRED_MEMORY_TOOLS,
+            "periodic_reflection_interval": int(os.getenv("XPD_REFLECTION_INTERVAL", "3")),
+            "error": None,
+        },
     }
 
     if not hermes_api_key():
         result["hermes"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
         result["db_query"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
+        result["memory"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
         return result
 
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
             response = await client.get(
                 f"{hermes_base_url()}/health",
                 headers={"Authorization": f"Bearer {hermes_api_key()}"},
@@ -203,11 +235,36 @@ async def health() -> dict:
                 result["db_query"]["ok"] = not missing_tools
                 if missing_tools:
                     result["db_query"]["error"] = "Required db-query tools are not exposed by Hermes API Server."
+
+                available_memory_tools = extract_available_memory_tools(
+                    toolsets_response.json()
+                )
+                missing_memory_tools = [
+                    tool_name
+                    for tool_name in REQUIRED_MEMORY_TOOLS
+                    if tool_name not in available_memory_tools
+                ]
+                result["memory"]["available_tools"] = available_memory_tools
+                result["memory"]["missing_tools"] = missing_memory_tools
+                result["memory"]["ok"] = not missing_memory_tools
+                if missing_memory_tools:
+                    result["memory"]["error"] = (
+                        "Required session_search/memory tools are not exposed by "
+                        "Hermes API Server."
+                    )
             else:
                 result["db_query"]["error"] = toolsets_response.text[:500]
+                result["memory"]["error"] = toolsets_response.text[:500]
     except Exception as exc:
         result["hermes"]["error"] = str(exc)
         result["db_query"]["error"] = str(exc)
+        result["memory"]["error"] = str(exc)
+
+    result["ok"] = bool(
+        result["hermes"]["ok"]
+        and result["db_query"]["ok"]
+        and result["memory"]["ok"]
+    )
 
     return result
 
@@ -218,7 +275,7 @@ async def chat(req: ChatRequest) -> dict:
     payload = build_payload(req, stream=False)
 
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             response = await client.post(
                 f"{hermes_base_url()}/chat/completions",
                 headers={
@@ -258,7 +315,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
     async def events():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 async with client.stream(
                     "POST",
                     f"{hermes_base_url()}/chat/completions",
