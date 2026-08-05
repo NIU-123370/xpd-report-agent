@@ -24,6 +24,10 @@ db_schema_search
 
 项目要求 Python 3.12 和 [uv](https://docs.astral.sh/uv/)。
 
+Hermes Runtime 固定为 `configs/hermes-runtime.lock` 记录的 `v0.19.0`、上游提交
+`a61183b56fdb45b9d2a0f2f6b8482e665ccf702f`。服务准备和启动都会校验版本，生产部署不要直接
+跟随 Hermes `main` 分支；服务器安装命令见 `deploy/systemd/README.md`。
+
 ```bash
 uv sync
 uv run pytest

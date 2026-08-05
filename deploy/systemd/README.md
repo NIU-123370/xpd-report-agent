@@ -24,6 +24,34 @@
 
 ## 2. 准备配置与持久化目录
 
+### 安装锁定的 Hermes Runtime
+
+项目把 Hermes 固定为 `configs/hermes-runtime.lock` 中记录的版本和 Git 提交。不要在服务器上
+直接安装 `main` 分支或运行自动升级。以服务用户执行下面的首次安装：
+
+```bash
+sudo -u xpd-agent -H bash -lc '
+  set -euo pipefail
+  mkdir -p "$HOME/.hermes"
+  git clone https://github.com/NousResearch/hermes-agent.git "$HOME/.hermes/hermes-agent"
+  git -C "$HOME/.hermes/hermes-agent" checkout --detach a61183b56fdb45b9d2a0f2f6b8482e665ccf702f
+  uv venv "$HOME/.hermes/hermes-agent/venv" --python 3.11
+  uv pip install --python "$HOME/.hermes/hermes-agent/venv/bin/python" \
+    -e "$HOME/.hermes/hermes-agent"
+  "$HOME/.hermes/hermes-agent/venv/bin/hermes" --version
+'
+```
+
+期望输出包含 `Hermes Agent v0.19.0` 和 `upstream a61183b5`。Hermes 的准备阶段和每次启动
+都会核对这两个值；版本或提交不一致时服务会拒绝启动。升级 Hermes 时应先在开发环境验证，
+然后只修改锁文件和本段安装提交，并重新执行完整测试。
+
+安装后也可以单独执行只读校验：
+
+```bash
+sudo -u xpd-agent -H /opt/xpd-report-agent/scripts/services/hermes.sh verify
+```
+
 复制 `xpd-report-agent.env.example` 到上表的 `@ENV_FILE@`，填入真实的模型、MySQL、
 OSS 和签名密钥。配置文件建议由 `root` 拥有，权限设为 `0640`，且不要放入 Git。
 

@@ -40,6 +40,15 @@ def _stage_hermes_service(
     script.parent.mkdir(parents=True)
     script.write_text(HERMES_SERVICE_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
 
+    configs_dir = root / "configs"
+    configs_dir.mkdir()
+    (configs_dir / "hermes-runtime.lock").write_text(
+        "HERMES_AGENT_REPOSITORY=https://github.com/NousResearch/hermes-agent.git\n"
+        "HERMES_AGENT_VERSION=0.19.0\n"
+        "HERMES_AGENT_COMMIT=a61183b56fdb45b9d2a0f2f6b8482e665ccf702f\n",
+        encoding="utf-8",
+    )
+
     plugin_dir = root / "src" / "xpd_report_agent" / "hermes_plugin" / "db_query"
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text("name: test\n", encoding="utf-8")
@@ -47,8 +56,6 @@ def _stage_hermes_service(
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("# Test skill\n", encoding="utf-8")
     if local_env is not None:
-        configs_dir = root / "configs"
-        configs_dir.mkdir()
         (configs_dir / "local.env").write_text(local_env, encoding="utf-8")
 
     home = tmp_path / "home"
@@ -57,6 +64,13 @@ def _stage_hermes_service(
     bin_dir.mkdir()
     for name in ("project-python", "hermes-python", "hermes", "uv"):
         _write_command_stub(bin_dir / name)
+    (bin_dir / "hermes").write_text(
+        (bin_dir / "hermes").read_text(encoding="utf-8")
+        + 'if [ "${1:-}" = "--version" ]; then\n'
+        + '  echo "Hermes Agent v0.19.0 (test) · upstream a61183b5"\n'
+        + "fi\n",
+        encoding="utf-8",
+    )
 
     call_log = tmp_path / "calls.log"
     env = os.environ.copy()
@@ -94,6 +108,7 @@ def test_hermes_service_run_does_not_bootstrap_by_default(tmp_path):
     _run_hermes_service(script, env)
 
     assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "hermes|--version",
         "project-python|scripts/configure_hermes.py",
         "hermes|gateway|run|--external-supervisor",
     ]
@@ -106,9 +121,10 @@ def test_hermes_service_run_preserves_explicit_bootstrap(tmp_path):
     _run_hermes_service(script, env)
 
     calls = call_log.read_text(encoding="utf-8").splitlines()
-    assert calls[0].startswith("uv|export|")
-    assert calls[1].startswith("uv|pip|install|")
-    assert calls[2:] == [
+    assert calls[0] == "hermes|--version"
+    assert calls[1].startswith("uv|export|")
+    assert calls[2].startswith("uv|pip|install|")
+    assert calls[3:] == [
         "project-python|scripts/configure_hermes.py",
         "hermes|plugins|enable|db-query",
         "hermes|gateway|run|--external-supervisor",
@@ -126,8 +142,33 @@ def test_hermes_service_process_env_overrides_local_env(tmp_path):
     _run_hermes_service(script, env)
 
     calls = call_log.read_text(encoding="utf-8").splitlines()
-    assert calls[0].startswith("uv|export|")
+    assert calls[0] == "hermes|--version"
+    assert calls[1].startswith("uv|export|")
     assert "hermes|plugins|enable|db-query" in calls
+
+
+def test_hermes_service_rejects_runtime_version_mismatch(tmp_path):
+    script, env, _call_log = _stage_hermes_service(tmp_path)
+    lock_path = script.parents[2] / "configs" / "hermes-runtime.lock"
+    lock_path.write_text(
+        lock_path.read_text(encoding="utf-8").replace(
+            "HERMES_AGENT_VERSION=0.19.0",
+            "HERMES_AGENT_VERSION=9.9.9",
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(script), "verify"],
+        cwd=script.parents[2],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "Hermes version mismatch. Required v9.9.9." in result.stderr
 
 
 def test_normalize_env_derives_gateway_and_fastapi_variables(tmp_path):

@@ -4,6 +4,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
+HERMES_RUNTIME_LOCK="$ROOT/configs/hermes-runtime.lock"
+if [ ! -r "$HERMES_RUNTIME_LOCK" ]; then
+  echo "Hermes runtime lock was not found: $HERMES_RUNTIME_LOCK" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "$HERMES_RUNTIME_LOCK"
+
+if [ -z "${HERMES_AGENT_VERSION:-}" ] || [ -z "${HERMES_AGENT_COMMIT:-}" ]; then
+  echo "Hermes runtime lock is incomplete: $HERMES_RUNTIME_LOCK" >&2
+  exit 1
+fi
+
 if [ "${LAUNCH_MANAGED:-false}" != "true" ]; then
   xpd_inherited_exports="$(export -p)"
   if [ -f "$ROOT/.env" ]; then
@@ -77,6 +90,37 @@ export API_SERVER_PORT="$HERMES_GATEWAY_PORT"
 export API_SERVER_KEY="$HERMES_GATEWAY_API_KEY"
 export GATEWAY_ALLOW_ALL_USERS="$HERMES_GATEWAY_ALLOW_ALL_USERS"
 
+verify_hermes_runtime() {
+  HERMES_BIN="${HERMES_BIN:-$HOME/.hermes/hermes-agent/venv/bin/hermes}"
+  if [ ! -x "$HERMES_BIN" ]; then
+    echo "Hermes executable was not found: $HERMES_BIN" >&2
+    exit 1
+  fi
+
+  hermes_version_output="$("$HERMES_BIN" --version 2>&1)" || {
+    echo "Unable to read the installed Hermes version." >&2
+    exit 1
+  }
+  hermes_commit_short="${HERMES_AGENT_COMMIT%${HERMES_AGENT_COMMIT#????????}}"
+
+  case "$hermes_version_output" in
+    *"Hermes Agent v${HERMES_AGENT_VERSION}"*) ;;
+    *)
+      echo "Hermes version mismatch. Required v${HERMES_AGENT_VERSION}." >&2
+      echo "Installed runtime: $hermes_version_output" >&2
+      exit 1
+      ;;
+  esac
+  case "$hermes_version_output" in
+    *"upstream ${hermes_commit_short}"*) ;;
+    *)
+      echo "Hermes revision mismatch. Required ${HERMES_AGENT_COMMIT}." >&2
+      echo "Installed runtime: $hermes_version_output" >&2
+      exit 1
+      ;;
+  esac
+}
+
 sync_project_assets() {
   mkdir -p "$HOME/.hermes/plugins/db-query" "$HOME/.hermes/skills/db-multitable-query"
   cp -R src/xpd_report_agent/hermes_plugin/db_query/. "$HOME/.hermes/plugins/db-query/"
@@ -118,6 +162,7 @@ prepare_hermes() {
     echo "Hermes executable was not found: $HERMES_BIN" >&2
     exit 1
   fi
+  verify_hermes_runtime
 
   if command -v uv >/dev/null 2>&1; then
     plugin_requirements="$(mktemp -t xpd-report-agent-hermes.XXXXXX)"
@@ -147,6 +192,7 @@ run_hermes() {
   if [ "$HERMES_BOOTSTRAP_ON_START" = "true" ]; then
     prepare_hermes
   else
+    verify_hermes_runtime
     # Code and Skill updates are local assets and must not require a dependency
     # bootstrap or network access before every restart.
     sync_project_assets
@@ -161,6 +207,9 @@ run_hermes() {
 }
 
 case "${1:-run}" in
+  verify)
+    verify_hermes_runtime
+    ;;
   prepare)
     prepare_hermes
     ;;
@@ -168,7 +217,7 @@ case "${1:-run}" in
     run_hermes
     ;;
   *)
-    echo "Usage: $0 [prepare|run]" >&2
+    echo "Usage: $0 [verify|prepare|run]" >&2
     exit 2
     ;;
 esac

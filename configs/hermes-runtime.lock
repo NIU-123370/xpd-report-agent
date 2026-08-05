@@ -1,0 +1,8 @@
+# Reproducible Hermes runtime used by this project.
+#
+# Keep this file as the single source of truth. Deployment scripts must check
+# both the release version and the upstream revision because Hermes is
+# installed from an editable Git checkout.
+HERMES_AGENT_REPOSITORY=https://github.com/NousResearch/hermes-agent.git
+HERMES_AGENT_VERSION=0.19.0
+HERMES_AGENT_COMMIT=a61183b56fdb45b9d2a0f2f6b8482e665ccf702f
