@@ -9,13 +9,28 @@ from typing import Literal
 
 import httpx
 from dotenv import dotenv_values
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from xpd_report_agent.api.agent_capacity import agent_capacity_slot
+from xpd_report_agent.api.error_contract import (
+    REQUEST_ID_HEADER,
+    install_error_contract,
+    request_id_from_header,
+)
 from xpd_report_agent.api.prompts import REPORT_SYSTEM_PROMPT
+from xpd_report_agent.api.service_auth import (
+    authorize_service_request,
+    service_auth_config,
+    service_auth_error_response,
+    service_auth_health,
+)
+from xpd_report_agent.hermes_plugin.db_query.db import connect_readonly
 from xpd_report_agent.paths import PROJECT_ROOT
+from xpd_report_agent.runtime.hermes_clarify import clarify_timeout_seconds
+from xpd_report_agent.runtime.hermes_config import required_memory_tools_from_env
 
 ROOT = PROJECT_ROOT
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -29,26 +44,57 @@ REQUIRED_DB_TOOLS = [
     "db_validate_sql",
     "db_execute_sql",
 ]
-REQUIRED_MEMORY_TOOLS = ["session_search", "memory"]
+REQUIRED_CLARIFY_TOOLS = ["clarify"]
+REQUIRED_REPORT_FILE_TOOLS = ["read_file", "export_report_file"]
 
-file_env = {
-    **dotenv_values(LEGACY_ENV_PATH),
-    **dotenv_values(ENV_PATH),
-}
-for key, value in file_env.items():
-    if key and value is not None:
-        os.environ.setdefault(key, value)
+
+def _load_project_env() -> None:
+    """Load developer env files only outside a managed service runtime."""
+
+    if os.getenv("LAUNCH_MANAGED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    file_env = {
+        **dotenv_values(LEGACY_ENV_PATH),
+        **dotenv_values(ENV_PATH),
+    }
+    for key, value in file_env.items():
+        if key and value is not None:
+            os.environ.setdefault(key, value)
+
+
+_load_project_env()
+
+REQUIRED_MEMORY_TOOLS = required_memory_tools_from_env()
 
 SYSTEM_PROMPT = REPORT_SYSTEM_PROMPT
 
 # Import after local configuration has been loaded into os.environ. The
 # session/reflection module resolves its durable paths lazily from that config.
+from xpd_report_agent.api.analysis_presets import (  # noqa: E402
+    router as analysis_presets_router,
+)
 from xpd_report_agent.api.memories import (  # noqa: E402
     router as memories_router,
 )
+from xpd_report_agent.api.schedules import (  # noqa: E402
+    resume_scheduled_reports,
+    schedules_enabled,
+    shutdown_scheduled_reports,
+)
+from xpd_report_agent.api.schedules import (  # noqa: E402
+    router as schedules_router,
+)
 from xpd_report_agent.api.sessions import (  # noqa: E402
+    agent_run_health,
     idle_session_sweeper,
+    resume_agent_runs,
     resume_reflection_jobs,
+    shutdown_agent_runs,
 )
 from xpd_report_agent.api.sessions import (  # noqa: E402
     router as sessions_router,
@@ -57,21 +103,52 @@ from xpd_report_agent.api.sessions import (  # noqa: E402
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Production systemd enables service authentication explicitly. Fail at
+    # startup instead of silently exposing an API with a missing key.
+    service_auth_config()
     await resume_reflection_jobs()
+    await resume_scheduled_reports()
+    await resume_agent_runs()
     sweeper = asyncio.create_task(idle_session_sweeper(), name="xpd-idle-session-sweeper")
     try:
         yield
     finally:
+        await shutdown_agent_runs()
+        await shutdown_scheduled_reports()
         sweeper.cancel()
         with suppress(asyncio.CancelledError):
             await sweeper
 
 
 app = FastAPI(title="xpd-report-agent", version="0.1.0", lifespan=lifespan)
+install_error_contract(app)
+
+
+@app.middleware("http")
+async def enforce_service_auth(request: Request, call_next):
+    path = request.url.path
+    protected = path.startswith("/api/") and not path.startswith(
+        "/api/internal/scheduled-reports/"
+    )
+    if protected:
+        try:
+            authorize_service_request(request.headers.get("Authorization"))
+        except HTTPException as exc:
+            request_id = getattr(
+                request.state,
+                "request_id",
+                request_id_from_header(request.headers.get(REQUEST_ID_HEADER)),
+            )
+            return service_auth_error_response(exc, request_id=request_id)
+    return await call_next(request)
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 app.include_router(sessions_router)
 app.include_router(memories_router)
+app.include_router(schedules_router)
+app.include_router(analysis_presets_router)
 
 
 class ChatMessage(BaseModel):
@@ -85,10 +162,20 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list)
 
 
+class ReadinessResponse(BaseModel):
+    ok: bool
+    status: Literal["ready", "not_ready"]
+    checks: dict[str, bool]
+
+
 def hermes_base_url() -> str:
+    return f"{hermes_origin()}/v1"
+
+
+def hermes_origin() -> str:
     host = os.getenv("HERMES_GATEWAY_HOST", "127.0.0.1")
     port = os.getenv("HERMES_GATEWAY_PORT", "8642")
-    return f"http://{host}:{port}/v1"
+    return f"http://{host}:{port}"
 
 
 def hermes_api_key() -> str:
@@ -171,6 +258,28 @@ def extract_available_memory_tools(toolsets_json: dict) -> list[str]:
     return [tool_name for tool_name in REQUIRED_MEMORY_TOOLS if tool_name in tools]
 
 
+def extract_available_clarify_tools(toolsets_json: dict) -> list[str]:
+    tools = set()
+    for toolset in toolsets_json.get("data") or []:
+        if not toolset.get("enabled"):
+            continue
+        for tool_name in toolset.get("tools") or []:
+            if tool_name in REQUIRED_CLARIFY_TOOLS:
+                tools.add(tool_name)
+    return [tool_name for tool_name in REQUIRED_CLARIFY_TOOLS if tool_name in tools]
+
+
+def extract_available_report_file_tools(toolsets_json: dict) -> list[str]:
+    tools = set()
+    for toolset in toolsets_json.get("data") or []:
+        if not toolset.get("enabled"):
+            continue
+        for tool_name in toolset.get("tools") or []:
+            if tool_name in REQUIRED_REPORT_FILE_TOOLS:
+                tools.add(tool_name)
+    return [tool_name for tool_name in REQUIRED_REPORT_FILE_TOOLS if tool_name in tools]
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -182,7 +291,9 @@ async def health() -> dict:
         "ok": False,
         "hermes_base_url": hermes_base_url(),
         "hermes_api_key_configured": bool(hermes_api_key()),
+        "service_auth": service_auth_health(),
         "hermes": {"ok": False, "status_code": None, "error": None},
+        "agent_runs": agent_run_health(),
         "db_query": {
             "ok": False,
             "required_tools": REQUIRED_DB_TOOLS,
@@ -199,12 +310,45 @@ async def health() -> dict:
             "periodic_reflection_interval": int(os.getenv("XPD_REFLECTION_INTERVAL", "3")),
             "error": None,
         },
+        "clarify": {
+            "ok": False,
+            "required_tools": REQUIRED_CLARIFY_TOOLS,
+            "available_tools": [],
+            "missing_tools": REQUIRED_CLARIFY_TOOLS,
+            "toolsets_status_code": None,
+            "patch_status_code": None,
+            "timeout_seconds": clarify_timeout_seconds(),
+            "error": None,
+        },
+        "report_files": {
+            "ok": False,
+            "required_tools": REQUIRED_REPORT_FILE_TOOLS,
+            "available_tools": [],
+            "missing_tools": REQUIRED_REPORT_FILE_TOOLS,
+            "toolsets_status_code": None,
+            "patch_status_code": None,
+            "oss": None,
+            "error": None,
+        },
+        "cron": {
+            "ok": not schedules_enabled(),
+            "enabled": schedules_enabled(),
+            "native": True,
+            "timezone": os.getenv("HERMES_TIMEZONE", "Asia/Shanghai"),
+            "patch_status_code": None,
+            "ticker_alive": False,
+            "ticker_interval_seconds": None,
+            "error": None,
+        },
     }
 
     if not hermes_api_key():
         result["hermes"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
         result["db_query"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
         result["memory"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
+        result["clarify"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
+        result["report_files"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
+        result["cron"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
         return result
 
     try:
@@ -223,6 +367,8 @@ async def health() -> dict:
                 headers={"Authorization": f"Bearer {hermes_api_key()}"},
             )
             result["db_query"]["toolsets_status_code"] = toolsets_response.status_code
+            result["clarify"]["toolsets_status_code"] = toolsets_response.status_code
+            result["report_files"]["toolsets_status_code"] = toolsets_response.status_code
             if toolsets_response.is_success:
                 available_tools = extract_available_db_tools(toolsets_response.json())
                 missing_tools = [
@@ -252,39 +398,206 @@ async def health() -> dict:
                         "Required session_search/memory tools are not exposed by "
                         "Hermes API Server."
                     )
+
+                available_clarify_tools = extract_available_clarify_tools(
+                    toolsets_response.json()
+                )
+                missing_clarify_tools = [
+                    tool_name
+                    for tool_name in REQUIRED_CLARIFY_TOOLS
+                    if tool_name not in available_clarify_tools
+                ]
+                result["clarify"]["available_tools"] = available_clarify_tools
+                result["clarify"]["missing_tools"] = missing_clarify_tools
+                if missing_clarify_tools:
+                    result["clarify"]["error"] = (
+                        "Required clarify tool is not exposed by Hermes API Server."
+                    )
+
+                available_report_file_tools = extract_available_report_file_tools(
+                    toolsets_response.json()
+                )
+                missing_report_file_tools = [
+                    tool_name
+                    for tool_name in REQUIRED_REPORT_FILE_TOOLS
+                    if tool_name not in available_report_file_tools
+                ]
+                result["report_files"]["available_tools"] = available_report_file_tools
+                result["report_files"]["missing_tools"] = missing_report_file_tools
+                if missing_report_file_tools:
+                    result["report_files"]["error"] = (
+                        "Required report file tools are not exposed by Hermes API Server."
+                    )
             else:
                 result["db_query"]["error"] = toolsets_response.text[:500]
                 result["memory"]["error"] = toolsets_response.text[:500]
+                result["clarify"]["error"] = toolsets_response.text[:500]
+                result["report_files"]["error"] = toolsets_response.text[:500]
+
+            clarify_response = await client.get(
+                f"{hermes_origin()}/api/clarifications/health",
+                headers={"Authorization": f"Bearer {hermes_api_key()}"},
+            )
+            result["clarify"]["patch_status_code"] = clarify_response.status_code
+            if clarify_response.is_success:
+                clarify_health = clarify_response.json()
+                result["clarify"]["timeout_seconds"] = clarify_health.get(
+                    "timeout_seconds", result["clarify"]["timeout_seconds"]
+                )
+                result["clarify"]["ok"] = bool(
+                    not result["clarify"]["missing_tools"]
+                    and clarify_health.get("ok")
+                    and clarify_health.get("enabled")
+                )
+                if not result["clarify"]["ok"] and result["clarify"]["error"] is None:
+                    result["clarify"]["error"] = (
+                        "Hermes clarify runtime bridge is not ready."
+                    )
+            elif result["clarify"]["error"] is None:
+                result["clarify"]["error"] = clarify_response.text[:500]
+
+            report_file_response = await client.get(
+                f"{hermes_origin()}/api/report-files/health",
+                headers={"Authorization": f"Bearer {hermes_api_key()}"},
+            )
+            result["report_files"]["patch_status_code"] = report_file_response.status_code
+            if report_file_response.is_success:
+                patch_health = report_file_response.json()
+                result["report_files"]["oss"] = patch_health.get("oss")
+                result["report_files"]["ok"] = bool(
+                    not result["report_files"]["missing_tools"]
+                    and patch_health.get("ok")
+                    and patch_health.get("enabled")
+                    and patch_health.get("storage_configured")
+                    and patch_health.get("storage_writable")
+                )
+                if (
+                    not result["report_files"]["ok"]
+                    and result["report_files"]["error"] is None
+                ):
+                    result["report_files"]["error"] = (
+                        "Hermes report file runtime bridge is not ready."
+                    )
+            elif result["report_files"]["error"] is None:
+                result["report_files"]["error"] = report_file_response.text[:500]
+
+            if schedules_enabled():
+                cron_response = await client.get(
+                    f"{hermes_origin()}/api/xpd-cron/health",
+                    headers={"Authorization": f"Bearer {hermes_api_key()}"},
+                )
+                result["cron"]["patch_status_code"] = cron_response.status_code
+                if cron_response.is_success:
+                    cron_health = cron_response.json()
+                    result["cron"].update(
+                        {
+                            "ok": bool(
+                                cron_health.get("ok")
+                                and cron_health.get("enabled")
+                                and cron_health.get("native")
+                            ),
+                            "enabled": True,
+                            "timezone": cron_health.get(
+                                "timezone", result["cron"]["timezone"]
+                            ),
+                            "ticker_alive": bool(cron_health.get("ticker_alive")),
+                            "ticker_interval_seconds": cron_health.get(
+                                "ticker_interval_seconds"
+                            ),
+                        }
+                    )
+                    if not result["cron"]["ok"]:
+                        result["cron"]["error"] = (
+                            "Hermes native cron bridge is not ready."
+                        )
+                else:
+                    result["cron"]["error"] = cron_response.text[:500]
     except Exception as exc:
         result["hermes"]["error"] = str(exc)
         result["db_query"]["error"] = str(exc)
         result["memory"]["error"] = str(exc)
+        result["clarify"]["error"] = str(exc)
+        result["report_files"]["error"] = str(exc)
+        result["cron"]["error"] = str(exc)
 
     result["ok"] = bool(
-        result["hermes"]["ok"]
+        result["service_auth"]["ok"]
+        and result["hermes"]["ok"]
+        and result["agent_runs"]["ok"]
         and result["db_query"]["ok"]
         and result["memory"]["ok"]
+        and result["clarify"]["ok"]
+        and result["report_files"]["ok"]
+        and result["cron"]["ok"]
     )
 
     return result
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest) -> dict:
+def _mysql_readiness_check() -> dict:
+    connection = None
+    try:
+        connection = connect_readonly()
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 AS ready")
+            row = cursor.fetchone()
+        ok = isinstance(row, dict) and row.get("ready") == 1
+        return {
+            "ok": ok,
+            "error": None if ok else "MySQL readiness query returned an unexpected result.",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "MySQL readiness query failed.",
+            "error_type": type(exc).__name__,
+        }
+    finally:
+        if connection is not None:
+            with suppress(Exception):
+                connection.close()
+@app.get(
+    "/ready",
+    response_model=ReadinessResponse,
+    responses={503: {"model": ReadinessResponse, "description": "Service is not ready"}},
+)
+async def ready() -> JSONResponse:
+    """Check that the Agent runtime and its real MySQL connection are ready."""
+
+    runtime, mysql = await asyncio.gather(
+        health(),
+        asyncio.to_thread(_mysql_readiness_check),
+    )
+    checks = {
+        "runtime": bool(runtime.get("ok")),
+        "mysql": bool(mysql.get("ok")),
+    }
+    ok = all(checks.values())
+    payload = {"ok": ok, "status": "ready" if ok else "not_ready", "checks": checks}
+    return JSONResponse(status_code=200 if ok else 503, content=payload)
+
+
+@app.post("/api/chat", deprecated=True)
+async def chat(req: ChatRequest, response: Response) -> dict:
+    response.headers["Deprecation"] = "true"
+    response.headers["Warning"] = (
+        '299 xpd-report-agent "Legacy stateless chat; use the Session or Agent Run API"'
+    )
     key = require_hermes_api_key()
     payload = build_payload(req, stream=False)
 
     try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-            response = await client.post(
-                f"{hermes_base_url()}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            response.raise_for_status()
+        async with agent_capacity_slot():
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                response = await client.post(
+                    f"{hermes_base_url()}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=502,
@@ -308,40 +621,50 @@ async def chat(req: ChatRequest) -> dict:
     }
 
 
-@app.post("/api/chat/stream")
+@app.post("/api/chat/stream", deprecated=True)
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     key = require_hermes_api_key()
     payload = build_payload(req, stream=True)
 
     async def events():
         try:
-            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                async with client.stream(
-                    "POST",
-                    f"{hermes_base_url()}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                ) as response:
-                    if not response.is_success:
-                        body = await response.aread()
-                        yield _sse_error(
-                            {
-                                "message": "Hermes API returned an error.",
-                                "status_code": response.status_code,
-                                "body": body.decode("utf-8", errors="replace")[:2000],
-                            }
-                        )
-                        return
-                    async for chunk in response.aiter_text():
-                        if chunk:
-                            yield chunk
+            async with agent_capacity_slot():
+                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{hermes_base_url()}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                    ) as response:
+                        if not response.is_success:
+                            body = await response.aread()
+                            yield _sse_error(
+                                {
+                                    "message": "Hermes API returned an error.",
+                                    "status_code": response.status_code,
+                                    "body": body.decode("utf-8", errors="replace")[:2000],
+                                }
+                            )
+                            return
+                        async for chunk in response.aiter_text():
+                            if chunk:
+                                yield chunk
         except httpx.HTTPError as exc:
             yield _sse_error({"message": "Hermes API request failed.", "error": str(exc)})
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Deprecation": "true",
+            "Warning": (
+                '299 xpd-report-agent "Legacy stateless chat; use the Session or Agent Run API"'
+            ),
+        },
+    )
 
 
 def _sse_error(payload: dict) -> str:

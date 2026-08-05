@@ -1,0 +1,2271 @@
+from __future__ import annotations
+
+import csv
+import io
+import json
+import math
+import os
+import re
+import shutil
+import threading
+import time
+import unicodedata
+import uuid
+import zipfile
+from datetime import date, datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from .query_results import query_result_registry
+from .report_oss import upload_report_artifact
+
+ARTIFACT_ID_PATTERN = re.compile(r"art_[0-9a-f]{32}")
+ARTIFACT_FILENAME_PATTERN = re.compile(
+    r"art_[0-9a-f]{32}__[^/\\]+\.(?:csv|xlsx|md|pdf|json)", re.I
+)
+SESSION_ID_PATTERN = re.compile(r"xpd_[0-9a-f]{20}_[A-Za-z0-9_]+")
+FILENAME_SEPARATOR = "__"
+SUPPORTED_FORMATS = frozenset({"csv", "xlsx", "markdown", "pdf", "json"})
+ANALYSIS_TYPES = frozenset({"simple", "comparison", "diagnostic"})
+FORMAT_EXTENSIONS = {
+    "csv": ".csv",
+    "xlsx": ".xlsx",
+    "markdown": ".md",
+    "pdf": ".pdf",
+    "json": ".json",
+}
+MEDIA_TYPES = {
+    "csv": "text/csv; charset=utf-8",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "markdown": "text/markdown; charset=utf-8",
+    "pdf": "application/pdf",
+    "json": "application/json; charset=utf-8",
+}
+MAX_TEXT_CHARS = 20_000
+MAX_LIST_ITEMS = 30
+MAX_COLUMNS = 256
+MAX_FILENAME_BYTES = 200
+EXCEL_MAX_CELL_CHARS = 32_767
+EXCEL_MAX_EXACT_INTEGER = 999_999_999_999_999
+EXCEL_ILLEGAL_CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
+
+CHINESE_COLUMN_LABELS = {
+    "caliber": "统计口径",
+    "start_time": "开始时间",
+    "end_time": "结束时间",
+    "session_cnt": "直播场次数",
+    "live_cnt": "直播场次数",
+    "duration_min": "直播时长（分钟）",
+    "total_hours": "总直播时长（小时）",
+    "item_id": "商品ID",
+    "stat_date": "统计日期",
+    "item_title": "商品标题",
+    "item_title_hash": "商品标题哈希",
+    "live_session_id": "直播场次ID",
+    "live_title": "直播标题",
+    "live_start_time": "直播开始时间",
+    "live_end_time": "直播结束时间",
+    "live_duration_min": "直播时长（分钟）",
+    "item_exposure_pv": "商品曝光次数",
+    "item_exposure_uv": "商品曝光人数",
+    "item_click_pv": "商品点击次数",
+    "item_click_uv": "商品点击人数",
+    "item_click_rate": "商品点击率",
+    "channel_exposure_uv": "频道曝光人数",
+    "channel_exposure_pv": "频道曝光次数",
+    "channel_click_uv": "频道点击人数",
+    "channel_click_pv": "频道点击次数",
+    "cover_click_rate": "封面点击率",
+    "is_digital_human_live": "是否数字人直播",
+    "watch_uv": "观看人数",
+    "watch_pv": "观看次数",
+    "watch_total_duration": "总观看时长",
+    "traffic_coupon_cost": "流量券成本",
+    "avg_watch_sec_per_user": "人均观看时长（秒）",
+    "avg_watch_sec_per_view": "次均观看时长（秒）",
+    "peak_online_user_cnt": "最高在线人数",
+    "avg_peak_online": "平均峰值在线人数",
+    "new_fans_cnt": "新增粉丝数",
+    "fan_conversion_rate": "转粉率",
+    "interact_uv": "互动人数",
+    "interact_cnt": "互动次数",
+    "like_uv": "点赞人数",
+    "like_cnt": "点赞次数",
+    "comment_uv": "评论人数",
+    "comment_cnt": "评论次数",
+    "share_uv": "分享人数",
+    "share_cnt": "分享次数",
+    "cart_amt": "加购金额",
+    "cart_byr_cnt": "加购买家数",
+    "cart_cnt": "加购次数",
+    "cart_itm_qty": "加购商品件数",
+    "cart_conversion_rate": "加购转化率",
+    "pay_amt": "成交金额",
+    "gmv": "成交金额（GMV）",
+    "pay_byr_cnt": "支付买家数",
+    "pay_itm_qty": "支付商品件数",
+    "pay_conversion_rate": "支付转化率",
+    "pay_ord_cnt": "支付订单数",
+    "customer_unit_price": "客单价",
+    "avg_customer_price": "平均客单价",
+    "order_unit_price": "订单均价",
+    "item_unit_price": "商品均价",
+    "refund_amt": "退款金额",
+    "refund_byr_cnt": "退款买家数",
+    "refund_itm_qty": "退款商品件数",
+    "refund_ord_cnt": "退款订单数",
+    "refund_byr_rate": "买家退款率",
+    "return_goods_rate": "退货率",
+    "refund_order_rate": "订单退款率",
+    "refund_rate": "金额退款率",
+    "refund_rate_pct": "金额退款率",
+    "item_click_rate_pct": "商品点击率",
+    "pay_conv_rate_pct": "支付转化率",
+    "confirm_amt": "确认收货金额",
+    "confirm_byr_cnt": "确认收货买家数",
+    "confirm_ord_cnt": "确认收货订单数",
+    "confirm_itm_qty": "确认收货商品件数",
+    "subpay_amt": "预售定金金额",
+    "subpay_byr_cnt": "预售定金买家数",
+    "subpay_ord_cnt": "预售定金订单数",
+    "subpay_itm_qty": "预售定金商品件数",
+    "predict_amt": "预计成交金额",
+    "tail_pay_amt": "预售尾款金额",
+    "tail_pay_ord_cnt": "预售尾款订单数",
+    "tail_predict_amt": "预计尾款金额",
+    "subpay_tail_pay_amt": "定金及尾款金额",
+    "subpay_tail_pay_ord_cnt": "定金及尾款订单数",
+    "subpay_tail_predict_amt": "定金及预计尾款金额",
+    "ord_cnt": "下单订单数",
+    "ord_pay_amt": "下单口径成交金额",
+    "ord_pay_ord_cnt": "下单口径支付订单数",
+    "ord_refund_amt": "下单口径退款金额",
+    "ord_refund_ord_cnt": "下单口径退款订单数",
+    "ord_confirm_amt": "下单口径收货金额",
+    "ord_confirm_ord_cnt": "下单口径收货订单数",
+    "pay_refund_amt": "支付口径退款金额",
+    "pay_refund_ord_cnt": "支付口径退款订单数",
+    "pay_confirm_amt": "支付口径收货金额",
+    "pay_confirm_ord_cnt": "支付口径收货订单数",
+    "reward_byr_cnt": "打赏人数",
+    "reward_cnt": "打赏次数",
+    "reward_gift_cnt": "礼物打赏次数",
+    "reward_taohuahua_cnt": "淘花花打赏次数",
+    "reward_rate": "打赏率",
+    "rank": "排名",
+    "ranking": "排名",
+    "row_count": "数据行数",
+    "note": "备注",
+    "=danger": "风险字段",
+}
+
+_export_lock = threading.RLock()
+
+
+EXPORT_REPORT_FILE_SCHEMA = {
+    "name": "export_report_file",
+    "description": (
+        "Generate a downloadable CSV, real XLSX workbook, Markdown, PDF, or JSON business "
+        "report from an exact, short-lived query snapshot. Use only when the user explicitly "
+        "asks to export or download a file. For a pure follow-up export, reuse the most recent "
+        "result_id from this session and do not call any db_* tool again."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "format": {
+                "type": "string",
+                "enum": ["csv", "xlsx", "markdown", "pdf", "json"],
+                "description": (
+                    "Output file format. Use xlsx for an editable workbook, pdf for a "
+                    "fixed-layout business report, or json for system integration."
+                ),
+            },
+            "filename": {
+                "type": "string",
+                "description": "Download filename. The correct extension is added automatically.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Short Chinese report title.",
+            },
+            "result_id": {
+                "type": "string",
+                "description": (
+                    "The opaque result_id returned by a successful db_execute_sql call in this "
+                    "session. It may come from an earlier turn and prevents exporting invented "
+                    "or unexecuted data."
+                ),
+            },
+            "analysis_type": {
+                "type": "string",
+                "enum": ["simple", "comparison", "diagnostic"],
+                "description": (
+                    "Required for XLSX. simple creates a compact query workbook; comparison "
+                    "adds trend/comparison analysis; diagnostic also adds driver analysis. "
+                    "If the user has not chosen and context is ambiguous, ask before exporting."
+                ),
+            },
+            "analysis": {
+                "type": "object",
+                "description": (
+                    "Evidence-backed analysis payload used to build XLSX summary, trend, driver, "
+                    "metric-definition, data-quality, and audit sheets. Never invent missing data."
+                ),
+                "properties": {
+                    "metrics": {"type": "array", "items": {"type": "object"}},
+                    "comparisons": {"type": "array", "items": {"type": "object"}},
+                    "trends": {"type": "array", "items": {"type": "object"}},
+                    "drivers": {"type": "array", "items": {"type": "object"}},
+                    "recommendations": {"type": "array", "items": {"type": "object"}},
+                    "metric_definitions": {"type": "array", "items": {"type": "object"}},
+                    "data_scope": {"type": "object"},
+                    "data_quality": {"type": "object"},
+                },
+                "additionalProperties": False,
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Concise Chinese business conclusion for XLSX/Markdown/PDF/JSON reports."
+                ),
+            },
+            "insights": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Key Chinese business insights supported by the query result.",
+            },
+            "assumptions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Query assumptions and metric definitions.",
+            },
+            "notes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Caveats and usage notes.",
+            },
+        },
+        "required": ["format", "title", "result_id"],
+    },
+}
+
+
+def _json(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def _error(message: Any) -> str:
+    return _json({"ok": False, "error": str(message)})
+
+
+def _bounded_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _storage_root() -> Path:
+    configured = os.getenv("XPD_FILE_STORAGE_PATH", "").strip()
+    if not configured:
+        raise RuntimeError("XPD_FILE_STORAGE_PATH is not configured.")
+    root = Path(configured).expanduser()
+    if not root.is_absolute():
+        raise RuntimeError("XPD_FILE_STORAGE_PATH must be an absolute path.")
+    return root.resolve()
+
+
+def _session_id(session_id: Any, task_id: Any) -> str:
+    for candidate in (session_id, task_id):
+        value = str(candidate or "")
+        if SESSION_ID_PATTERN.fullmatch(value) and "_reflection_" not in value:
+            return value
+    raise ValueError("Report export requires an owned xpd session.")
+
+
+def _exports_dir(session_id: str) -> Path:
+    root = _storage_root()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
+    session_candidate = root / session_id
+    if session_candidate.is_symlink():
+        raise ValueError("Invalid report export session path.")
+    session_root = session_candidate.resolve()
+    if session_root.parent != root:
+        raise ValueError("Invalid report export session path.")
+    session_root.mkdir(exist_ok=True, mode=0o700)
+    os.chmod(session_root, 0o700)
+    exports_candidate = session_root / "exports"
+    if exports_candidate.is_symlink():
+        raise ValueError("Invalid report export directory.")
+    exports_dir = exports_candidate.resolve()
+    if exports_dir.parent != session_root:
+        raise ValueError("Invalid report export directory.")
+    exports_dir.mkdir(exist_ok=True, mode=0o700)
+    os.chmod(exports_dir, 0o700)
+    return exports_dir
+
+
+def _clean_text(value: Any, *, limit: int = MAX_TEXT_CHARS) -> str:
+    text = str(value or "").replace("\x00", "").strip()
+    return text[:limit]
+
+
+def _clean_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        text
+        for item in value[:MAX_LIST_ITEMS]
+        if (text := _clean_text(item, limit=2000))
+    ]
+
+
+def _clean_analysis_type(value: Any, *, required: bool = False) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized and not required:
+        return "simple"
+    if normalized not in ANALYSIS_TYPES:
+        raise ValueError(
+            "analysis_type must be simple, comparison, or diagnostic. "
+            "Ask the user to choose when the XLSX report type is unclear."
+        )
+    return normalized
+
+
+def _clean_analysis_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 4:
+        return None
+    if value is None or isinstance(value, (bool, int, float, Decimal, date, datetime)):
+        return value
+    if isinstance(value, str):
+        return _clean_text(value, limit=4000)
+    if isinstance(value, list):
+        return [
+            cleaned
+            for item in value[:MAX_LIST_ITEMS]
+            if (cleaned := _clean_analysis_value(item, depth=depth + 1)) is not None
+        ]
+    if isinstance(value, dict):
+        cleaned_mapping: dict[str, Any] = {}
+        for raw_key, raw_value in list(value.items())[:MAX_COLUMNS]:
+            key = _clean_text(raw_key, limit=100)
+            if not key:
+                continue
+            cleaned_mapping[key] = _clean_analysis_value(raw_value, depth=depth + 1)
+        return cleaned_mapping
+    return _clean_text(value, limit=4000)
+
+
+def _clean_analysis(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = {
+        "metrics",
+        "comparisons",
+        "trends",
+        "drivers",
+        "recommendations",
+        "metric_definitions",
+        "data_scope",
+        "data_quality",
+    }
+    return {
+        key: _clean_analysis_value(raw_value)
+        for key, raw_value in value.items()
+        if key in allowed
+    }
+
+
+def _sanitize_filename(raw: Any, title: str, output_format: str) -> str:
+    extension = FORMAT_EXTENSIONS[output_format]
+    candidate = _clean_text(raw, limit=180) or title or "经营报告"
+    candidate = unicodedata.normalize("NFKC", Path(candidate).name)
+    candidate = re.sub(r"[\x00-\x1f\x7f/\\:*?\"<>|]+", "_", candidate).strip(" ._")
+    if not candidate:
+        candidate = "经营报告"
+    for known_extension in FORMAT_EXTENSIONS.values():
+        if candidate.lower().endswith(known_extension):
+            candidate = candidate[: -len(known_extension)].rstrip(" ._")
+            break
+    candidate = candidate[:120].rstrip(" ._") or "经营报告"
+    byte_budget = MAX_FILENAME_BYTES - len(extension.encode("utf-8"))
+    encoded = candidate.encode("utf-8")
+    if len(encoded) > byte_budget:
+        candidate = encoded[:byte_budget].decode("utf-8", errors="ignore").rstrip(" ._")
+    candidate = candidate or "经营报告"
+    return f"{candidate}{extension}"
+
+
+def _cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat(sep=" ") if isinstance(value, datetime) else value.isoformat()
+    return str(value)
+
+
+def _column_label(column: str) -> str:
+    raw = str(column).strip()
+    if re.search(r"[\u3400-\u9fff]", raw):
+        return raw
+    normalized = raw.strip("`\"'").lower()
+    if normalized in CHINESE_COLUMN_LABELS:
+        return CHINESE_COLUMN_LABELS[normalized]
+
+    aggregate_prefixes = {
+        "total_": "总",
+        "sum_": "合计",
+        "avg_": "平均",
+        "average_": "平均",
+        "max_": "最高",
+        "min_": "最低",
+    }
+    for prefix, label in aggregate_prefixes.items():
+        if normalized.startswith(prefix):
+            remainder = normalized[len(prefix) :]
+            if remainder in CHINESE_COLUMN_LABELS:
+                return f"{label}{CHINESE_COLUMN_LABELS[remainder]}"
+
+    aggregate_suffixes = {
+        "_total": "合计",
+        "_sum": "合计",
+        "_avg": "平均值",
+        "_average": "平均值",
+        "_max": "最高值",
+        "_min": "最低值",
+    }
+    for suffix, label in aggregate_suffixes.items():
+        if normalized.endswith(suffix):
+            remainder = normalized[: -len(suffix)]
+            if remainder in CHINESE_COLUMN_LABELS:
+                return f"{CHINESE_COLUMN_LABELS[remainder]}{label}"
+
+    return f"数据字段（{raw or '未命名'}）"
+
+
+def _display_columns(columns: list[str]) -> list[str]:
+    labels: list[str] = []
+    counts: dict[str, int] = {}
+    for column in columns:
+        label = _column_label(column)
+        counts[label] = counts.get(label, 0) + 1
+        count = counts[label]
+        labels.append(label if count == 1 else f"{label}（{count}）")
+    return labels
+
+
+def _csv_cell(value: Any) -> str:
+    text = _cell_text(value)
+    if isinstance(value, str) and text.lstrip().startswith(("=", "+", "-", "@")):
+        return f"'{text}"
+    return text
+
+
+def _csv_bytes(columns: list[str], rows: list[dict[str, Any]]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    # SQL aliases can become column names, so headers need the same spreadsheet
+    # formula-injection protection as data cells.
+    writer.writerow([_csv_cell(column) for column in _display_columns(columns)])
+    for row in rows:
+        writer.writerow([_csv_cell(row.get(column)) for column in columns])
+    return output.getvalue().encode("utf-8-sig")
+
+
+def _markdown_cell(value: Any) -> str:
+    return (
+        _cell_text(value)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r\n", "<br>")
+        .replace("\n", "<br>")
+        .replace("\r", "<br>")
+    )
+
+
+def _markdown_list(lines: list[str], heading: str, items: list[str]) -> None:
+    if not items:
+        return
+    lines.extend(("", f"## {heading}", ""))
+    lines.extend(f"- {item}" for item in items)
+
+
+def _markdown_bytes(
+    *,
+    title: str,
+    summary: str,
+    insights: list[str],
+    assumptions: list[str],
+    notes: list[str],
+    sql: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    truncated: bool,
+) -> bytes:
+    lines = [f"# {title}"]
+    if summary:
+        lines.extend(("", "## 经营结论", "", summary))
+    _markdown_list(lines, "关键洞察", insights)
+    lines.extend(("", "## 数据明细", ""))
+    if columns:
+        lines.append("| " + " | ".join(_markdown_cell(column) for column in columns) + " |")
+        lines.append("| " + " | ".join("---" for _ in columns) + " |")
+        lines.extend(
+            "| "
+            + " | ".join(_markdown_cell(row.get(column)) for column in columns)
+            + " |"
+            for row in rows
+        )
+    else:
+        lines.append("（查询结果为空）")
+    if truncated:
+        lines.extend(("", "> 数据达到导出行数上限，本文件仅包含前若干行。"))
+    _markdown_list(lines, "查询假设", assumptions)
+    lines.extend(("", "## 已执行 SQL", ""))
+    lines.extend(f"    {line}" for line in sql.strip().splitlines())
+    _markdown_list(lines, "注意事项", notes)
+    lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _report_timezone() -> ZoneInfo:
+    name = os.getenv("HERMES_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Unknown HERMES_TIMEZONE: {name}") from exc
+
+
+def _xlsx_text(value: Any, *, context: str) -> str:
+    text = _cell_text(value)
+    text = EXCEL_ILLEGAL_CONTROL_PATTERN.sub(
+        lambda match: f"\\x{ord(match.group(0)):02x}",
+        text,
+    )
+    if text.lstrip().startswith(("=", "+", "-", "@")):
+        text = f"'{text}"
+    if len(text) > EXCEL_MAX_CELL_CHARS:
+        raise ValueError(
+            f"{context} contains {len(text)} characters; Excel cells support at most "
+            f"{EXCEL_MAX_CELL_CHARS}. The value was not truncated."
+        )
+    return text
+
+
+def _xlsx_safe_value(
+    value: Any,
+    *,
+    context: str = "XLSX cell",
+    force_text: bool = False,
+) -> Any:
+    """Return an Excel-safe value without silently losing source precision or text."""
+    if value is None:
+        return None
+    if force_text:
+        return _xlsx_text(value, context=context)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(_report_timezone()).replace(tzinfo=None)
+        return value
+    if isinstance(value, date):
+        return value
+    if isinstance(value, int):
+        if abs(value) > EXCEL_MAX_EXACT_INTEGER:
+            return _xlsx_text(value, context=context)
+        return value
+    if isinstance(value, Decimal):
+        if value.is_finite():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError):
+                numeric = math.nan
+            significant_digits = len(value.normalize().as_tuple().digits)
+            if (
+                significant_digits <= 15
+                and math.isfinite(numeric)
+                and Decimal(str(numeric)) == value
+            ):
+                return numeric
+        return _xlsx_text(value, context=context)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _xlsx_text(value, context=context)
+    return _xlsx_text(value, context=context)
+
+
+def _display_width(value: Any) -> int:
+    return sum(2 if re.match(r"[\u3400-\u9fff]", character) else 1 for character in _cell_text(value))
+
+
+def _wrapped_line_count(value: Any, width: float) -> int:
+    available_width = max(1, int(width) - 2)
+    physical_lines = re.split(r"\r\n?|\n", _cell_text(value))
+    return sum(
+        max(1, math.ceil(_display_width(line) / available_width))
+        for line in physical_lines
+    )
+
+
+def _is_identifier_column(column: str) -> bool:
+    raw = str(column).strip("`\"'").strip()
+    normalized = raw.lower()
+    return (
+        normalized == "id"
+        or normalized.endswith("_id")
+        or _column_label(raw).upper().endswith("ID")
+    )
+
+
+def _column_widths(columns: list[str], rows: list[dict[str, Any]]) -> list[float]:
+    widths = []
+    labels = _display_columns(columns)
+    for column, label in zip(columns, labels, strict=True):
+        normalized = str(column).strip("`\"'").lower()
+        longest = _display_width(label)
+        for row in rows[:200]:
+            longest = max(longest, _display_width(row.get(column)))
+        if any(token in normalized for token in ("time", "date")):
+            minimum, maximum = 18, 22
+        elif any(token in normalized for token in ("title", "name", "caliber", "desc")):
+            minimum, maximum = 20, 32
+        elif normalized.endswith("_id"):
+            minimum, maximum = 18, 24
+        elif normalized.endswith(
+            (
+                "_amt",
+                "_amount",
+                "_price",
+                "_cost",
+                "_rate",
+                "_ratio",
+                "_pct",
+                "_percentage",
+                "_cnt",
+                "_count",
+                "_qty",
+                "_pv",
+                "_uv",
+            )
+        ):
+            minimum, maximum = 12, 16
+        else:
+            minimum, maximum = 12, 22
+        widths.append(float(min(maximum, max(minimum, longest + 2))))
+    return widths or [16.0]
+
+
+def _column_number_kinds(columns: list[str]) -> list[str | None]:
+    kinds: list[str | None] = []
+    for column in columns:
+        normalized = str(column).strip("`\"'").lower()
+        label = _column_label(str(column))
+        if _is_identifier_column(str(column)):
+            kinds.append(None)
+        elif normalized.endswith(("_pct", "_percent", "_percentage_point")):
+            kinds.append("percent_point")
+        elif (
+            normalized.endswith(("_rate", "_ratio", "_pct", "_percentage"))
+            or "率" in label
+            or "占比" in label
+        ):
+            kinds.append("percent")
+        elif (
+            normalized.endswith(("_amt", "_amount", "_price", "_cost"))
+            or any(token in label for token in ("金额", "单价", "均价", "成本"))
+        ):
+            kinds.append("currency")
+        elif (
+            normalized.endswith(("_cnt", "_count", "_qty", "_pv", "_uv"))
+            or normalized in {"rank", "ranking", "row_count", "live_duration_min"}
+            or any(token in label for token in ("人数", "次数", "件数", "订单数", "排名"))
+        ):
+            kinds.append("integer")
+        elif normalized in {
+            "total_hours",
+            "duration_hours",
+            "avg_watch_sec_per_user",
+            "avg_watch_sec_per_view",
+        }:
+            kinds.append("decimal")
+        else:
+            kinds.append(None)
+    return kinds
+
+
+def _xlsx_bytes(
+    *,
+    title: str,
+    summary: str,
+    insights: list[str],
+    assumptions: list[str],
+    notes: list[str],
+    sql: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    truncated: bool,
+    analysis_type: str = "simple",
+    analysis: dict[str, Any] | None = None,
+) -> bytes:
+    """Build a controlled, fixed-template report workbook."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.chart import BarChart, LineChart, Reference
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.page import PageMargins
+    except ImportError as exc:  # pragma: no cover - deployment dependency guard
+        raise RuntimeError("XLSX export requires the openpyxl package.") from exc
+
+    navy = "123047"
+    teal = "0F7C80"
+    accent = "0B7285"
+    text_color = "263238"
+    muted = "607D86"
+    light_teal = "E6F3F3"
+    banded = "F7FAFA"
+    border_color = "D5E0E3"
+    warning_fill = "FFF4E5"
+    warning_text = "B45309"
+    blue_fill = "EAF2F8"
+    white = "FFFFFF"
+
+    thin = Side(style="thin", color=border_color)
+    cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    bottom_border = Border(bottom=thin)
+    body_font = Font(name="Arial", size=10, color=text_color)
+    label_font = Font(name="Arial", size=10, bold=True, color=accent)
+    header_font = Font(name="Arial", size=10, bold=True, color=white)
+    title_font = Font(name="Arial", size=18, bold=True, color=white)
+    section_font = Font(name="Arial", size=11, bold=True, color=accent)
+
+    analysis_type = _clean_analysis_type(analysis_type)
+    analysis = dict(analysis or {})
+    metrics = [item for item in analysis.get("metrics", []) if isinstance(item, dict)][:6]
+    comparisons = [
+        item for item in analysis.get("comparisons", []) if isinstance(item, dict)
+    ][:MAX_LIST_ITEMS]
+    trends = [item for item in analysis.get("trends", []) if isinstance(item, dict)][
+        :MAX_LIST_ITEMS
+    ]
+    drivers = [item for item in analysis.get("drivers", []) if isinstance(item, dict)][
+        :MAX_LIST_ITEMS
+    ]
+    recommendations = [
+        item for item in analysis.get("recommendations", []) if isinstance(item, dict)
+    ][:MAX_LIST_ITEMS]
+    metric_definitions = [
+        item for item in analysis.get("metric_definitions", []) if isinstance(item, dict)
+    ][:MAX_LIST_ITEMS]
+    data_scope = analysis.get("data_scope") if isinstance(analysis.get("data_scope"), dict) else {}
+    data_quality = (
+        analysis.get("data_quality")
+        if isinstance(analysis.get("data_quality"), dict)
+        else {}
+    )
+
+    def analysis_label() -> str:
+        return {
+            "simple": "简单查询",
+            "comparison": "对比分析",
+            "diagnostic": "诊断分析",
+        }[analysis_type]
+
+    def record_value(record: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            value = record.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    def display_analysis_value(value: Any) -> Any:
+        if isinstance(value, bool):
+            return "是" if value else "否"
+        if isinstance(value, list):
+            return "、".join(_cell_text(item) for item in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, default=str)
+        return value
+
+    def flatten_mapping(value: dict[str, Any], prefix: str = "") -> list[tuple[str, Any]]:
+        flattened: list[tuple[str, Any]] = []
+        for key, item in value.items():
+            label = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(item, dict):
+                flattened.extend(flatten_mapping(item, label))
+            else:
+                flattened.append((label, display_analysis_value(item)))
+        return flattened[:MAX_COLUMNS]
+
+    field_labels = {
+        "period_start": "统计开始日期",
+        "period_end": "统计结束日期",
+        "timezone": "时区",
+        "grain": "数据粒度",
+        "filters": "筛选条件",
+        "dimensions": "分析维度",
+        "source_tables": "数据表",
+        "deduplication": "去重方式",
+        "freshness.latest": "数据最新日期",
+        "freshness.lag_days": "数据延迟天数",
+        "period_coverage.requested_start": "请求周期开始日期",
+        "period_coverage.requested_end": "请求周期结束日期",
+        "period_coverage.observed_start": "实际数据开始日期",
+        "period_coverage.observed_end": "实际数据结束日期",
+        "period_coverage.covered_days": "已覆盖天数",
+        "period_coverage.expected_days": "应覆盖天数",
+        "period_coverage.coverage_ratio": "周期覆盖率",
+        "period_coverage.complete": "周期是否完整",
+        "small_samples.threshold": "小样本阈值",
+        "dimensions.required": "必要维度",
+        "dimensions.present": "已有维度",
+        "dimensions.missing": "缺失维度",
+        "warnings": "质量警告",
+    }
+
+    def analysis_field_label(key: str) -> str:
+        if key in field_labels:
+            return field_labels[key]
+        if key.startswith("null_counts."):
+            return f"空值数量：{key.removeprefix('null_counts.')}"
+        if key.startswith("zero_denominators."):
+            return f"零分母数量：{key.removeprefix('zero_denominators.')}"
+        if key.startswith("small_samples.columns."):
+            return f"小样本字段：{key.removeprefix('small_samples.columns.')}"
+        return key
+
+    def format_metric_display(value: Any, unit: Any, metric_name: Any = "") -> str:
+        if value is None:
+            return "—"
+        unit_text = _cell_text(unit)
+        is_rate = unit_text in {"%", "百分比", "百分点"} or "率" in _cell_text(metric_name)
+        if (
+            isinstance(value, (int, float, Decimal))
+            and unit_text == "百分点"
+            and abs(float(value)) <= 1
+        ):
+            return f"{float(value) * 100:.2f}个百分点"
+        if isinstance(value, (int, float, Decimal)) and is_rate and abs(float(value)) <= 1:
+            return f"{float(value):.2%}"
+        if isinstance(value, (int, float, Decimal)):
+            return f"{float(value):,.2f}".rstrip("0").rstrip(".") + unit_text
+        return f"{_cell_text(value)}{unit_text}"
+
+    def configure_sheet(worksheet: Any, *, tab_color: str = teal) -> None:
+        worksheet.sheet_properties.tabColor = tab_color
+        worksheet.sheet_view.showGridLines = False
+        worksheet.sheet_view.zoomScale = 90
+        worksheet.sheet_format.defaultRowHeight = 22
+
+    def add_sheet_title(worksheet: Any, heading: str, end_column: int) -> None:
+        worksheet.merge_cells(
+            start_row=1, start_column=1, end_row=1, end_column=end_column
+        )
+        cell = worksheet.cell(1, 1, _xlsx_safe_value(heading, context=f"{heading} title"))
+        cell.font = title_font
+        cell.fill = PatternFill("solid", fgColor=navy)
+        cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        worksheet.row_dimensions[1].height = 40
+
+    def write_table(
+        worksheet: Any,
+        *,
+        start_row: int,
+        headers: list[str],
+        records: list[list[Any]],
+        widths: list[float] | None = None,
+        percent_columns: set[int] | None = None,
+    ) -> int:
+        for column_index, header in enumerate(headers, start=1):
+            cell = worksheet.cell(start_row, column_index, header)
+            cell.font = header_font
+            cell.fill = PatternFill("solid", fgColor=teal)
+            cell.border = cell_border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        worksheet.row_dimensions[start_row].height = 30
+        for row_offset, record in enumerate(records, start=1):
+            row_index = start_row + row_offset
+            for column_index, value in enumerate(record, start=1):
+                safe_value = _xlsx_safe_value(
+                    display_analysis_value(value),
+                    context=f"{worksheet.title} row {row_index}, column {column_index}",
+                )
+                cell = worksheet.cell(row_index, column_index, safe_value)
+                cell.font = body_font
+                cell.fill = PatternFill("solid", fgColor=banded if row_index % 2 else white)
+                cell.border = cell_border
+                cell.alignment = Alignment(
+                    horizontal="right" if isinstance(safe_value, (int, float)) else "left",
+                    vertical="top",
+                    wrap_text=True,
+                )
+                if column_index in (percent_columns or set()) and isinstance(
+                    safe_value, (int, float)
+                ):
+                    cell.number_format = "0.00%"
+                elif isinstance(safe_value, (int, float)) and not isinstance(
+                    safe_value, bool
+                ):
+                    cell.number_format = "#,##0.00"
+            worksheet.row_dimensions[row_index].height = 26
+        for index, width in enumerate(widths or [20.0] * len(headers), start=1):
+            worksheet.column_dimensions[get_column_letter(index)].width = width
+        return start_row + max(1, len(records))
+
+    workbook = Workbook()
+    workbook.iso_dates = True
+    workbook.properties.creator = "xpd-report-agent"
+    workbook.properties.title = title
+    workbook.properties.subject = "直播经营数据分析报告"
+    workbook.properties.description = "由 xpd-report-agent 受控导出器生成"
+
+    summary_sheet = workbook.active
+    summary_sheet.title = "经营摘要"
+    configure_sheet(summary_sheet, tab_color=navy)
+    summary_sheet.freeze_panes = "A5"
+    summary_sheet.sheet_format.defaultRowHeight = 22
+    summary_sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    summary_sheet.page_setup.orientation = "portrait"
+    summary_sheet.page_setup.paperSize = summary_sheet.PAPERSIZE_A4
+    summary_sheet.page_setup.fitToWidth = 1
+    summary_sheet.page_setup.fitToHeight = 0
+    summary_sheet.page_margins = PageMargins(
+        left=0.35,
+        right=0.35,
+        top=0.55,
+        bottom=0.55,
+        header=0.2,
+        footer=0.2,
+    )
+    for index, width in enumerate((18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0), start=1):
+        summary_sheet.column_dimensions[get_column_letter(index)].width = width
+
+    summary_sheet.merge_cells("A1:H1")
+    title_cell = summary_sheet["A1"]
+    title_cell.value = _xlsx_safe_value(title, context="Report title")
+    title_cell.font = title_font
+    title_cell.fill = PatternFill("solid", fgColor=navy)
+    title_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    summary_sheet.row_dimensions[1].height = 40
+
+    generated_at = datetime.now(_report_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+    metadata = (
+        ("生成时间", generated_at),
+        ("数据行数", len(rows)),
+        (
+            "数据状态",
+            "达到导出上限，仅包含前若干行" if truncated else "数据完整，未达到导出上限",
+        ),
+    )
+    for row_index, (label, value) in enumerate(metadata, start=2):
+        summary_sheet.merge_cells(start_row=row_index, start_column=2, end_row=row_index, end_column=8)
+        label_cell = summary_sheet.cell(row=row_index, column=1, value=label)
+        label_cell.font = label_font
+        label_cell.fill = PatternFill("solid", fgColor=light_teal)
+        label_cell.border = bottom_border
+        label_cell.alignment = Alignment(vertical="center", indent=1)
+        value_cell = summary_sheet.cell(
+            row=row_index,
+            column=2,
+            value=_xlsx_safe_value(value, context=f"Summary metadata row {row_index}"),
+        )
+        value_cell.font = Font(
+            name="Arial",
+            size=10,
+            color=warning_text if truncated and row_index == 4 else text_color,
+            bold=truncated and row_index == 4,
+        )
+        value_cell.fill = PatternFill(
+            "solid",
+            fgColor=warning_fill if truncated and row_index == 4 else white,
+        )
+        value_cell.border = bottom_border
+        value_cell.alignment = Alignment(
+            horizontal="left",
+            vertical="center",
+            indent=1,
+        )
+        summary_sheet.row_dimensions[row_index].height = 24
+
+    current_row = 6
+
+    if metrics:
+        summary_sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=8)
+        metric_heading = summary_sheet.cell(current_row, 1, "核心指标")
+        metric_heading.font = section_font
+        metric_heading.fill = PatternFill("solid", fgColor=light_teal)
+        metric_heading.alignment = Alignment(vertical="center", indent=1)
+        summary_sheet.row_dimensions[current_row].height = 28
+        current_row += 1
+        for metric_index, metric in enumerate(metrics):
+            card_column = 1 + (metric_index % 3) * 2
+            card_row = current_row + (metric_index // 3) * 4
+            end_column = card_column + 1
+            summary_sheet.merge_cells(
+                start_row=card_row, start_column=card_column, end_row=card_row, end_column=end_column
+            )
+            name = record_value(metric, "name", "metric") or f"指标{metric_index + 1}"
+            name_cell = summary_sheet.cell(card_row, card_column, _xlsx_safe_value(name, context="Metric name"))
+            name_cell.font = label_font
+            name_cell.fill = PatternFill("solid", fgColor=blue_fill)
+            name_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+            summary_sheet.merge_cells(
+                start_row=card_row + 1,
+                start_column=card_column,
+                end_row=card_row + 1,
+                end_column=end_column,
+            )
+            current_value = record_value(metric, "current_value", "value")
+            unit = record_value(metric, "unit") or ""
+            value_text = format_metric_display(current_value, unit, name)
+            value_cell = summary_sheet.cell(card_row + 1, card_column, _xlsx_safe_value(value_text, context="Metric value"))
+            value_cell.font = Font(name="Arial", size=16, bold=True, color=navy)
+            value_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+            summary_sheet.merge_cells(
+                start_row=card_row + 2,
+                start_column=card_column,
+                end_row=card_row + 2,
+                end_column=end_column,
+            )
+            baseline = record_value(metric, "baseline_value")
+            absolute_change = record_value(metric, "absolute_change")
+            relative_change = record_value(metric, "relative_change")
+            context_parts = []
+            if baseline is not None:
+                context_parts.append(f"基准 {format_metric_display(baseline, unit, name)}")
+            if absolute_change is not None:
+                change_unit = "百分点" if "率" in _cell_text(name) else unit
+                context_parts.append(
+                    f"变化 {format_metric_display(absolute_change, change_unit, name)}"
+                )
+            if relative_change is not None:
+                context_parts.append(f"变化率 {format_metric_display(relative_change, '%', '变化率')}")
+            context_cell = summary_sheet.cell(
+                card_row + 2,
+                card_column,
+                _xlsx_safe_value("｜".join(context_parts) or "暂无对比基准", context="Metric comparison"),
+            )
+            context_cell.font = Font(name="Arial", size=9, color=muted)
+            context_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1, wrap_text=True)
+            for row_number in range(card_row, card_row + 3):
+                for column_number in range(card_column, end_column + 1):
+                    summary_sheet.cell(row_number, column_number).border = cell_border
+        current_row += math.ceil(len(metrics) / 3) * 4
+
+    def add_summary_section(heading: str, values: list[str], *, bullets: bool) -> None:
+        nonlocal current_row
+        if not values:
+            return
+        summary_sheet.merge_cells(
+            start_row=current_row,
+            start_column=1,
+            end_row=current_row,
+            end_column=8,
+        )
+        heading_cell = summary_sheet.cell(row=current_row, column=1, value=heading)
+        heading_cell.font = section_font
+        heading_cell.fill = PatternFill("solid", fgColor=light_teal)
+        heading_cell.border = bottom_border
+        heading_cell.alignment = Alignment(vertical="center", indent=1)
+        summary_sheet.row_dimensions[current_row].height = 28
+        current_row += 1
+
+        for value in values:
+            display_value = f"• {value}" if bullets else value
+            summary_sheet.merge_cells(
+                start_row=current_row,
+                start_column=1,
+                end_row=current_row,
+                end_column=8,
+            )
+            content_cell = summary_sheet.cell(
+                row=current_row,
+                column=1,
+                value=_xlsx_safe_value(
+                    display_value,
+                    context=f"Summary content row {current_row}",
+                ),
+            )
+            content_cell.font = body_font
+            content_cell.border = bottom_border
+            content_cell.alignment = Alignment(
+                horizontal="left",
+                vertical="top",
+                wrap_text=True,
+                indent=1,
+            )
+            estimated_lines = _wrapped_line_count(display_value, 94)
+            summary_sheet.row_dimensions[current_row].height = float(
+                min(300, max(30, 18 * estimated_lines + 10))
+            )
+            current_row += 1
+        current_row += 1
+
+    driver_summaries = [
+        _cell_text(record_value(item, "statement", "evidence", "member", "name"))
+        for item in drivers[:3]
+        if record_value(item, "statement", "evidence", "member", "name") is not None
+    ]
+    recommendation_summaries = [
+        _cell_text(record_value(item, "action", "statement"))
+        for item in recommendations[:3]
+        if record_value(item, "action", "statement") is not None
+    ]
+    quality_warnings = data_quality.get("warnings") if isinstance(data_quality.get("warnings"), list) else []
+    add_summary_section("核心结论", [summary] if summary else [], bullets=False)
+    add_summary_section("主要驱动因素", driver_summaries or insights[:3], bullets=True)
+    add_summary_section("建议动作", recommendation_summaries, bullets=True)
+    add_summary_section("数据质量警告", [_cell_text(item) for item in quality_warnings] + notes, bullets=True)
+    add_summary_section("数据口径", assumptions, bullets=True)
+    summary_sheet.print_area = f"A1:D{max(4, current_row - 1)}"
+    summary_sheet.oddFooter.center.text = "直播经营数据分析报告"
+    summary_sheet.oddFooter.right.text = "第 &[Page] 页"
+    summary_sheet.oddFooter.center.size = 8
+    summary_sheet.oddFooter.center.color = muted
+    summary_sheet.oddFooter.right.size = 8
+    summary_sheet.oddFooter.right.color = muted
+
+    if analysis_type in {"comparison", "diagnostic"}:
+        trend_sheet = workbook.create_sheet("趋势与对比")
+        configure_sheet(trend_sheet)
+        add_sheet_title(trend_sheet, "趋势与对比", 7)
+        comparison_rows = [
+            [
+                record_value(item, "metric", "name"),
+                record_value(item, "current_value", "value"),
+                record_value(item, "baseline_value"),
+                record_value(item, "absolute_change"),
+                record_value(item, "relative_change"),
+                record_value(item, "unit"),
+                record_value(item, "baseline_label"),
+            ]
+            for item in comparisons
+        ]
+        comparison_end = write_table(
+            trend_sheet,
+            start_row=3,
+            headers=["指标", "当前值", "基准值", "绝对变化", "变化率", "单位", "基准说明"],
+            records=comparison_rows,
+            widths=[24, 16, 16, 16, 14, 12, 24],
+            percent_columns={5},
+        )
+        for row_offset, item in enumerate(comparisons, start=1):
+            metric_name = _cell_text(record_value(item, "metric", "name"))
+            unit = _cell_text(record_value(item, "unit"))
+            if "率" in metric_name or unit in {"%", "百分比", "百分点"}:
+                for column_index in (2, 3, 4):
+                    trend_sheet.cell(3 + row_offset, column_index).number_format = "0.00%"
+        if not comparison_rows:
+            trend_sheet.cell(4, 1, "未提供可靠的对比数据")
+
+        trend_start = comparison_end + 3
+        trend_rows = [
+            [
+                record_value(item, "period", "date", "label"),
+                record_value(item, "metric", "name"),
+                record_value(item, "current_value", "value"),
+                record_value(item, "baseline_value"),
+                record_value(item, "absolute_change"),
+                record_value(item, "relative_change"),
+                record_value(item, "anomaly", "note"),
+            ]
+            for item in trends
+        ]
+        trend_end = write_table(
+            trend_sheet,
+            start_row=trend_start,
+            headers=["周期", "指标", "当前值", "基准值", "绝对变化", "变化率", "异常说明"],
+            records=trend_rows,
+            widths=[18, 22, 16, 16, 16, 14, 32],
+            percent_columns={6},
+        )
+        for row_offset, item in enumerate(trends, start=1):
+            metric_name = _cell_text(record_value(item, "metric", "name"))
+            unit = _cell_text(record_value(item, "unit"))
+            if "率" in metric_name or unit in {"%", "百分比", "百分点"}:
+                for column_index in (3, 4, 5):
+                    trend_sheet.cell(trend_start + row_offset, column_index).number_format = "0.00%"
+        trend_sheet.freeze_panes = "A4"
+        trend_sheet.auto_filter.ref = f"A{trend_start}:G{max(trend_start, trend_end)}"
+
+        if trend_rows:
+            first_metric = trend_rows[0][1]
+            chart_rows = [row for row in trend_rows if row[1] == first_metric and isinstance(row[2], (int, float))][:20]
+            if len(chart_rows) >= 2:
+                chart_start = trend_start
+                helper_column = 9
+                trend_sheet.cell(chart_start, helper_column, "周期")
+                trend_sheet.cell(chart_start, helper_column + 1, _cell_text(first_metric) or "指标值")
+                trend_sheet.column_dimensions[get_column_letter(helper_column)].width = 16
+                trend_sheet.column_dimensions[get_column_letter(helper_column + 1)].width = 18
+                for index, row in enumerate(chart_rows, start=1):
+                    trend_sheet.cell(chart_start + index, helper_column, row[0])
+                    trend_sheet.cell(chart_start + index, helper_column + 1, row[2])
+                line_chart = LineChart()
+                line_chart.title = f"{_cell_text(first_metric)}趋势"
+                line_chart.height = 8
+                line_chart.width = 15
+                line_chart.style = 13
+                line_chart.legend = None
+                line_chart.y_axis.title = _cell_text(record_value(trends[0], "unit"))
+                line_chart.x_axis.title = "周期"
+                line_chart.add_data(
+                    Reference(
+                        trend_sheet,
+                        min_col=helper_column + 1,
+                        min_row=chart_start,
+                        max_row=chart_start + len(chart_rows),
+                    ),
+                    titles_from_data=True,
+                )
+                line_chart.set_categories(
+                    Reference(
+                        trend_sheet,
+                        min_col=helper_column,
+                        min_row=chart_start + 1,
+                        max_row=chart_start + len(chart_rows),
+                    )
+                )
+                trend_sheet.add_chart(line_chart, f"I{chart_start + len(chart_rows) + 2}")
+        elif comparison_rows:
+            chart = BarChart()
+            chart.type = "col"
+            chart.title = "当前值与基准值"
+            chart.height = 8
+            chart.width = 15
+            chart.style = 10
+            chart.add_data(
+                Reference(trend_sheet, min_col=2, max_col=3, min_row=3, max_row=3 + len(comparison_rows)),
+                titles_from_data=True,
+            )
+            chart.set_categories(
+                Reference(trend_sheet, min_col=1, min_row=4, max_row=3 + len(comparison_rows))
+            )
+            trend_sheet.add_chart(chart, f"I{trend_start}")
+
+    if analysis_type == "diagnostic":
+        driver_sheet = workbook.create_sheet("驱动分析")
+        configure_sheet(driver_sheet)
+        add_sheet_title(driver_sheet, "驱动分析", 9)
+        driver_rows = [
+            [
+                record_value(item, "dimension"),
+                record_value(item, "member", "name"),
+                record_value(item, "metric"),
+                record_value(item, "current_value", "value"),
+                record_value(item, "contribution_value"),
+                record_value(item, "contribution_rate", "contribution"),
+                record_value(item, "statement"),
+                record_value(item, "evidence"),
+                record_value(item, "confidence"),
+            ]
+            for item in drivers
+        ]
+        driver_end = write_table(
+            driver_sheet,
+            start_row=3,
+            headers=["维度", "贡献项", "指标", "当前值", "贡献量", "贡献占比", "结论", "证据", "置信度"],
+            records=driver_rows,
+            widths=[16, 24, 18, 15, 15, 14, 34, 34, 12],
+            percent_columns={6, 9},
+        )
+        driver_sheet.freeze_panes = "A4"
+        driver_sheet.auto_filter.ref = f"A3:I{max(3, driver_end)}"
+        numeric_driver_column = (
+            5
+            if any(isinstance(row[4], (int, float)) for row in driver_rows)
+            else 6
+        )
+        chartable_rows = [
+            (index, row)
+            for index, row in enumerate(driver_rows, start=4)
+            if isinstance(row[numeric_driver_column - 1], (int, float))
+        ][:10]
+        if chartable_rows:
+            driver_chart = BarChart()
+            driver_chart.type = "bar"
+            driver_chart.title = "Top 贡献因素"
+            driver_chart.height = 8
+            driver_chart.width = 15
+            driver_chart.style = 12
+            driver_chart.legend = None
+            if numeric_driver_column == 6:
+                driver_chart.x_axis.numFmt = "0%"
+            min_row = chartable_rows[0][0]
+            max_row = chartable_rows[-1][0]
+            driver_chart.add_data(
+                Reference(driver_sheet, min_col=numeric_driver_column, min_row=3, max_row=max_row),
+                titles_from_data=True,
+            )
+            driver_chart.set_categories(
+                Reference(driver_sheet, min_col=2, min_row=min_row, max_row=max_row)
+            )
+            driver_sheet.add_chart(driver_chart, f"A{driver_end + 3}")
+
+    detail_sheet = workbook.create_sheet("数据明细")
+    detail_sheet.sheet_properties.tabColor = teal
+    detail_sheet.sheet_view.showGridLines = False
+    detail_sheet.sheet_view.zoomScale = 85
+    detail_sheet.sheet_format.defaultRowHeight = 22
+    detail_sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    detail_sheet.page_setup.orientation = "landscape"
+    detail_sheet.page_setup.paperSize = detail_sheet.PAPERSIZE_A4
+    detail_sheet.page_setup.fitToWidth = 1
+    detail_sheet.page_setup.fitToHeight = 0
+    detail_sheet.page_margins = PageMargins(
+        left=0.25,
+        right=0.25,
+        top=0.5,
+        bottom=0.5,
+        header=0.2,
+        footer=0.2,
+    )
+
+    if columns:
+        display_columns = _display_columns(columns)
+        number_kinds = _column_number_kinds(columns)
+        column_widths = _column_widths(columns, rows)
+        for column_index, label in enumerate(display_columns, start=1):
+            cell = detail_sheet.cell(
+                row=1,
+                column=column_index,
+                value=_xlsx_safe_value(
+                    label,
+                    context=f"Column header {column_index}",
+                ),
+            )
+            cell.font = header_font
+            cell.fill = PatternFill("solid", fgColor=teal)
+            cell.border = cell_border
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+        detail_sheet.row_dimensions[1].height = 38
+
+        number_formats = {
+            "integer": "#,##0;[Red](#,##0);-",
+            "decimal": "#,##0.00;[Red](#,##0.00);-",
+            "percent": "0.00%;[Red](0.00%);-",
+            "percent_point": '0.00"%";[Red](0.00"%");-',
+            "currency": "¥#,##0.00;[Red](¥#,##0.00);-",
+        }
+        for row_index, row in enumerate(rows, start=2):
+            row_fill = PatternFill("solid", fgColor=banded if row_index % 2 else white)
+            max_wrapped_lines = 1
+            for column_index, column in enumerate(columns, start=1):
+                source_value = row.get(column)
+                identifier_column = _is_identifier_column(column)
+                safe_value = _xlsx_safe_value(
+                    source_value,
+                    context=f"Data row {row_index - 1}, column {column}",
+                    force_text=identifier_column,
+                )
+                cell = detail_sheet.cell(
+                    row=row_index,
+                    column=column_index,
+                    value=safe_value,
+                )
+                kind = number_kinds[column_index - 1]
+                cell.font = body_font
+                cell.fill = row_fill
+                cell.border = cell_border
+                if isinstance(safe_value, datetime):
+                    cell.number_format = "yyyy-mm-dd hh:mm:ss"
+                    horizontal = "center"
+                elif isinstance(safe_value, date):
+                    cell.number_format = "yyyy-mm-dd"
+                    horizontal = "center"
+                elif kind and isinstance(safe_value, (int, float)) and not isinstance(
+                    safe_value, bool
+                ):
+                    cell.number_format = number_formats[kind]
+                    horizontal = "right"
+                elif identifier_column:
+                    cell.number_format = "@"
+                    horizontal = "left"
+                elif isinstance(source_value, (Decimal, int)) and isinstance(
+                    safe_value, str
+                ):
+                    # Excel can only preserve 15 significant numeric digits. Keep
+                    # higher-precision values as text instead of silently rounding.
+                    cell.number_format = "@"
+                    horizontal = "right"
+                else:
+                    horizontal = "left"
+                cell.alignment = Alignment(
+                    horizontal=horizontal,
+                    vertical="center",
+                    wrap_text=horizontal == "left",
+                )
+                if horizontal == "left" and safe_value not in (None, ""):
+                    max_wrapped_lines = max(
+                        max_wrapped_lines,
+                        _wrapped_line_count(
+                            safe_value,
+                            column_widths[column_index - 1],
+                        ),
+                    )
+            detail_sheet.row_dimensions[row_index].height = float(
+                min(300, max(24, 16 * max_wrapped_lines + 8))
+            )
+
+        last_column = get_column_letter(len(columns))
+        last_row = max(1, len(rows) + 1)
+        detail_sheet.freeze_panes = "B2"
+        detail_sheet.auto_filter.ref = f"A1:{last_column}{last_row}"
+        detail_sheet.print_title_rows = "1:1"
+        detail_sheet.print_area = f"A1:{last_column}{last_row}"
+        for column_index, width in enumerate(column_widths, start=1):
+            detail_sheet.column_dimensions[get_column_letter(column_index)].width = width
+    else:
+        empty_cell = detail_sheet["A1"]
+        empty_cell.value = "查询结果为空"
+        empty_cell.font = label_font
+        empty_cell.fill = PatternFill("solid", fgColor=light_teal)
+        empty_cell.border = cell_border
+        empty_cell.alignment = Alignment(horizontal="center", vertical="center")
+        detail_sheet.column_dimensions["A"].width = 24
+        detail_sheet.row_dimensions[1].height = 30
+
+    detail_sheet.oddFooter.center.text = "直播经营数据分析报告"
+    detail_sheet.oddFooter.right.text = "第 &[Page] 页"
+    detail_sheet.oddFooter.center.size = 8
+    detail_sheet.oddFooter.center.color = muted
+    detail_sheet.oddFooter.right.size = 8
+    detail_sheet.oddFooter.right.color = muted
+
+    quality_sheet = workbook.create_sheet("数据口径与质量")
+    configure_sheet(quality_sheet)
+    add_sheet_title(quality_sheet, "数据口径与质量", 7)
+    scope_rows = [
+        [analysis_field_label(key), value] for key, value in flatten_mapping(data_scope)
+    ]
+    scope_end = write_table(
+        quality_sheet,
+        start_row=3,
+        headers=["口径字段", "内容"],
+        records=scope_rows,
+        widths=[30, 72],
+    )
+    if not scope_rows:
+        quality_sheet.cell(4, 1, "未提供结构化数据口径，请参考查询审计页。")
+
+    definition_start = scope_end + 3
+    definition_rows = [
+        [
+            record_value(item, "name"),
+            record_value(item, "formula"),
+            record_value(item, "unit"),
+            record_value(item, "aggregation"),
+            record_value(item, "numerator"),
+            record_value(item, "denominator"),
+            record_value(item, "grain"),
+        ]
+        for item in metric_definitions
+    ]
+    definition_end = write_table(
+        quality_sheet,
+        start_row=definition_start,
+        headers=["指标名称", "指标公式", "单位", "聚合方式", "分子", "分母", "数据粒度"],
+        records=definition_rows,
+        widths=[22, 38, 12, 16, 22, 22, 22],
+    )
+    quality_start = definition_end + 3
+    flattened_quality = flatten_mapping(data_quality)
+    quality_rows = [
+        [analysis_field_label(key), value] for key, value in flattened_quality
+    ]
+    quality_end = write_table(
+        quality_sheet,
+        start_row=quality_start,
+        headers=["质量检查项", "检查结果"],
+        records=quality_rows,
+        widths=[34, 68],
+    )
+    for offset, (key, _) in enumerate(flattened_quality, start=1):
+        if key.endswith(("coverage_ratio", "rate", "ratio")):
+            quality_sheet.cell(quality_start + offset, 2).number_format = "0.00%"
+    if not quality_rows:
+        quality_sheet.cell(quality_start + 1, 1, "未提供服务端数据质量结果。")
+    quality_sheet.freeze_panes = "A4"
+    quality_sheet.print_area = f"A1:G{max(quality_start + 1, quality_end)}"
+
+    audit_sheet = workbook.create_sheet("查询审计")
+    configure_sheet(audit_sheet, tab_color=muted)
+    add_sheet_title(audit_sheet, "查询审计", 6)
+    source_tables = data_scope.get("source_tables")
+    audit_rows = [
+        ["报告类型", analysis_label()],
+        ["生成时间", generated_at],
+        ["查询状态", "已通过服务端只读校验并执行"],
+        ["返回行数", len(rows)],
+        ["结果截断", "是" if truncated else "否"],
+        ["使用数据表", display_analysis_value(source_tables) if source_tables else "未提供"],
+    ]
+    audit_end = write_table(
+        audit_sheet,
+        start_row=3,
+        headers=["审计项", "内容"],
+        records=audit_rows,
+        widths=[24, 72],
+    )
+    sql_heading_row = audit_end + 3
+    audit_sheet.merge_cells(start_row=sql_heading_row, start_column=1, end_row=sql_heading_row, end_column=6)
+    sql_heading = audit_sheet.cell(sql_heading_row, 1, "已执行 SQL")
+    sql_heading.font = section_font
+    sql_heading.fill = PatternFill("solid", fgColor=light_teal)
+    sql_heading.alignment = Alignment(vertical="center", indent=1)
+    audit_sheet.merge_cells(
+        start_row=sql_heading_row + 1,
+        start_column=1,
+        end_row=sql_heading_row + 1,
+        end_column=6,
+    )
+    sql_cell = audit_sheet.cell(
+        sql_heading_row + 1,
+        1,
+        _xlsx_safe_value(sql, context="Executed SQL"),
+    )
+    sql_cell.font = Font(name="Courier New", size=9, color=text_color)
+    sql_cell.fill = PatternFill("solid", fgColor=banded)
+    sql_cell.border = cell_border
+    sql_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    audit_sheet.row_dimensions[sql_heading_row + 1].height = float(
+        min(300, max(60, 16 * _wrapped_line_count(sql, 110)))
+    )
+    audit_sheet.freeze_panes = "A4"
+    audit_sheet.print_area = f"A1:F{sql_heading_row + 1}"
+
+    # This controlled exporter intentionally emits no formulas, so LibreOffice
+    # recalculation is unnecessary and formula injection remains impossible.
+    for worksheet in workbook.worksheets:
+        for workbook_row in worksheet.iter_rows():
+            for cell in workbook_row:
+                if getattr(cell, "data_type", None) == "f":
+                    raise ValueError(f"Generated XLSX contains a formula at {worksheet.title}!{cell.coordinate}.")
+
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
+def _json_bytes(
+    *,
+    title: str,
+    summary: str,
+    insights: list[str],
+    assumptions: list[str],
+    notes: list[str],
+    sql: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    truncated: bool,
+) -> bytes:
+    document = {
+        "title": title,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "summary": summary,
+        "insights": insights,
+        "assumptions": assumptions,
+        "notes": notes,
+        "query": {"sql": sql},
+        "data": {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": truncated,
+        },
+    }
+    return json.dumps(
+        document,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _pdf_paragraph_text(value: Any, *, limit: int = 240) -> str:
+    text = _clean_text(_cell_text(value), limit=limit)
+    return escape(text).replace("\r\n", "<br/>").replace("\n", "<br/>").replace("\r", "<br/>")
+
+
+def _pdf_font_path() -> Path:
+    configured = os.getenv("XPD_PDF_FONT_PATH", "").strip()
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        Path("/Library/Fonts/Arial Unicode.ttf"),
+        Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+        Path("/usr/share/fonts/truetype/arphic/ukai.ttc"),
+        Path("C:/Windows/Fonts/msyh.ttc"),
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return candidate.resolve()
+    raise RuntimeError(
+        "No embeddable Chinese PDF font was found. Configure XPD_PDF_FONT_PATH "
+        "with a TrueType Chinese font file."
+    )
+
+
+def _pdf_bytes(
+    *,
+    title: str,
+    summary: str,
+    insights: list[str],
+    assumptions: list[str],
+    notes: list[str],
+    sql: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    truncated: bool,
+) -> bytes:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import (
+            LongTable,
+            PageBreak,
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+    except ImportError as exc:  # pragma: no cover - deployment dependency guard
+        raise RuntimeError("PDF export requires the reportlab package.") from exc
+
+    font_name = "XPDChinese"
+    with _export_lock:
+        if font_name not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont(font_name, str(_pdf_font_path()), subfontIndex=0))
+
+    output = io.BytesIO()
+    page_width, _ = landscape(A4)
+    left_margin = right_margin = 14 * mm
+    document = SimpleDocTemplate(
+        output,
+        pagesize=landscape(A4),
+        leftMargin=left_margin,
+        rightMargin=right_margin,
+        topMargin=19 * mm,
+        bottomMargin=16 * mm,
+        title=title,
+        author="直播经营数据分析 Agent",
+        subject="经营数据分析报告",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ChineseTitle",
+        parent=styles["Title"],
+        fontName=font_name,
+        fontSize=21,
+        leading=29,
+        alignment=TA_LEFT,
+        textColor=colors.HexColor("#18344A"),
+        spaceAfter=8 * mm,
+    )
+    heading_style = ParagraphStyle(
+        "ChineseHeading",
+        parent=styles["Heading2"],
+        fontName=font_name,
+        fontSize=12,
+        leading=18,
+        textColor=colors.HexColor("#0B7285"),
+        spaceBefore=4 * mm,
+        spaceAfter=2 * mm,
+    )
+    body_style = ParagraphStyle(
+        "ChineseBody",
+        parent=styles["BodyText"],
+        fontName=font_name,
+        fontSize=9,
+        leading=15,
+        textColor=colors.HexColor("#263238"),
+        alignment=TA_LEFT,
+        wordWrap="CJK",
+    )
+    small_style = ParagraphStyle(
+        "ChineseSmall",
+        parent=body_style,
+        fontSize=7,
+        leading=10,
+    )
+    table_header_style = ParagraphStyle(
+        "ChineseTableHeader",
+        parent=small_style,
+        fontSize=7,
+        leading=9,
+        alignment=TA_CENTER,
+        textColor=colors.white,
+    )
+
+    story: list[Any] = [Paragraph(_pdf_paragraph_text(title, limit=200), title_style)]
+    metadata = Table(
+        [
+            ["生成时间", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")],
+            ["数据行数", str(len(rows))],
+            ["数据完整性", "达到导出上限，仅包含前若干行" if truncated else "未达到导出上限"],
+        ],
+        colWidths=[28 * mm, 118 * mm],
+        hAlign="LEFT",
+    )
+    metadata.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, -1), font_name),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#52616B")),
+                ("TEXTCOLOR", (1, 0), (1, -1), colors.HexColor("#18344A")),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F2F7F8")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#D6E4E5")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D6E4E5")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    story.extend([metadata, Spacer(1, 3 * mm)])
+
+    def add_text_section(heading: str, values: list[str]) -> None:
+        if not values:
+            return
+        story.append(Paragraph(heading, heading_style))
+        for value in values:
+            story.append(Paragraph(f"- {_pdf_paragraph_text(value, limit=2000)}", body_style))
+            story.append(Spacer(1, 1.2 * mm))
+
+    if summary:
+        story.extend(
+            [
+                Paragraph("经营结论", heading_style),
+                Paragraph(_pdf_paragraph_text(summary, limit=MAX_TEXT_CHARS), body_style),
+            ]
+        )
+    add_text_section("关键洞察", insights)
+    add_text_section("查询假设", assumptions)
+    add_text_section("注意事项", notes)
+
+    story.append(PageBreak())
+    story.append(Paragraph("数据明细", heading_style))
+    if not columns:
+        story.append(Paragraph("（查询结果为空）", body_style))
+    else:
+        available_width = page_width - left_margin - right_margin
+        group_size = 8
+        for offset in range(0, len(columns), group_size):
+            group = columns[offset : offset + group_size]
+            if offset:
+                story.append(PageBreak())
+                story.append(Paragraph("数据明细（续）", heading_style))
+            if len(columns) > group_size:
+                story.append(
+                    Paragraph(
+                        f"字段 {offset + 1}-{offset + len(group)} / {len(columns)}",
+                        small_style,
+                    )
+                )
+                story.append(Spacer(1, 1.5 * mm))
+            weights = []
+            for column in group:
+                longest = max(
+                    [len(column)]
+                    + [len(_cell_text(row.get(column))) for row in rows[:50]]
+                )
+                weights.append(min(24, max(8, longest)))
+            weight_total = sum(weights) or 1
+            widths = [available_width * weight / weight_total for weight in weights]
+            table_data = [
+                [Paragraph(_pdf_paragraph_text(column), table_header_style) for column in group]
+            ]
+            table_data.extend(
+                [
+                    Paragraph(_pdf_paragraph_text(row.get(column)), small_style)
+                    for column in group
+                ]
+                for row in rows
+            )
+            detail_table = LongTable(
+                table_data,
+                colWidths=widths,
+                repeatRows=1,
+                hAlign="LEFT",
+                splitByRow=1,
+            )
+            detail_table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B7285")),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#C9D7DB")),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7FAFA")]),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                        ("TOPPADDING", (0, 0), (-1, -1), 3),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ]
+                )
+            )
+            story.append(detail_table)
+
+    story.extend(
+        [
+            PageBreak(),
+            Paragraph("已执行 SQL", heading_style),
+            Paragraph(_pdf_paragraph_text(sql, limit=MAX_TEXT_CHARS), small_style),
+        ]
+    )
+
+    def draw_page(canvas: Any, doc: Any) -> None:
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#D6E4E5"))
+        canvas.setLineWidth(0.5)
+        canvas.line(left_margin, 13 * mm, page_width - right_margin, 13 * mm)
+        canvas.setFont(font_name, 7)
+        canvas.setFillColor(colors.HexColor("#607D86"))
+        canvas.drawString(left_margin, 8.5 * mm, "直播经营数据分析报告")
+        canvas.drawRightString(
+            page_width - right_margin,
+            8.5 * mm,
+            f"第 {doc.page} 页",
+        )
+        canvas.restoreState()
+
+    document.build(story, onFirstPage=draw_page, onLaterPages=draw_page)
+    return output.getvalue()
+
+
+def _artifact_bytes(
+    output_format: str,
+    *,
+    title: str,
+    summary: str,
+    insights: list[str],
+    assumptions: list[str],
+    notes: list[str],
+    sql: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    truncated: bool,
+    analysis_type: str = "simple",
+    analysis: dict[str, Any] | None = None,
+) -> bytes:
+    if output_format == "csv":
+        return _csv_bytes(columns, rows)
+    if output_format == "markdown":
+        return _markdown_bytes(
+            title=title,
+            summary=summary,
+            insights=insights,
+            assumptions=assumptions,
+            notes=notes,
+            sql=sql,
+            columns=columns,
+            rows=rows,
+            truncated=truncated,
+        )
+    if output_format == "pdf":
+        return _pdf_bytes(
+            title=title,
+            summary=summary,
+            insights=insights,
+            assumptions=assumptions,
+            notes=notes,
+            sql=sql,
+            columns=columns,
+            rows=rows,
+            truncated=truncated,
+        )
+    if output_format == "json":
+        return _json_bytes(
+            title=title,
+            summary=summary,
+            insights=insights,
+            assumptions=assumptions,
+            notes=notes,
+            sql=sql,
+            columns=columns,
+            rows=rows,
+            truncated=truncated,
+        )
+    return _xlsx_bytes(
+        title=title,
+        summary=summary,
+        insights=insights,
+        assumptions=assumptions,
+        notes=notes,
+        sql=sql,
+        columns=columns,
+        rows=rows,
+        truncated=truncated,
+        analysis_type=analysis_type,
+        analysis=analysis,
+    )
+
+
+def _xlsx_values_equal(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, float) and isinstance(actual, (int, float)):
+        return expected == float(actual)
+    return expected == actual
+
+
+def _validate_artifact_bytes(
+    output_format: str,
+    content: bytes,
+    *,
+    title: str = "",
+    columns: list[str] | None = None,
+    rows: list[dict[str, Any]] | None = None,
+    analysis_type: str = "simple",
+) -> dict[str, Any]:
+    """Validate file structure and, for XLSX, the exported query-cell contents."""
+    if output_format == "csv":
+        text = content.decode("utf-8-sig")
+        for _ in csv.reader(io.StringIO(text, newline="")):
+            pass
+        return {"status": "passed", "scope": "file_structure"}
+    if output_format == "markdown":
+        content.decode("utf-8")
+        return {"status": "passed", "scope": "file_structure"}
+    if output_format == "json":
+        parsed = json.loads(content.decode("utf-8"))
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("data"), dict):
+            raise ValueError("Generated JSON report is incomplete.")
+        return {"status": "passed", "scope": "file_structure"}
+    if output_format == "pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:  # pragma: no cover - deployment dependency guard
+            raise RuntimeError("PDF validation requires the pypdf package.") from exc
+        reader = PdfReader(io.BytesIO(content))
+        if reader.is_encrypted or not reader.pages:
+            raise ValueError("Generated PDF report is invalid or empty.")
+        return {"status": "passed", "scope": "file_structure"}
+
+    required = {
+        "[Content_Types].xml",
+        "_rels/.rels",
+        "xl/workbook.xml",
+        "xl/_rels/workbook.xml.rels",
+        "xl/styles.xml",
+        "xl/worksheets/sheet1.xml",
+        "xl/worksheets/sheet2.xml",
+    }
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        if archive.testzip() is not None or not required <= set(archive.namelist()):
+            raise ValueError("Generated XLSX package is incomplete.")
+        for name in required:
+            if name.endswith(".xml") or name.endswith(".rels"):
+                ElementTree.fromstring(archive.read(name))
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:  # pragma: no cover - deployment dependency guard
+        raise RuntimeError("XLSX validation requires the openpyxl package.") from exc
+
+    expected_columns = list(columns or [])
+    expected_rows = list(rows or [])
+    workbook = load_workbook(io.BytesIO(content), data_only=False, read_only=False)
+    try:
+        normalized_analysis_type = _clean_analysis_type(analysis_type)
+        expected_sheets = ["经营摘要"]
+        if normalized_analysis_type in {"comparison", "diagnostic"}:
+            expected_sheets.append("趋势与对比")
+        if normalized_analysis_type == "diagnostic":
+            expected_sheets.append("驱动分析")
+        expected_sheets.extend(["数据明细", "数据口径与质量", "查询审计"])
+        if workbook.sheetnames != expected_sheets:
+            raise ValueError("Generated XLSX has unexpected worksheets.")
+        summary_sheet = workbook["经营摘要"]
+        detail_sheet = workbook["数据明细"]
+        expected_title = _xlsx_safe_value(title, context="Report title")
+        if summary_sheet["A1"].value != expected_title:
+            raise ValueError("Generated XLSX report title does not match the export request.")
+
+        for worksheet in workbook.worksheets:
+            for workbook_row in worksheet.iter_rows():
+                for cell in workbook_row:
+                    if cell.data_type == "f":
+                        raise ValueError(
+                            f"Generated XLSX contains a formula at "
+                            f"{worksheet.title}!{cell.coordinate}."
+                        )
+                    if isinstance(cell.value, str):
+                        if len(cell.value) > EXCEL_MAX_CELL_CHARS:
+                            raise ValueError(
+                                f"Generated XLSX text exceeds Excel's cell limit at "
+                                f"{worksheet.title}!{cell.coordinate}."
+                            )
+                        if EXCEL_ILLEGAL_CONTROL_PATTERN.search(cell.value):
+                            raise ValueError(
+                                f"Generated XLSX contains an illegal control character at "
+                                f"{worksheet.title}!{cell.coordinate}."
+                            )
+
+        if expected_columns:
+            expected_headers = [
+                _xlsx_safe_value(label, context=f"Column header {index}")
+                for index, label in enumerate(_display_columns(expected_columns), start=1)
+            ]
+            actual_headers = [
+                detail_sheet.cell(row=1, column=index).value
+                for index in range(1, len(expected_columns) + 1)
+            ]
+            if actual_headers != expected_headers:
+                raise ValueError("Generated XLSX column headers do not match the query result.")
+            if detail_sheet.max_row != len(expected_rows) + 1:
+                raise ValueError("Generated XLSX row count does not match the query result.")
+            for row_index, source_row in enumerate(expected_rows, start=2):
+                for column_index, column in enumerate(expected_columns, start=1):
+                    identifier_column = _is_identifier_column(column)
+                    expected = _xlsx_safe_value(
+                        source_row.get(column),
+                        context=f"Data row {row_index - 1}, column {column}",
+                        force_text=identifier_column,
+                    )
+                    actual_cell = detail_sheet.cell(row=row_index, column=column_index)
+                    if not _xlsx_values_equal(expected, actual_cell.value):
+                        raise ValueError(
+                            f"Generated XLSX value mismatch at {actual_cell.coordinate}."
+                        )
+                    if identifier_column and actual_cell.number_format != "@":
+                        raise ValueError(
+                            f"Generated XLSX identifier is not stored as text at "
+                            f"{actual_cell.coordinate}."
+                        )
+        elif detail_sheet["A1"].value != "查询结果为空":
+            raise ValueError("Generated XLSX empty-result marker is missing.")
+    finally:
+        workbook.close()
+
+    return {
+        "status": "passed",
+        "scope": "xlsx_structure_and_exported_query_rows",
+        "business_conclusions_checked": False,
+    }
+
+
+def _stored_artifact_files(root: Path) -> list[tuple[str, Path]]:
+    artifacts: list[tuple[str, Path]] = []
+    if not root.exists() or root.is_symlink():
+        return artifacts
+    for session_dir in root.iterdir():
+        if (
+            session_dir.is_symlink()
+            or not session_dir.is_dir()
+            or not SESSION_ID_PATTERN.fullmatch(session_dir.name)
+        ):
+            continue
+        exports_dir = session_dir / "exports"
+        if exports_dir.is_symlink() or not exports_dir.is_dir():
+            continue
+        for path in exports_dir.iterdir():
+            if (
+                not path.is_symlink()
+                and path.is_file()
+                and ARTIFACT_FILENAME_PATTERN.fullmatch(path.name)
+            ):
+                artifacts.append((session_dir.name, path))
+    return artifacts
+
+
+def _cleanup_expired_artifacts(root: Path, *, now: float) -> None:
+    retention_days = _bounded_int("XPD_FILE_RETENTION_DAYS", 30, 0)
+    if retention_days <= 0:
+        return
+    cutoff = now - retention_days * 86_400
+    for _, path in _stored_artifact_files(root):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except FileNotFoundError:
+            continue
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _write_artifact(exports_dir: Path, filename: str, content: bytes) -> tuple[str, Path]:
+    max_files = _bounded_int("XPD_FILE_MAX_ARTIFACTS_PER_SESSION", 50, 1)
+    max_file_bytes = _bounded_int("XPD_FILE_MAX_BYTES_PER_ARTIFACT", 10 * 1024 * 1024, 1024)
+    max_total_bytes = _bounded_int(
+        "XPD_FILE_MAX_TOTAL_BYTES_PER_SESSION", 100 * 1024 * 1024, max_file_bytes
+    )
+    if not content:
+        raise ValueError("Refusing to create an empty report artifact.")
+    if len(content) > max_file_bytes:
+        raise ValueError(f"Report artifact exceeds the {max_file_bytes}-byte limit.")
+
+    with _export_lock:
+        storage_root = exports_dir.parent.parent
+        _cleanup_expired_artifacts(storage_root, now=time.time())
+        stored = _stored_artifact_files(storage_root)
+        existing = [
+            path
+            for session_id, path in stored
+            if session_id == exports_dir.parent.name
+        ]
+        if len(existing) >= max_files:
+            raise ValueError(f"This session already has the maximum of {max_files} report files.")
+        total_bytes = sum(_file_size(path) for path in existing)
+        if total_bytes + len(content) > max_total_bytes:
+            raise ValueError("This session has reached its total report file storage limit.")
+
+        owner_scope = exports_dir.parent.name.split("_", 2)[1]
+        owner_limit = _bounded_int(
+            "XPD_FILE_MAX_TOTAL_BYTES_PER_OWNER", 500 * 1024 * 1024, max_total_bytes
+        )
+        root_limit = _bounded_int(
+            "XPD_FILE_MAX_TOTAL_BYTES", 5 * 1024 * 1024 * 1024, owner_limit
+        )
+        owner_bytes = sum(
+            _file_size(path)
+            for stored_session_id, path in stored
+            if stored_session_id.split("_", 2)[1] == owner_scope
+        )
+        root_bytes = sum(_file_size(path) for _, path in stored)
+        if owner_bytes + len(content) > owner_limit:
+            raise ValueError("This owner has reached the total report file storage limit.")
+        if root_bytes + len(content) > root_limit:
+            raise ValueError("Report file storage has reached its global limit.")
+        min_free_bytes = _bounded_int(
+            "XPD_FILE_MIN_FREE_BYTES", 256 * 1024 * 1024, 0
+        )
+        if shutil.disk_usage(storage_root).free - len(content) < min_free_bytes:
+            raise ValueError("Not enough free disk space to create another report file.")
+
+        artifact_id = f"art_{uuid.uuid4().hex}"
+        if not ARTIFACT_ID_PATTERN.fullmatch(artifact_id):
+            raise RuntimeError("Failed to create a valid report artifact id.")
+        target = exports_dir / f"{artifact_id}{FILENAME_SEPARATOR}{filename}"
+        temporary = exports_dir / f".{artifact_id}.tmp"
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            os.chmod(target, 0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return artifact_id, target
+
+
+def export_report_file(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
+    try:
+        payload = dict(args or {})
+        output_format = str(payload.get("format") or "").strip().lower()
+        if output_format not in SUPPORTED_FORMATS:
+            raise ValueError("format must be csv, xlsx, markdown, pdf, or json.")
+        active_session_id = _session_id(kwargs.get("session_id"), kwargs.get("task_id"))
+        title = _clean_text(payload.get("title"), limit=200) or "经营报告"
+        result = query_result_registry.get(
+            result_id=payload.get("result_id"),
+            session_id=active_session_id,
+        )
+        if result is None:
+            raise ValueError(
+                "Query result not found, expired, or owned by another session. "
+                "Ask the user to run the data query again before exporting."
+            )
+        sql = str(result["sql"])
+        columns = [str(column) for column in result["columns"]]
+        rows = list(result["rows"])
+        truncated = bool(result["truncated"])
+        if len(columns) > MAX_COLUMNS:
+            raise ValueError(f"Report export supports at most {MAX_COLUMNS} columns.")
+        analysis_type = _clean_analysis_type(
+            payload.get("analysis_type"), required=output_format == "xlsx"
+        )
+        analysis = _clean_analysis(payload.get("analysis"))
+        summary = _clean_text(payload.get("summary"))
+        insights = _clean_list(payload.get("insights"))
+        assumptions = _clean_list(payload.get("assumptions"))
+        notes = _clean_list(payload.get("notes"))
+        filename = _sanitize_filename(payload.get("filename"), title, output_format)
+        content = _artifact_bytes(
+            output_format,
+            title=title,
+            summary=summary,
+            insights=insights,
+            assumptions=assumptions,
+            notes=notes,
+            sql=sql,
+            columns=columns,
+            rows=rows,
+            truncated=truncated,
+            analysis_type=analysis_type,
+            analysis=analysis,
+        )
+        validation = _validate_artifact_bytes(
+            output_format,
+            content,
+            title=title,
+            columns=columns,
+            rows=rows,
+            analysis_type=analysis_type,
+        )
+        artifact_id, path = _write_artifact(
+            _exports_dir(active_session_id), filename, content
+        )
+        try:
+            remote = upload_report_artifact(
+                path,
+                session_id=active_session_id,
+                artifact_id=artifact_id,
+                filename=filename,
+                media_type=MEDIA_TYPES[output_format],
+            )
+        except Exception:
+            # Export is successful only when the configured durable destination
+            # has accepted the object. Do not leave a local-only artifact that
+            # the API could mistake for a completed OSS report.
+            path.unlink(missing_ok=True)
+            raise
+        return _json(
+            {
+                "ok": True,
+                "artifact_id": artifact_id,
+                "session_id": active_session_id,
+                "filename": filename,
+                "format": output_format,
+                "media_type": MEDIA_TYPES[output_format],
+                "size_bytes": len(content),
+                "row_count": len(rows),
+                "truncated": truncated,
+                "result_id": result["result_id"],
+                "path": path.name,
+                "validated": validation["status"] == "passed",
+                "validation": validation,
+                **(remote or {}),
+                "next_step": (
+                    "Return the download_url and file metadata to the user."
+                    if remote
+                    else "Return the file metadata and tell the user to use the file link."
+                ),
+            }
+        )
+    except Exception as exc:
+        return _error(exc)

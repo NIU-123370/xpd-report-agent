@@ -8,8 +8,15 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from xpd_report_agent.api.session_service import (
     CLIENT_SESSION_KEY_HEADER,
-    owner_scope,
-    validate_session_key,
+    CLIENT_USER_ID_HEADER,
+    IDENTITY_MODE_USER_ID,
+    identity_mode,
+    resolve_owner_scope,
+)
+from xpd_report_agent.memory_paths import (
+    local_memory_dir,
+    merchant_memory_path,
+    user_memory_dir,
 )
 
 router = APIRouter(prefix="/api")
@@ -22,8 +29,9 @@ MEMORY_FILES = (
 
 def _client_scope(
     raw_key: Annotated[str | None, Header(alias=CLIENT_SESSION_KEY_HEADER)] = None,
+    raw_user_id: Annotated[str | None, Header(alias=CLIENT_USER_ID_HEADER)] = None,
 ) -> str:
-    return owner_scope(validate_session_key(raw_key))
+    return resolve_owner_scope(session_key=raw_key, user_id=raw_user_id)
 
 
 MemoryScope = Annotated[str, Depends(_client_scope)]
@@ -44,13 +52,61 @@ def _consolidation_ratio() -> float:
     return min(0.95, max(0.5, ratio))
 
 
-def memory_file_snapshots() -> list[dict]:
-    memory_dir = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser() / "memories"
+def _memory_specs(scope: str | None) -> list[tuple[str, Path, str, str, str, int, bool]]:
+    if identity_mode() == IDENTITY_MODE_USER_ID:
+        personal_dir = user_memory_dir(scope or "")
+        specs = [
+            (
+                "agent",
+                personal_dir / "MEMORY.md",
+                "personal/MEMORY.md",
+                "个人反思记忆",
+                "XPD_MEMORY_CHAR_LIMIT",
+                2200,
+                False,
+            ),
+            (
+                "user",
+                personal_dir / "USER.md",
+                "personal/USER.md",
+                "个人画像记忆",
+                "XPD_USER_CHAR_LIMIT",
+                1375,
+                False,
+            ),
+        ]
+        merchant_enabled = os.getenv(
+            "XPD_MERCHANT_MEMORY_ENABLED", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not merchant_enabled:
+            return specs
+        return [
+            (
+                "merchant",
+                merchant_memory_path(),
+                "merchant/MEMORY.md",
+                "商家公共经营记忆",
+                "XPD_MERCHANT_MEMORY_CHAR_LIMIT",
+                2200,
+                True,
+            ),
+            *specs,
+        ]
+
+    memory_dir = local_memory_dir()
+    return [
+        (store, memory_dir / filename, filename, label, env_name, default, False)
+        for store, filename, label, env_name, default in MEMORY_FILES
+    ]
+
+
+def memory_file_snapshots(scope: str | None = None) -> list[dict]:
     watermark = _consolidation_ratio()
     snapshots = []
 
-    for store, filename, label, env_name, default_limit in MEMORY_FILES:
-        path = memory_dir / filename
+    for store, path, filename, label, env_name, default_limit, read_only in _memory_specs(
+        scope
+    ):
         try:
             content = path.read_text(encoding="utf-8") if path.exists() else ""
             modified_at = path.stat().st_mtime if path.exists() else None
@@ -68,6 +124,7 @@ def memory_file_snapshots() -> list[dict]:
                 "filename": filename,
                 "label": label,
                 "content": content,
+                "read_only": read_only,
                 "exists": path.exists(),
                 "used_chars": used_chars,
                 "limit_chars": limit,
@@ -82,9 +139,15 @@ def memory_file_snapshots() -> list[dict]:
 
 
 @router.get("/memories")
-async def get_memory_files(_scope: MemoryScope) -> dict:
+async def get_memory_files(scope: MemoryScope) -> dict:
+    mode = identity_mode()
     return {
         "ok": True,
-        "scope": "local_hermes_profile",
-        "data": memory_file_snapshots(),
+        "scope": (
+            "authenticated_user"
+            if mode == IDENTITY_MODE_USER_ID
+            else "local_hermes_profile"
+        ),
+        "identity_mode": mode,
+        "data": memory_file_snapshots(scope),
     }

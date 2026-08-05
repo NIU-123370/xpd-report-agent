@@ -3,6 +3,14 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _stable_test_identity_mode(monkeypatch):
+    # Tests opt into user_id explicitly. Never let a developer's ignored
+    # configs/local.env change the baseline assumptions of unrelated tests.
+    monkeypatch.setenv("XPD_IDENTITY_MODE", "session_key")
+    monkeypatch.setenv("XPD_REPORT_OSS_ENABLED", "false")
+
+
 def _columns(*names: str, primary_key: tuple[str, ...] = ()) -> list[dict]:
     return [
         {

@@ -145,7 +145,10 @@ cython_debug/
 
 # xpd-report-agent local runtime state
 configs/local.env
+configs/cloud.env
 data/*.sqlite
+data/report-files/
+outputs/
 !data/.gitkeep
 logs/
 .run/

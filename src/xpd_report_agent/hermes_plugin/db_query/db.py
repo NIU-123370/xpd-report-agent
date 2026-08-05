@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from functools import lru_cache
-from typing import Any
+from math import isfinite
+from typing import Any, Callable, TypeVar
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -15,6 +17,37 @@ MYSQL_ENV_KEYS = (
     "MYSQL_PASSWORD",
     "MYSQL_DATABASE",
 )
+
+MYSQL_READ_MAX_ATTEMPTS_ENV = "XPD_MYSQL_READ_MAX_ATTEMPTS"
+MYSQL_READ_RETRY_BACKOFF_MS_ENV = "XPD_MYSQL_READ_RETRY_BACKOFF_MS"
+
+DEFAULT_MYSQL_READ_MAX_ATTEMPTS = 2
+MAX_MYSQL_READ_MAX_ATTEMPTS = 3
+DEFAULT_MYSQL_READ_RETRY_BACKOFF_MS = 100.0
+MAX_MYSQL_READ_RETRY_BACKOFF_MS = 500.0
+MAX_MYSQL_READ_RETRY_TOTAL_DELAY_MS = 1_000.0
+
+# These codes represent an unavailable/lost connection, not a problem with the
+# submitted SQL. In particular, query timeouts (for example 3024), syntax
+# errors, missing columns, and permission errors are intentionally absent.
+TRANSIENT_MYSQL_CONNECTION_ERROR_CODES = frozenset(
+    {
+        1040,  # Too many connections.
+        2002,  # Cannot connect through the local socket.
+        2003,  # Cannot connect to the MySQL server.
+        2006,  # MySQL server has gone away.
+        2013,  # Lost connection during query.
+        2055,  # Lost connection at handshake/reading initial communication.
+    }
+)
+
+MYSQL_QUERY_TIMEOUT_MARKERS = (
+    "timed out",
+    "read timeout",
+    "query timeout",
+)
+
+_ResultT = TypeVar("_ResultT")
 
 LOGICAL_FOREIGN_KEYS = (
     {
@@ -46,7 +79,7 @@ def get_mysql_config() -> dict[str, Any]:
     }
 
 
-def connect_readonly() -> pymysql.Connection:
+def _connect_readonly_once() -> pymysql.Connection:
     config = get_mysql_config()
     return pymysql.connect(
         **config,
@@ -58,6 +91,217 @@ def connect_readonly() -> pymysql.Connection:
         write_timeout=10,
         init_command="SET SESSION TRANSACTION READ ONLY",
     )
+
+
+def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _bounded_float_env(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if not isfinite(value):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def mysql_read_retry_config() -> tuple[int, float]:
+    """Return bounded total attempts and base backoff in seconds."""
+
+    attempts = _bounded_int_env(
+        MYSQL_READ_MAX_ATTEMPTS_ENV,
+        DEFAULT_MYSQL_READ_MAX_ATTEMPTS,
+        minimum=1,
+        maximum=MAX_MYSQL_READ_MAX_ATTEMPTS,
+    )
+    backoff_ms = _bounded_float_env(
+        MYSQL_READ_RETRY_BACKOFF_MS_ENV,
+        DEFAULT_MYSQL_READ_RETRY_BACKOFF_MS,
+        minimum=0.0,
+        maximum=MAX_MYSQL_READ_RETRY_BACKOFF_MS,
+    )
+    return attempts, backoff_ms / 1_000.0
+
+
+def _exception_chain(exc: BaseException):
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def is_transient_mysql_connection_error(
+    exc: BaseException,
+    *,
+    during_connect: bool,
+) -> bool:
+    """Classify only explicit connection failures as safe read retries."""
+
+    for current in _exception_chain(exc):
+        if isinstance(current, pymysql.MySQLError):
+            code = current.args[0] if current.args else None
+            # An explicit MySQL code is authoritative. Do not let an incidental
+            # chained transport exception turn a syntax/permission/timeout
+            # error into a retryable one.
+            if isinstance(code, int):
+                # PyMySQL wraps socket read timeouts raised while waiting for a
+                # query result as OperationalError(2013), the same code used
+                # for a genuine connection loss. Retrying that slow query can
+                # amplify database load, so use the message to keep query/read
+                # timeouts non-retryable after the connection was established.
+                message = " ".join(str(part) for part in current.args[1:]).lower()
+                if (
+                    not during_connect
+                    and code == 2013
+                    and any(marker in message for marker in MYSQL_QUERY_TIMEOUT_MARKERS)
+                ):
+                    return False
+                return code in TRANSIENT_MYSQL_CONNECTION_ERROR_CODES
+
+        # A transport can reset after execute has started. Retrying is safe
+        # because this plugin accepts only validated, read-only SELECT queries.
+        if isinstance(
+            current,
+            (ConnectionResetError, ConnectionAbortedError, BrokenPipeError),
+        ):
+            return True
+
+        # A raw timeout/refusal is retryable only while opening the connection.
+        # During cursor execution it may instead be a query/read timeout, which
+        # must not be retried mechanically.
+        if during_connect and isinstance(
+            current,
+            (TimeoutError, ConnectionRefusedError),
+        ):
+            return True
+
+    return False
+
+
+def _retry_delay_seconds(
+    failed_attempt: int,
+    *,
+    base_backoff_seconds: float,
+    total_delay_seconds: float,
+) -> float:
+    requested = base_backoff_seconds * (2 ** max(0, failed_attempt - 1))
+    remaining = max(
+        0.0,
+        (MAX_MYSQL_READ_RETRY_TOTAL_DELAY_MS / 1_000.0) - total_delay_seconds,
+    )
+    return min(requested, remaining)
+
+
+def _sleep_before_retry(
+    failed_attempt: int,
+    *,
+    base_backoff_seconds: float,
+    total_delay_seconds: float,
+) -> float:
+    delay = _retry_delay_seconds(
+        failed_attempt,
+        base_backoff_seconds=base_backoff_seconds,
+        total_delay_seconds=total_delay_seconds,
+    )
+    if delay > 0:
+        time.sleep(delay)
+    return total_delay_seconds + delay
+
+
+def connect_readonly() -> pymysql.Connection:
+    """Open a read-only connection, retrying only transient connect failures."""
+
+    attempts, backoff_seconds = mysql_read_retry_config()
+    total_delay_seconds = 0.0
+    for attempt in range(1, attempts + 1):
+        try:
+            return _connect_readonly_once()
+        except Exception as exc:
+            if attempt >= attempts or not is_transient_mysql_connection_error(
+                exc,
+                during_connect=True,
+            ):
+                raise
+            total_delay_seconds = _sleep_before_retry(
+                attempt,
+                base_backoff_seconds=backoff_seconds,
+                total_delay_seconds=total_delay_seconds,
+            )
+
+    raise RuntimeError("MySQL connection retry loop exited unexpectedly")
+
+
+_DEFAULT_RETRYING_CONNECTION_FACTORY = connect_readonly
+
+
+def execute_readonly_with_retry(
+    operation: Callable[[pymysql.Connection], _ResultT],
+    *,
+    connection_factory: Callable[[], pymysql.Connection] | None = None,
+) -> _ResultT:
+    """Run one read-only operation with a fresh connection per attempt."""
+
+    attempts, backoff_seconds = mysql_read_retry_config()
+    total_delay_seconds = 0.0
+
+    # The public factory already retries connection establishment. Bypass that
+    # inner loop here so the configured maximum remains a true total-attempt
+    # cap. A custom factory is supported for tests and embedders.
+    if (
+        connection_factory is None
+        or connection_factory is _DEFAULT_RETRYING_CONNECTION_FACTORY
+    ):
+        open_connection = _connect_readonly_once
+    else:
+        open_connection = connection_factory
+
+    for attempt in range(1, attempts + 1):
+        conn: pymysql.Connection | None = None
+        during_connect = True
+        retry = False
+        try:
+            conn = open_connection()
+            during_connect = False
+            return operation(conn)
+        except Exception as exc:
+            if attempt >= attempts or not is_transient_mysql_connection_error(
+                exc,
+                during_connect=during_connect,
+            ):
+                raise
+            retry = True
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    # The connection is discarded either way. A close failure
+                    # must not hide the original query error or turn a
+                    # successful, read-only query into an unknown outcome.
+                    pass
+
+        if retry:
+            total_delay_seconds = _sleep_before_retry(
+                attempt,
+                base_backoff_seconds=backoff_seconds,
+                total_delay_seconds=total_delay_seconds,
+            )
+
+    raise RuntimeError("MySQL read retry loop exited unexpectedly")
 
 
 def quote_ident(name: str) -> str:
@@ -84,12 +328,12 @@ def _fetch_one(conn: pymysql.Connection, sql: str, params: tuple = ()) -> dict[s
 @lru_cache(maxsize=1)
 def load_schema() -> dict[str, Any]:
     database = get_mysql_config()["database"]
-    conn = connect_readonly()
-    try:
+
+    def load_from_connection(conn: pymysql.Connection) -> dict[str, Any]:
         table_rows = _fetch_all(
             conn,
             """
-            SELECT TABLE_NAME AS name
+            SELECT TABLE_NAME AS name, TABLE_ROWS AS estimated_row_count
             FROM INFORMATION_SCHEMA.TABLES
             WHERE TABLE_SCHEMA = %s
               AND TABLE_TYPE = 'BASE TABLE'
@@ -98,6 +342,9 @@ def load_schema() -> dict[str, Any]:
             (database,),
         )
         tables = [row["name"] for row in table_rows]
+        estimated_rows = {
+            str(row["name"]): row.get("estimated_row_count") for row in table_rows
+        }
         result: dict[str, Any] = {"tables": {}, "foreign_keys": []}
 
         for table in tables:
@@ -180,18 +427,16 @@ def load_schema() -> dict[str, Any]:
                 )
                 index["columns"].append(row["column_name"])
 
-            row_count = _fetch_one(
-                conn,
-                f"SELECT COUNT(*) AS c FROM {quote_ident(table)}",
-            )["c"]
-
             result["tables"][table] = {
                 "name": table,
                 "columns": columns,
                 "primary_key": pk_columns,
                 "foreign_keys": foreign_keys,
                 "indexes": list(indexes_by_name.values()),
-                "row_count": row_count,
+                # INFORMATION_SCHEMA.TABLES avoids running COUNT(*) against
+                # every table when a production database contains many tables.
+                "row_count": estimated_rows.get(table),
+                "row_count_is_estimate": True,
             }
             result["foreign_keys"].extend(foreign_keys)
 
@@ -206,8 +451,11 @@ def load_schema() -> dict[str, Any]:
                 result["tables"][item["from_table"]]["foreign_keys"].append(item)
 
         return result
-    finally:
-        conn.close()
+
+    return execute_readonly_with_retry(
+        load_from_connection,
+        connection_factory=connect_readonly,
+    )
 
 
 def clear_schema_cache() -> None:
@@ -220,21 +468,20 @@ def get_sample_rows(table: str, limit: int = 3) -> list[dict[str, Any]]:
         raise ValueError(f"Unknown table: {table}")
 
     safe_limit = max(0, min(int(limit), 20))
-    conn = connect_readonly()
-    try:
-        return _fetch_all(
+    return execute_readonly_with_retry(
+        lambda conn: _fetch_all(
             conn,
             f"SELECT * FROM {quote_ident(table)} LIMIT %s",
             (safe_limit,),
-        )
-    finally:
-        conn.close()
+        ),
+        connection_factory=connect_readonly,
+    )
 
 
 def get_schema_ddl() -> str:
     schema = load_schema()
-    conn = connect_readonly()
-    try:
+
+    def load_ddl_from_connection(conn: pymysql.Connection) -> str:
         statements = []
         for table in schema["tables"]:
             row = _fetch_one(conn, f"SHOW CREATE TABLE {quote_ident(table)}")
@@ -242,5 +489,8 @@ def get_schema_ddl() -> str:
             if ddl:
                 statements.append(ddl.strip().rstrip(";") + ";")
         return "\n\n".join(statements)
-    finally:
-        conn.close()
+
+    return execute_readonly_with_retry(
+        load_ddl_from_connection,
+        connection_factory=connect_readonly,
+    )

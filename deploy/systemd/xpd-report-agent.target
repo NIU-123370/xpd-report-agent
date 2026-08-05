@@ -1,0 +1,7 @@
+[Unit]
+Description=XPD Report Agent services
+Wants=xpd-hermes.service xpd-fastapi.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

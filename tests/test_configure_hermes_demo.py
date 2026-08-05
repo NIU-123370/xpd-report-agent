@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import yaml
 
-from xpd_report_agent.runtime.hermes_config import API_SERVER_TOOLSETS, configure_config
+from xpd_report_agent.runtime.hermes_config import (
+    API_SERVER_TOOLSETS,
+    configure_config,
+)
 
 
 def test_configure_config_enables_db_query_for_api_server(tmp_path):
@@ -22,10 +25,14 @@ def test_configure_config_enables_db_query_for_api_server(tmp_path):
     data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
     assert result["api_server_toolsets"] == API_SERVER_TOOLSETS
+    assert result["session_search_enabled"] is True
+    assert result["required_memory_tools"] == ["session_search", "memory"]
     assert "db-query" in data["plugins"]["enabled"]
     assert "db-query" not in data["plugins"]["disabled"]
     assert data["platform_toolsets"]["api_server"] == API_SERVER_TOOLSETS
     assert "db_query" in data["known_plugin_toolsets"]["api_server"]
+    assert "report_file" in data["known_plugin_toolsets"]["api_server"]
+    assert "file" in data["platform_toolsets"]["api_server"]
     assert data["memory"] == {
         "memory_enabled": True,
         "user_profile_enabled": True,
@@ -34,6 +41,39 @@ def test_configure_config_enables_db_query_for_api_server(tmp_path):
         "nudge_interval": 3,
         "flush_min_turns": 3,
     }
+    assert result["timezone"] == "Asia/Shanghai"
+    assert result["cron"]["max_parallel_jobs"] == 1
+    assert data["timezone"] == "Asia/Shanghai"
+    assert data["cron"]["max_parallel_jobs"] == 1
+
+
+def test_user_id_mode_disables_unscoped_session_search_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("XPD_IDENTITY_MODE", "user_id")
+    monkeypatch.delenv("XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED", raising=False)
+    config_path = tmp_path / "config.yaml"
+
+    result = configure_config(config_path, model_config={})
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert "session_search" not in result["api_server_toolsets"]
+    assert "session_search" not in data["platform_toolsets"]["api_server"]
+    assert "memory" in result["api_server_toolsets"]
+    assert result["session_search_enabled"] is False
+    assert result["required_memory_tools"] == ["memory"]
+
+
+def test_user_id_mode_requires_explicit_unsafe_switch_for_session_search(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XPD_IDENTITY_MODE", "user_id")
+    monkeypatch.setenv("XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED", "true")
+    config_path = tmp_path / "config.yaml"
+
+    result = configure_config(config_path, model_config={})
+
+    assert "session_search" in result["api_server_toolsets"]
+    assert result["session_search_enabled"] is True
+    assert result["required_memory_tools"] == ["session_search", "memory"]
 
 
 def test_configure_config_writes_model_config_without_leaking_key(tmp_path):

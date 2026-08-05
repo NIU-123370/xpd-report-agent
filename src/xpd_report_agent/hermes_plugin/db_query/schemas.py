@@ -1,6 +1,10 @@
 DB_GET_SCHEMA_DDL = {
     "name": "db_get_schema_ddl",
-    "description": "Get the MySQL report database DDL and table relationship summary. Call this first, before any other db-query tool, when answering MySQL database questions.",
+    "description": (
+        "Get the complete MySQL report database DDL and relationship summary for "
+        "diagnostics. Use only when schema search has no usable result, schema metadata "
+        "is inconsistent, or the user explicitly requests schema troubleshooting."
+    ),
     "parameters": {
         "type": "object",
         "properties": {},
@@ -10,7 +14,10 @@ DB_GET_SCHEMA_DDL = {
 
 DB_SCHEMA_SEARCH = {
     "name": "db_schema_search",
-    "description": "Search relevant MySQL tables, columns, business meanings, and metrics for a natural language database question. Use only after db_get_schema_ddl has been called for the question.",
+    "description": (
+        "Search relevant MySQL tables, columns, business meanings, and metrics for a "
+        "natural language database question. Use this as the first database discovery tool."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -30,7 +37,11 @@ DB_SCHEMA_SEARCH = {
 
 DB_GET_TABLE_PROFILE = {
     "name": "db_get_table_profile",
-    "description": "Get metadata for selected MySQL tables, including columns, primary keys, foreign keys, indexes, row counts, and sample rows.",
+    "description": (
+        "Get metadata for selected MySQL tables, including columns, primary keys, foreign "
+        "keys, indexes, and row counts. Sample rows are optional and should be requested "
+        "only when metadata is insufficient to resolve table semantics."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -41,7 +52,7 @@ DB_GET_TABLE_PROFILE = {
             },
             "include_samples": {
                 "type": "boolean",
-                "default": True,
+                "default": False,
             },
         },
         "required": ["tables"],
@@ -91,7 +102,56 @@ DB_EXECUTE_SQL = {
             },
             "max_rows": {
                 "type": "integer",
-                "default": 100,
+                "minimum": 1,
+                "maximum": 1000,
+                "description": (
+                    "Maximum rows to return. Defaults to 100 for ordinary analysis "
+                    "and 1000 when capture_for_export=true."
+                ),
+            },
+            "capture_for_export": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Compatibility hint: set true when the same request combines a new query "
+                    "with file export, raising the default row cap from 100 to 1000. Every "
+                    "successful session query already returns a short-lived result_id, so a "
+                    "later pure export request must reuse that result_id instead of re-querying."
+                ),
+            },
+            "quality_context": {
+                "type": "object",
+                "description": (
+                    "Optional bounded context used by the server to calculate period "
+                    "coverage, zero denominators, small samples, and missing dimensions."
+                ),
+                "properties": {
+                    "period_start": {"type": "string", "format": "date"},
+                    "period_end": {"type": "string", "format": "date"},
+                    "time_column": {"type": "string"},
+                    "required_dimensions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 10,
+                    },
+                    "denominator_columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 20,
+                    },
+                    "sample_size_columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 20,
+                    },
+                    "small_sample_threshold": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10000,
+                        "default": 30,
+                    },
+                },
+                "additionalProperties": False,
             },
         },
         "required": ["sql"],

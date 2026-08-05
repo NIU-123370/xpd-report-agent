@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>xpd-report-agent</title>
+    <title>直播经营助手</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -11,10 +11,11 @@
       <section class="workspace" aria-label="xpd-report-agent">
         <aside class="sidebar">
           <div class="brand">
-            <div class="mark" aria-hidden="true">H</div>
-            <div>
-              <h1>xpd-report-agent</h1>
-              <p id="statusText">Checking</p>
+            <div class="mark" aria-hidden="true">播</div>
+            <div class="brand-copy">
+              <span class="brand-kicker">LIVE DATA DESK</span>
+              <h1>直播经营助手</h1>
+              <p id="statusText">正在连接服务</p>
             </div>
           </div>
 
@@ -29,33 +30,80 @@
             <div id="sessionList" class="session-list" aria-live="polite"></div>
           </section>
 
-          <button id="memoryViewButton" class="memory-entry" type="button">
-            <span aria-hidden="true">M</span>
-            <span>
-              <strong>Agent 记忆</strong>
-              <small>查看 MEMORY.md / USER.md</small>
-            </span>
-          </button>
+          <section class="management-tools" aria-label="工作台">
+            <p class="section-label">工作台</p>
+            <button id="memoryViewButton" class="memory-entry" type="button">
+              <span aria-hidden="true">忆</span>
+              <span>
+                <strong>Agent 记忆</strong>
+                <small>查看长期记忆文件</small>
+              </span>
+            </button>
 
-          <div class="examples" aria-label="Example questions">
+            <button id="scheduleViewButton" class="memory-entry" type="button" hidden>
+              <span aria-hidden="true">时</span>
+              <span>
+                <strong>定时报告</strong>
+                <small>日报 / 周报自动生成</small>
+              </span>
+            </button>
+          </section>
+
+          <section class="analysis-tools" aria-label="经营分析">
+            <p class="section-label">经营分析</p>
+            <button
+              class="analysis-entry"
+              type="button"
+              data-analysis-preset="refund_diagnosis"
+            >
+              <span aria-hidden="true">退</span>
+              <span>
+                <strong>退款诊断</strong>
+                <small>定位高退款商品与场次</small>
+              </span>
+            </button>
+            <button
+              class="analysis-entry"
+              type="button"
+              data-analysis-preset="product_ranking"
+            >
+              <span aria-hidden="true">榜</span>
+              <span>
+                <strong>商品排行</strong>
+                <small>按成交、订单或退款排名</small>
+              </span>
+            </button>
+            <button
+              class="analysis-entry"
+              type="button"
+              data-analysis-preset="repurchase_analysis"
+            >
+              <span aria-hidden="true">复</span>
+              <span>
+                <strong>复购分析</strong>
+                <small>检查买家复购与留存</small>
+              </span>
+            </button>
+          </section>
+
+          <div class="examples" aria-label="示例问题">
             <p class="section-label">示例问题</p>
-            <button type="button" data-example="最近30天每个品牌的GMV是多少？">品牌 GMV</button>
-            <button type="button" data-example="最近30天各类目的GMV和订单数是多少？">类目表现</button>
-            <button type="button" data-example="最近30天各渠道的GMV、订单数和客单价是多少？">渠道分析</button>
-            <button type="button" data-example="最近60天各品牌的退款金额和退款率是多少？">退款率</button>
-            <button type="button" data-example="最近90天复购客户数和复购率是多少？">复购客户</button>
+            <button type="button" data-example="分析最近30天直播整体的成交、流量和退款表现。">经营概览</button>
+            <button type="button" data-example="统计最近30天成交金额排名前10的商品。">商品排行</button>
+            <button type="button" data-example="对比最近30天各直播场次的成交金额、订单数和退款率。">场次表现</button>
+            <button type="button" data-example="找出最近30天退款率和退款金额异常的商品。">退款异常</button>
           </div>
 
-          <label class="toggle">
-            <input id="streamToggle" type="checkbox" checked />
-            <span>Streaming</span>
+          <label class="toggle toggle-fixed" title="澄清交互需要保持流式连接">
+            <input id="streamToggle" type="checkbox" checked disabled />
+            <span>流式交互已开启</span>
           </label>
         </aside>
 
         <section id="chatPanel" class="chat-panel">
           <header class="chat-header">
             <div class="chat-title">
-              <span>当前对话</span>
+              <span id="currentSessionEyebrow">当前对话</span>
               <h2 id="currentSessionTitle">新对话</h2>
             </div>
             <div class="chat-actions">
@@ -70,10 +118,10 @@
             <textarea
               id="messageInput"
               rows="2"
-              placeholder="输入数据问题"
+              placeholder="输入想分析的数据问题…"
               autocomplete="off"
             ></textarea>
-            <button id="sendButton" type="submit" aria-label="Send">
+            <button id="sendButton" type="submit" aria-label="发送">
               <span aria-hidden="true">→</span>
             </button>
           </form>
@@ -93,9 +141,171 @@
 
           <div class="memory-content">
             <p class="memory-help">
-              这里原样展示 Hermes 当前使用的两个记忆文件。刷新后可观察反思写入带来的变化。
+              这里原样展示 Hermes 当前使用的记忆文件。本地模式显示原有文件；接入中台后显示商家共享记忆和当前用户的个人记忆。
             </p>
             <div id="memoryFiles" class="memory-files" aria-live="polite"></div>
+          </div>
+        </section>
+
+        <section id="schedulePanel" class="schedule-panel" aria-label="定时报告" hidden>
+          <header class="chat-header">
+            <div class="chat-title">
+              <span>北京时间（Asia/Shanghai）</span>
+              <h2>定时报告</h2>
+            </div>
+            <div class="chat-actions">
+              <button id="refreshScheduleButton" type="button">刷新</button>
+              <button id="newScheduleButton" type="button">新增计划</button>
+              <button id="backFromScheduleButton" type="button">返回对话</button>
+            </div>
+          </header>
+
+          <div class="schedule-content">
+            <p class="schedule-help">
+              设置自动生成经营日报或品牌表现报告的时间。所有日期与时间均按北京时间执行，精确到分钟。
+            </p>
+
+            <form id="scheduleForm" class="schedule-form" hidden>
+              <div class="schedule-form-heading">
+                <div>
+                  <span>报告计划</span>
+                  <h3 id="scheduleFormTitle">新增定时报告</h3>
+                </div>
+                <span class="schedule-timezone">北京时间</span>
+              </div>
+
+              <div class="schedule-fields">
+                <label>
+                  <span>报告类型</span>
+                  <select id="scheduleReportType" required>
+                    <option value="daily_operations">经营日报</option>
+                    <option value="weekly_brand">品牌表现报告</option>
+                  </select>
+                </label>
+
+                <label>
+                  <span>执行频率</span>
+                  <select id="scheduleFrequency" required>
+                    <option value="once">仅执行一次</option>
+                    <option value="daily">每天</option>
+                    <option value="weekly">每周</option>
+                  </select>
+                </label>
+
+                <label id="scheduleDateField">
+                  <span>执行日期</span>
+                  <input id="scheduleRunDate" type="date" />
+                </label>
+
+                <label id="scheduleWeekdayField" hidden>
+                  <span>执行星期</span>
+                  <select id="scheduleWeekday">
+                    <option value="1">星期一</option>
+                    <option value="2">星期二</option>
+                    <option value="3">星期三</option>
+                    <option value="4">星期四</option>
+                    <option value="5">星期五</option>
+                    <option value="6">星期六</option>
+                    <option value="7">星期日</option>
+                  </select>
+                </label>
+
+                <label>
+                  <span>执行时间（北京时间）</span>
+                  <input id="scheduleTime" type="time" step="60" required />
+                </label>
+
+                <label>
+                  <span>文件格式</span>
+                  <select id="scheduleFormat" required>
+                    <option value="xlsx">Excel（XLSX）</option>
+                    <option value="csv">CSV</option>
+                    <option value="markdown">Markdown</option>
+                    <option value="pdf">PDF</option>
+                    <option value="json">JSON</option>
+                  </select>
+                </label>
+              </div>
+
+              <p id="scheduleFormError" class="schedule-form-error" aria-live="polite"></p>
+              <div class="schedule-form-actions">
+                <button id="cancelScheduleButton" type="button">取消</button>
+                <button id="saveScheduleButton" class="primary" type="submit">保存计划</button>
+              </div>
+            </form>
+
+            <p id="scheduleNotice" class="schedule-notice" aria-live="polite"></p>
+            <div id="scheduleList" class="schedule-list" aria-live="polite"></div>
+          </div>
+        </section>
+
+        <section id="analysisPanel" class="analysis-panel" aria-label="经营分析" hidden>
+          <header class="chat-header">
+            <div class="chat-title">
+              <span id="analysisEyebrow">经营分析</span>
+              <h2 id="analysisTitle">退款诊断</h2>
+            </div>
+            <div class="chat-actions">
+              <button id="backFromAnalysisButton" type="button">返回对话</button>
+            </div>
+          </header>
+
+          <div class="analysis-content">
+            <section class="analysis-intro">
+              <span id="analysisStatus" class="analysis-status">正在检查数据能力…</span>
+              <h3 id="analysisHeading">退款诊断</h3>
+              <p id="analysisDescription"></p>
+              <p id="analysisCapabilityNote" class="analysis-capability-note" aria-live="polite"></p>
+            </section>
+
+            <form id="analysisForm" class="analysis-form">
+              <div class="analysis-fields">
+                <label>
+                  <span>分析周期</span>
+                  <select id="analysisPeriod" required>
+                    <option value="7">最近 7 天</option>
+                    <option value="30" selected>最近 30 天</option>
+                    <option value="60">最近 60 天</option>
+                    <option value="90">最近 90 天</option>
+                  </select>
+                </label>
+
+                <label id="analysisFocusField">
+                  <span id="analysisFocusLabel">诊断维度</span>
+                  <select id="analysisFocus"></select>
+                </label>
+
+                <label id="analysisTopField" hidden>
+                  <span>排行数量</span>
+                  <select id="analysisTopN">
+                    <option value="10">Top 10</option>
+                    <option value="20">Top 20</option>
+                    <option value="50">Top 50</option>
+                  </select>
+                </label>
+              </div>
+
+              <label class="analysis-note-field">
+                <span>补充要求（可选）</span>
+                <textarea
+                  id="analysisNote"
+                  rows="3"
+                  maxlength="500"
+                  placeholder="例如：重点关注退款率突然上升的商品"
+                ></textarea>
+              </label>
+
+              <p id="analysisFormError" class="analysis-form-error" aria-live="polite"></p>
+              <div class="analysis-form-actions">
+                <button id="startAnalysisButton" class="primary" type="submit">
+                  发起分析
+                </button>
+              </div>
+            </form>
+
+            <p class="analysis-footnote">
+              分析将在当前对话中流式运行，查询过程和结果会保留在历史记录中。
+            </p>
           </div>
         </section>
       </section>

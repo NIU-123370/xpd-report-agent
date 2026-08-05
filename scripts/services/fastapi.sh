@@ -4,28 +4,56 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-if [ "${LAUNCH_MANAGED:-false}" != "true" ] && [ -f "$ROOT/.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$ROOT/.env"
-  set +a
-fi
-
-if [ "${LAUNCH_MANAGED:-false}" != "true" ] && [ -f "$ROOT/configs/local.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$ROOT/configs/local.env"
-  set +a
+if [ "${LAUNCH_MANAGED:-false}" != "true" ]; then
+  xpd_inherited_exports="$(export -p)"
+  if [ -f "$ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$ROOT/.env"
+    set +a
+  fi
+  if [ -f "$ROOT/configs/local.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$ROOT/configs/local.env"
+    set +a
+  fi
+  # `export -p` produces shell-escaped declarations. Replaying the inherited
+  # environment keeps process variables above both local configuration files.
+  eval "$xpd_inherited_exports"
+  unset xpd_inherited_exports
 fi
 
 export HERMES_GATEWAY_HOST="${HERMES_GATEWAY_HOST:-127.0.0.1}"
 export HERMES_GATEWAY_PORT="${HERMES_GATEWAY_PORT:-8642}"
 export HERMES_GATEWAY_API_KEY="${HERMES_GATEWAY_API_KEY:-dev-secret}"
 export HERMES_GATEWAY_MODEL="${HERMES_GATEWAY_MODEL:-hermes-agent}"
+export HERMES_TIMEZONE="${HERMES_TIMEZONE:-Asia/Shanghai}"
 
 export FASTAPI_HOST="${FASTAPI_HOST:-127.0.0.1}"
 export FASTAPI_PORT="${FASTAPI_PORT:-8000}"
 export FASTAPI_RELOAD="${FASTAPI_RELOAD:-false}"
+export XPD_SERVICE_AUTH_ENABLED="${XPD_SERVICE_AUTH_ENABLED:-false}"
+export XPD_AGENT_MAX_CONCURRENCY="${XPD_AGENT_MAX_CONCURRENCY:-3}"
+export XPD_AGENT_RUN_MAX_ATTEMPTS="${XPD_AGENT_RUN_MAX_ATTEMPTS:-2}"
+export XPD_AGENT_CHAT_TIMEOUT_SECONDS="${XPD_AGENT_CHAT_TIMEOUT_SECONDS:-600}"
+export XPD_AGENT_RECONCILE_SECONDS="${XPD_AGENT_RECONCILE_SECONDS:-10}"
+export XPD_AGENT_OUTCOME_RECONCILE_SECONDS="${XPD_AGENT_OUTCOME_RECONCILE_SECONDS:-600}"
+export XPD_AGENT_RUN_SHUTDOWN_GRACE_SECONDS="${XPD_AGENT_RUN_SHUTDOWN_GRACE_SECONDS:-30}"
+export XPD_FINAL_REFLECTION_TIMEOUT_SECONDS="${XPD_FINAL_REFLECTION_TIMEOUT_SECONDS:-180}"
+export XPD_HERMES_CONNECT_MAX_ATTEMPTS="${XPD_HERMES_CONNECT_MAX_ATTEMPTS:-3}"
+export XPD_HERMES_RETRY_BASE_SECONDS="${XPD_HERMES_RETRY_BASE_SECONDS:-0.2}"
+
+# These sitecustomize patches belong to the Hermes interpreter. The managed
+# launcher passes one shared environment to both services, so explicitly keep
+# the project FastAPI interpreter from importing Hermes-only gateway modules.
+export XPD_HERMES_REASONING_STREAM_PATCH=false
+export XPD_HERMES_CLARIFY_PATCH=false
+export XPD_HERMES_REPORT_FILE_PATCH=false
+export XPD_HERMES_CRON_PATCH=false
+export XPD_HERMES_USER_MEMORY_PATCH=false
+
+export XPD_FILE_STORAGE_PATH="${XPD_FILE_STORAGE_PATH:-$ROOT/data/report-files}"
 
 PROJECT_PYTHON="${PROJECT_PYTHON:-$ROOT/.venv/bin/python}"
 if [ ! -x "$PROJECT_PYTHON" ]; then

@@ -5,9 +5,17 @@ import time
 from importlib import import_module
 from typing import Any
 
-from .db import connect_readonly, get_sample_rows, get_schema_ddl, load_schema
+from .data_quality import analyze_query_quality
+from .db import (
+    connect_readonly,
+    execute_readonly_with_retry,
+    get_sample_rows,
+    get_schema_ddl,
+    load_schema,
+)
 from .join_graph import find_join_paths
-from .schema_index import TABLE_DESCRIPTIONS, search_schema
+from .query_results import query_result_registry
+from .schema_index import GENERIC_TABLE_DESCRIPTION, TABLE_DESCRIPTIONS, search_schema
 
 BUSINESS_METRICS = {
     "成交金额": "SUM(pay_amt)",
@@ -62,6 +70,8 @@ def db_get_schema_ddl(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
         return to_json(
             {
                 "ok": True,
+                "table_count": len(schema["tables"]),
+                "tables": sorted(schema["tables"]),
                 "ddl": get_schema_ddl(),
                 "relationships": relationships,
                 "metrics": BUSINESS_METRICS,
@@ -86,7 +96,7 @@ def db_get_table_profile(args: dict[str, Any] | None = None, **kwargs: Any) -> s
     try:
         payload = coerce_args(args, **kwargs)
         tables = payload["tables"]
-        include_samples = bool(payload.get("include_samples", True))
+        include_samples = bool(payload.get("include_samples", False))
         schema = load_schema()
 
         result = {}
@@ -97,7 +107,9 @@ def db_get_table_profile(args: dict[str, Any] | None = None, **kwargs: Any) -> s
 
             result[table] = {
                 "ok": True,
-                "description": TABLE_DESCRIPTIONS.get(table, ""),
+                "description": TABLE_DESCRIPTIONS.get(
+                    table, GENERIC_TABLE_DESCRIPTION
+                ),
                 **schema["tables"][table],
             }
             if include_samples:
@@ -135,7 +147,11 @@ def db_execute_sql(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
         if error:
             return to_json({"ok": False, "error": error})
 
-        max_rows = sql_guard.clamp_max_rows(int(payload.get("max_rows", 100)))
+        capture_for_export = bool(payload.get("capture_for_export", False))
+        default_max_rows = sql_guard.MAX_ROWS_CAP if capture_for_export else 100
+        max_rows = sql_guard.clamp_max_rows(
+            int(payload.get("max_rows", default_max_rows))
+        )
 
         validation = sql_guard.validate_sql(sql)
         if not validation.get("ok"):
@@ -149,28 +165,59 @@ def db_execute_sql(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
 
         started = time.time()
         limited_sql = sql_guard.wrap_with_limit(sql, max_rows=max_rows)
-        conn = connect_readonly()
-        try:
+        def execute_query(conn):
             with conn.cursor() as cursor:
                 cursor.execute(limited_sql)
+                description = getattr(cursor, "description", None) or ()
+                described_columns = [str(item[0]) for item in description if item]
                 rows = list(cursor.fetchall())
-        finally:
-            conn.close()
+            return described_columns, rows
+
+        described_columns, rows = execute_readonly_with_retry(
+            execute_query,
+            connection_factory=connect_readonly,
+        )
 
         data = [dict(r) for r in rows[:max_rows]]
-        columns = list(data[0].keys()) if data else []
+        columns = described_columns or (list(data[0].keys()) if data else [])
+        truncated = len(rows) > max_rows
         elapsed_ms = int((time.time() - started) * 1000)
-
-        return to_json(
-            {
-                "ok": True,
-                "columns": columns,
-                "rows": data,
-                "row_count": len(data),
-                "truncated": len(rows) > max_rows,
-                "elapsed_ms": elapsed_ms,
-                "sql": sql,
-            }
+        data_quality = analyze_query_quality(
+            columns=columns,
+            rows=data,
+            max_rows=max_rows,
+            truncated=truncated,
+            context=payload.get("quality_context"),
         )
+        response = {
+            "ok": True,
+            "columns": columns,
+            "rows": data,
+            "row_count": len(data),
+            "truncated": truncated,
+            "elapsed_ms": elapsed_ms,
+            "sql": sql,
+            "data_quality": data_quality,
+        }
+        # Every successful session query gets a short-lived, owner-scoped
+        # snapshot reference. A later pure format request can export the exact
+        # rows already shown without asking the Agent to rediscover Schema or
+        # re-plan and re-run SQL.
+        result_id = query_result_registry.store(
+            # Hermes' persisted API session is the ownership boundary. The
+            # effective task id may be an internal execution identifier.
+            session_id=payload.get("session_id") or payload.get("task_id"),
+            sql=sql,
+            columns=columns,
+            rows=data,
+            truncated=truncated,
+        )
+        if result_id is not None:
+            response["result_id"] = result_id
+        elif payload.get("session_id") or payload.get("task_id"):
+            response["result_capture_error"] = (
+                "The query succeeded, but its short-lived result snapshot could not be stored."
+            )
+        return to_json(response)
     except Exception as exc:
         return error_json(exc)

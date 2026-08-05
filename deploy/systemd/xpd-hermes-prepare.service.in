@@ -1,0 +1,22 @@
+[Unit]
+Description=XPD Report Agent - prepare Hermes runtime
+Documentation=file://@PROJECT_ROOT@/deploy/systemd/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+Environment=HOME=@SERVICE_HOME@
+Environment=LAUNCH_MANAGED=true
+EnvironmentFile=@ENV_FILE@
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart=@PROJECT_ROOT@/scripts/services/hermes.sh prepare
+TimeoutStartSec=10min
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xpd-hermes-prepare

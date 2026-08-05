@@ -9,10 +9,20 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from xpd_report_agent.api.structured_analysis import strip_structured_analysis_block
+from xpd_report_agent.memory_paths import (
+    IDENTITY_MODE_ENV,
+    IDENTITY_MODE_SESSION_KEY,
+    IDENTITY_MODE_USER_ID,
+    configured_identity_mode,
+)
+
 CLIENT_SESSION_KEY_HEADER = "X-XPD-Session-Key"
+CLIENT_USER_ID_HEADER = "X-User-Id"
 SESSION_ID_PREFIX = "xpd"
 SESSION_KEY_MIN_LENGTH = 24
 SESSION_KEY_MAX_LENGTH = 256
+USER_ID_MAX_LENGTH = 128
 
 
 def session_signing_secret() -> str:
@@ -42,9 +52,52 @@ def validate_session_key(session_key: str | None) -> str:
     return value
 
 
+def identity_mode() -> str:
+    mode = configured_identity_mode()
+    if mode not in {IDENTITY_MODE_SESSION_KEY, IDENTITY_MODE_USER_ID}:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"{IDENTITY_MODE_ENV} must be either "
+                f"'{IDENTITY_MODE_SESSION_KEY}' or '{IDENTITY_MODE_USER_ID}'."
+            ),
+        )
+    return mode
+
+
+def validate_user_id(user_id: str | None) -> str:
+    value = (user_id or "").strip()
+    if not value or len(value) > USER_ID_MAX_LENGTH:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                f"{CLIENT_USER_ID_HEADER} must contain a stable user identifier "
+                f"between 1 and {USER_ID_MAX_LENGTH} characters."
+            ),
+        )
+    if re.search(r"[\s\x00-\x1f\x7f]", value):
+        raise HTTPException(status_code=401, detail=f"Invalid {CLIENT_USER_ID_HEADER}.")
+    return value
+
+
 def owner_scope(session_key: str, *, secret: str | None = None) -> str:
     signing_secret = (secret or session_signing_secret()).encode("utf-8")
     return hmac.new(signing_secret, session_key.encode("utf-8"), hashlib.sha256).hexdigest()[:20]
+
+
+def user_owner_scope(user_id: str, *, secret: str | None = None) -> str:
+    # Domain-separate authenticated user IDs from legacy browser session keys.
+    # This prevents identical raw values in the two identity modes from sharing
+    # owner-scoped resources accidentally.
+    return owner_scope(f"user-id:{validate_user_id(user_id)}", secret=secret)
+
+
+def resolve_owner_scope(
+    *, session_key: str | None = None, user_id: str | None = None
+) -> str:
+    if identity_mode() == IDENTITY_MODE_USER_ID:
+        return user_owner_scope(user_id or "")
+    return owner_scope(validate_session_key(session_key))
 
 
 def new_session_id(scope: str) -> str:
@@ -154,6 +207,10 @@ def client_safe_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
             )
             if key in message
         }
+        if role == "assistant" and isinstance(safe_message.get("content"), str):
+            safe_message["content"] = strip_structured_analysis_block(
+                str(safe_message["content"])
+            )
         if role == "assistant":
             reasoning = message.get("reasoning_content") or message.get("reasoning")
             if isinstance(reasoning, str) and reasoning.strip():

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from . import schemas, tools
+from . import report_export, schemas, tools
 
 MYSQL_REQUIRED_ENV = [
     "MYSQL_HOST",
@@ -53,4 +53,11 @@ def register(ctx) -> None:
         schema=schemas.DB_EXECUTE_SQL,
         handler=tools.db_execute_sql,
         requires_env=MYSQL_REQUIRED_ENV,
+    )
+    ctx.register_tool(
+        name="export_report_file",
+        toolset="report_file",
+        schema=report_export.EXPORT_REPORT_FILE_SCHEMA,
+        handler=report_export.export_report_file,
+        requires_env=["XPD_FILE_STORAGE_PATH"],
     )

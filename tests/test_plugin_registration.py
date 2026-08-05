@@ -26,6 +26,11 @@ def test_register_includes_schema_ddl_tool():
     names = [item["name"] for item in ctx.tools]
     assert names[0] == "db_get_schema_ddl"
     assert "db_get_schema_ddl" in names
+    assert "export_report_file" in names
+
+    export_entry = next(item for item in ctx.tools if item["name"] == "export_report_file")
+    assert export_entry["toolset"] == "report_file"
+    assert export_entry["requires_env"] == ["XPD_FILE_STORAGE_PATH"]
 
     entry = next(item for item in ctx.tools if item["name"] == "db_get_schema_ddl")
     assert entry["schema"] == schemas.DB_GET_SCHEMA_DDL
@@ -42,3 +47,4 @@ def test_plugin_manifest_lists_schema_ddl_first():
 
     assert manifest["provides_tools"][0] == "db_get_schema_ddl"
     assert "db_get_schema_ddl" in manifest["provides_tools"]
+    assert "export_report_file" in manifest["provides_tools"]

@@ -14,7 +14,17 @@ MODEL_ENV_MAP = {
     "api_key": "HERMES_LLM_API_KEY",
 }
 
-API_SERVER_TOOLSETS = ["db_query", "session_search", "memory"]
+API_SERVER_TOOLSETS = [
+    "db_query",
+    "report_file",
+    "file",
+    "session_search",
+    "memory",
+    "clarify",
+]
+
+IDENTITY_MODE_ENV = "XPD_IDENTITY_MODE"
+UNSAFE_USER_SESSION_SEARCH_ENV = "XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -32,6 +42,37 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def session_search_enabled_from_env() -> bool:
+    """Return whether Hermes may expose its process-global session search.
+
+    Hermes' native session_search currently has no owner-scope filter. Keep it
+    available for the single-user, local session-key workflow, but fail closed
+    when the middle-platform user_id identity mode is active. The compatibility
+    switch is deliberately named unsafe so enabling it is an explicit decision.
+    """
+
+    identity_mode = os.getenv(IDENTITY_MODE_ENV, "session_key").strip().lower()
+    if identity_mode == "session_key":
+        return True
+    if identity_mode == "user_id":
+        return _env_bool(UNSAFE_USER_SESSION_SEARCH_ENV, False)
+    return False
+
+
+def api_server_toolsets_from_env() -> list[str]:
+    toolsets = list(API_SERVER_TOOLSETS)
+    if not session_search_enabled_from_env():
+        toolsets.remove("session_search")
+    return toolsets
+
+
+def required_memory_tools_from_env() -> list[str]:
+    tools = ["memory"]
+    if session_search_enabled_from_env():
+        tools.insert(0, "session_search")
+    return tools
 
 
 def memory_config_from_env() -> dict:
@@ -105,19 +146,30 @@ def configure_config(
     if "db-query" in disabled:
         plugins["disabled"] = [item for item in disabled if item != "db-query"]
 
+    api_server_toolsets = api_server_toolsets_from_env()
     platform_toolsets = data.setdefault("platform_toolsets", {})
-    platform_toolsets["api_server"] = list(API_SERVER_TOOLSETS)
+    platform_toolsets["api_server"] = api_server_toolsets
 
     known_plugin_toolsets = data.setdefault("known_plugin_toolsets", {})
-    api_server_toolsets = known_plugin_toolsets.setdefault("api_server", [])
-    if "db_query" not in api_server_toolsets:
-        api_server_toolsets.append("db_query")
+    known_api_server_toolsets = known_plugin_toolsets.setdefault("api_server", [])
+    for plugin_toolset in ("db_query", "report_file"):
+        if plugin_toolset not in known_api_server_toolsets:
+            known_api_server_toolsets.append(plugin_toolset)
 
     resolved_memory_config = (
         memory_config if memory_config is not None else memory_config_from_env()
     )
     memory = data.setdefault("memory", {})
     memory.update(resolved_memory_config)
+
+    timezone = os.getenv("HERMES_TIMEZONE", "Asia/Shanghai").strip()
+    if timezone:
+        data["timezone"] = timezone
+    cron = data.setdefault("cron", {})
+    cron["max_parallel_jobs"] = max(
+        1,
+        _env_int("XPD_CRON_MAX_PARALLEL_JOBS", 1),
+    )
 
     model_configured = _apply_model_config(
         data,
@@ -135,7 +187,11 @@ def configure_config(
         "config_path": str(config_path),
         "plugins_enabled": plugins["enabled"],
         "api_server_toolsets": platform_toolsets["api_server"],
+        "required_memory_tools": required_memory_tools_from_env(),
+        "session_search_enabled": "session_search" in api_server_toolsets,
         "memory": memory,
+        "timezone": data.get("timezone"),
+        "cron": cron,
         "model_configured": model_configured,
     }
 

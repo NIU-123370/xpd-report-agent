@@ -17,6 +17,10 @@ TABLE_DESCRIPTIONS = {
     ),
 }
 
+GENERIC_TABLE_DESCRIPTION = (
+    "数据库动态发现表。业务含义需结合字段、索引、样例数据和用户问题确认。"
+)
+
 METRICS = {
     "pay_amount": {
         "description": "成交金额，使用 SUM(pay_amt)。",
@@ -119,9 +123,8 @@ def search_schema(question: str, top_k: int = 8) -> dict:
     table_hits = []
     for table_name, meta in schema["tables"].items():
         columns = [column["name"] for column in meta["columns"]]
-        text = " ".join(
-            [table_name, TABLE_DESCRIPTIONS.get(table_name, ""), " ".join(columns)]
-        ).lower()
+        description = TABLE_DESCRIPTIONS.get(table_name, GENERIC_TABLE_DESCRIPTION)
+        text = " ".join([table_name, description, " ".join(columns)]).lower()
         score = sum(1 for term in terms if term and term in text)
         if table_name.lower() in lowered:
             score += 5
@@ -130,7 +133,7 @@ def search_schema(question: str, top_k: int = 8) -> dict:
                 {
                     "table": table_name,
                     "score": score,
-                    "description": TABLE_DESCRIPTIONS.get(table_name, ""),
+                    "description": description,
                     "columns": columns,
                 }
             )
@@ -147,9 +150,12 @@ def search_schema(question: str, top_k: int = 8) -> dict:
     metric_hits.sort(key=lambda item: item["score"], reverse=True)
 
     return {
+        "table_count": len(schema["tables"]),
+        "available_tables": sorted(schema["tables"]),
         "tables": table_hits[:safe_top_k],
         "metrics": metric_hits[:safe_top_k],
         "notes": [
+            "当前数据库中的全部基础表都会动态发现并可参与只读查询。",
             "日趋势使用 tb_live_goods_daily_stats，粒度为商品×日期。",
             "单场商品分析使用 tb_live_goods_session_stats，粒度为商品×直播场次。",
             "整场直播总结使用 tb_session_endtime_stats，粒度为直播场次。",
