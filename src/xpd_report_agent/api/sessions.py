@@ -1844,6 +1844,7 @@ async def download_session_artifact(
     artifact_id: str,
     request: Request,
     scope: SessionScope,
+    _service_authenticated: Annotated[None, Depends(require_service_auth)],
 ) -> Response:
     await _get_session(session_id, scope)
     try:
@@ -2287,7 +2288,7 @@ async def _submit_agent_run_input(
             "model": AgentRunSubmissionResponse,
             "description": "Existing clarification input",
         },
-        **documented_error_responses(400, 404, 409, 422, 503),
+        **documented_error_responses(400, 404, 409, 422, 502, 503, 504),
     },
 )
 async def submit_agent_run_input(
@@ -2315,7 +2316,7 @@ async def submit_agent_run_input(
             "model": AgentRunSubmissionResponse,
             "description": "Existing clarification input",
         },
-        **documented_error_responses(400, 401, 404, 409, 422, 503),
+        **documented_error_responses(400, 401, 404, 409, 422, 502, 503, 504),
     },
 )
 async def submit_middle_platform_agent_run_input(

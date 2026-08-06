@@ -45,6 +45,12 @@ def test_middle_platform_openapi_declares_headers_statuses_and_models():
     post = schema["paths"]["/api/v1/agent/runs"]["post"]
     get = schema["paths"]["/api/v1/agent/runs/{run_id}"]["get"]
     submit_input = schema["paths"]["/api/v1/agent/runs/{run_id}/input"]["post"]
+    download_artifact = schema["paths"][
+        "/api/sessions/{session_id}/artifacts/{artifact_id}/download"
+    ]["get"]
+
+    for operation in (post, get, submit_input, download_artifact):
+        assert operation["security"] == [{"ServiceBearerAuth": []}]
 
     post_parameters = _parameters(post)
     assert post_parameters[("header", "Idempotency-Key")]["required"] is True
@@ -64,6 +70,10 @@ def test_middle_platform_openapi_declares_headers_statuses_and_models():
     assert expected_post_statuses <= {int(status) for status in post["responses"]}
     expected_get_statuses = {200, 401, 404, 422, 503}
     assert expected_get_statuses <= {int(status) for status in get["responses"]}
+    expected_input_statuses = {200, 202, 400, 401, 404, 409, 422, 502, 503, 504}
+    assert expected_input_statuses <= {
+        int(status) for status in submit_input["responses"]
+    }
 
     for operation, success_statuses in ((post, (200, 202)), (get, (200,))):
         for status_code in success_statuses:
@@ -75,6 +85,10 @@ def test_middle_platform_openapi_declares_headers_statuses_and_models():
         assert _json_schema(post, status_code)["$ref"].endswith("/ApiErrorResponse")
     for status_code in expected_get_statuses - {200}:
         assert _json_schema(get, status_code)["$ref"].endswith("/ApiErrorResponse")
+    for status_code in expected_input_statuses - {200, 202}:
+        assert _json_schema(submit_input, status_code)["$ref"].endswith(
+            "/ApiErrorResponse"
+        )
 
     assert "ApiError" in schema["components"]["schemas"]
     assert "ApiErrorResponse" in schema["components"]["schemas"]

@@ -204,7 +204,9 @@ session，也不参与 `user_id` 身份隔离。切换到 `user_id` 模式后，
 把 `XPD_CRON_CALLBACK_ORIGIN` 设置为仅内部可达的 FastAPI 地址。
 
 导出文件先安全生成在 `data/report-files/`，配置 OSS 凭据后会上传至
-`oss://starpartner-biz/public/dev/agent-report-files/`，接口返回默认有效一小时的签名下载 URL。
+`oss://starpartner-biz/public/dev/agent-report-files/`。接口结果始终返回 Agent 服务内的稳定下载
+地址；访问该地址时才生成临时 OSS 签名并返回 `307`，或在 `Accept: application/json` 时返回
+签名 URL 及过期时间。重新查询任务状态不会刷新 OSS 签名。
 对象按北京时间建立 `YYYYMMDD` 日目录，文件名为
 `uid-traceid-秒级Unix时间戳.扩展名`；中台的 `X-User-Id` 和 `X-Request-Id` 分别作为
 `uid` 和 `traceid`。本地网页没有真实 UID 时，使用稳定的用户范围标识。
