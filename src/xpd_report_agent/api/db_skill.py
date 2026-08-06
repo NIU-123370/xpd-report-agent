@@ -90,13 +90,18 @@ def is_export_only_request(user_message: str | None) -> bool:
     )
 
 
+def is_database_request(user_message: str | None) -> bool:
+    message = str(user_message or "").strip()
+    return bool(message) and not is_export_only_request(message) and bool(
+        _DATABASE_QUERY_SIGNAL.search(message)
+    )
+
+
 def db_skill_prompt(user_message: str | None) -> str:
     """Inject DB reasoning only when this turn actually requests data work."""
 
     message = str(user_message or "").strip()
-    if not message or is_export_only_request(message):
-        return ""
-    if not _DATABASE_QUERY_SIGNAL.search(message):
+    if not is_database_request(message):
         return ""
     return (
         "<db_query_skill>\n"
@@ -118,6 +123,20 @@ def export_action_prompt(user_message: str | None) -> str:
         "必须先向用户澄清，并提供且只提供这三个候选项。用户确认前不得调用任何查询或导出工具。"
         "导出 XLSX 时必须把已确认类型写入 analysis_type，并把已有且可验证的 metrics、comparisons、"
         "trends、drivers、recommendations、metric_definitions、data_scope、data_quality 写入 analysis；"
+        "analysis 内的键必须使用下列 canonical 英文 JSON 键："
+        "comparisons 每项使用 metric、current_value、baseline_value、absolute_change、"
+        "relative_change、unit、baseline_label、favorability；"
+        "trends 每项使用 period、metric、current_value、baseline_value、absolute_change、"
+        "relative_change、unit、anomaly；"
+        "drivers 每项使用 statement、evidence、metric_refs、contribution、confidence、"
+        "dimension、member、metric、current_value、contribution_value、contribution_rate；"
+        "metric_definitions 每项使用 name、formula、unit、aggregation、numerator、denominator、grain。"
+        "不得把 date、session 或“退货件数”等非 canonical 键当作上述对象字段。"
+        "JSON 键保持上述英文，但所有会在工作簿中展示的指标名、维度名、标签、结论、证据、"
+        "异常说明、建议和状态值必须使用简体中文：favorability 只用“有利”“不利”"
+        "或“未判定”，优先级/严重程度使用“高”“中”“低”，真假状态使用“是”“否”，不得使用 "
+        "F/U、FAVORABLE/UNFAVORABLE、PASS/WARNING/FAIL 或 high/medium/low 作为可见值。"
+        "SQL、数据表名、原始字段名、时区标识以及商品和品牌原文保留原样。"
         "缺少的数据留空，不得为了填充工作表而编造。"
         "不要调用 db_schema_search、db_get_table_profile、db_get_join_paths、"
         "db_validate_sql 或 db_execute_sql；直接使用会话历史中最近一个未过期的 result_id "

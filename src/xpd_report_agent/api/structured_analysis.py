@@ -80,6 +80,20 @@ class AnalysisComparison(BaseModel):
     relative_change: int | float | str | None = None
     unit: str | None = Field(default=None, max_length=40)
     baseline_label: str | None = Field(default=None, max_length=120)
+    favorability: str | None = Field(default=None, max_length=20)
+
+
+class AnalysisTrend(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    period: str = Field(min_length=1, max_length=120)
+    metric: str = Field(min_length=1, max_length=120)
+    current_value: int | float | str | None
+    baseline_value: int | float | str | None = None
+    absolute_change: int | float | str | None = None
+    relative_change: int | float | str | None = None
+    unit: str | None = Field(default=None, max_length=40)
+    anomaly: str | None = Field(default=None, max_length=1000)
 
 
 class AnalysisDriver(BaseModel):
@@ -96,7 +110,7 @@ class AnalysisAnomaly(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     statement: str = Field(min_length=1, max_length=1000)
-    severity: Literal["low", "medium", "high"] = "medium"
+    severity: Literal["低", "中", "高", "low", "medium", "high"] = "中"
     metric_refs: list[str] = Field(default_factory=list, max_length=20)
     observed_value: int | float | str | None = None
     baseline_value: int | float | str | None = None
@@ -107,7 +121,7 @@ class AnalysisRecommendation(BaseModel):
 
     action: str = Field(min_length=1, max_length=1000)
     rationale: str = Field(default="", max_length=1000)
-    priority: Literal["low", "medium", "high"] = "medium"
+    priority: Literal["低", "中", "高", "low", "medium", "high"] = "中"
     metric_refs: list[str] = Field(default_factory=list, max_length=20)
 
 
@@ -155,6 +169,7 @@ class StructuredAnalysis(BaseModel):
         default_factory=list, max_length=50
     )
     comparisons: list[AnalysisComparison] = Field(default_factory=list, max_length=50)
+    trends: list[AnalysisTrend] = Field(default_factory=list, max_length=100)
     insights: list[AnalysisInsight] = Field(default_factory=list, max_length=30)
     drivers: list[AnalysisDriver] = Field(default_factory=list, max_length=30)
     anomalies: list[AnalysisAnomaly] = Field(default_factory=list, max_length=30)
@@ -182,7 +197,7 @@ class RunClarificationRequest(BaseModel):
 
 STRUCTURED_ANALYSIS_INSTRUCTION = f"""
 中台结构化结果要求：
-1. 先正常输出给用户阅读的中文分析答案。
+1. 先正常输出给用户阅读的中文分析答案；该可见答案不得包含 SQL 语句、SQL 代码块或“查询明细”章节。
 2. 在答案最后追加且只追加一个下述标记块；不要用 Markdown 代码块包裹它。
 3. 标记块内必须是严格 JSON，字段必须与示例一致：
 {STRUCTURED_ANALYSIS_START}
@@ -194,11 +209,12 @@ STRUCTURED_ANALYSIS_INSTRUCTION = f"""
   "data_scope": {{"period_start": "YYYY-MM-DD", "period_end": "YYYY-MM-DD", "timezone": "Asia/Shanghai", "grain": "商品+自然日", "filters": ["有效支付订单"], "dimensions": ["item_id"], "source_tables": ["报表表名"], "deduplication": "去重方式"}},
   "metrics": [{{"name": "成交金额", "value": 123.45, "unit": "元", "description": "可选说明"}}],
   "metric_definitions": [{{"name": "成交金额", "formula": "SUM(pay_amt)", "unit": "元", "aggregation": "求和", "numerator": null, "denominator": null, "grain": "商品+自然日"}}],
-  "comparisons": [{{"metric": "成交金额", "current_value": 123.45, "baseline_value": 100, "absolute_change": 23.45, "relative_change": 0.2345, "unit": "元", "baseline_label": "等长上一周期"}}],
+  "comparisons": [{{"metric": "成交金额", "current_value": 123.45, "baseline_value": 100, "absolute_change": 23.45, "relative_change": 0.2345, "unit": "元", "baseline_label": "等长上一周期", "favorability": "有利"}}],
+  "trends": [{{"period": "2026-08-01", "metric": "成交金额", "current_value": 123.45, "baseline_value": 100, "absolute_change": 23.45, "relative_change": 0.2345, "unit": "元", "anomaly": "未见明显异常"}}],
   "insights": [{{"statement": "成交金额增加23.45元", "evidence": "当前123.45元、基准100元", "metric_refs": ["成交金额"], "confidence": 1.0}}],
   "drivers": [{{"statement": "商品A贡献了主要增量", "evidence": "成交额增加20元", "metric_refs": ["成交金额"], "contribution": 0.85, "confidence": 0.95}}],
-  "anomalies": [{{"statement": "商品B退款率显著偏高", "severity": "high", "metric_refs": ["退款率"], "observed_value": 0.2, "baseline_value": 0.08}}],
-  "recommendations": [{{"action": "优先复盘商品B", "rationale": "退款率高于基准", "priority": "high", "metric_refs": ["退款率"]}}],
+  "anomalies": [{{"statement": "商品B退款率显著偏高", "severity": "高", "metric_refs": ["退款率"], "observed_value": 0.2, "baseline_value": 0.08}}],
+  "recommendations": [{{"action": "优先复盘商品B", "rationale": "退款率高于基准", "priority": "高", "metric_refs": ["退款率"]}}],
   "assumptions": ["分析口径或数据限制"],
   "limitations": ["缺少退款原因字段，不能判断因果"],
   "data_quality": {{"query_count": 1, "returned_row_count": 10, "truncated": false, "empty_result": false, "validation_passed": true, "freshness": {{"field": "data_freshness", "latest": "YYYY-MM-DD", "lag_days": 1}}, "period_coverage": {{"requested_start": "YYYY-MM-DD", "requested_end": "YYYY-MM-DD", "observed_start": "YYYY-MM-DD", "observed_end": "YYYY-MM-DD", "covered_days": 7, "expected_days": 7, "coverage_ratio": 1.0, "complete": true}}, "null_counts": {{}}, "zero_denominators": {{}}, "small_samples": {{"threshold": 30, "columns": {{}}}}, "dimensions": {{"required": ["item_id"], "present": ["item_id"], "missing": []}}, "warnings": [], "notes": []}},
@@ -206,15 +222,25 @@ STRUCTURED_ANALYSIS_INSTRUCTION = f"""
   "sql": ["与 executed_queries 相同的 SQL，保留用于兼容 v1.0 客户端"]
 }}
 {STRUCTURED_ANALYSIS_END}
-4. insights 只能写数据事实，并必须提供 evidence、metric_refs 和 confidence；drivers 中的推断必须有
+4. JSON 键必须使用示例中的 canonical 英文键名，不得把“成交金额”“日期”等中文标签当作对象键。
+   除 SQL、表名、原始字段名、时区标识和商品/品牌原文等技术或业务标识外，所有会在报告中展示的
+   名称、标签、结论、证据、异常说明和状态都必须使用简体中文；影响方向使用“有利/不利/未判定”，
+   优先级和严重程度使用“高/中/低”，真假状态使用“是/否”；不得输出 F/U、FAVORABLE/UNFAVORABLE、
+   PASS/WARNING/FAIL 或 high/medium/low 等英文可见状态。
+5. insights 只能写数据事实，并必须提供 evidence、metric_refs 和 confidence；drivers 中的推断必须有
    evidence 和 confidence；recommendations 必须通过 metric_refs 绑定本轮指标或异常证据，不得输出
    无数据依据的泛化建议。
-5. 只能写入实际查询结果中存在的指标和本轮实际执行过的 SQL，不得推测、补齐或伪造。
-6. data_scope 和 metric_definitions 必须依据实际 SQL、表结构和已确认口径填写；data_quality 必须原样
+6. 只能写入实际查询结果中存在的指标和本轮实际执行过的 SQL，不得推测、补齐或伪造；SQL 仅写入
+   标记块内的 executed_queries 和 sql 字段，不能出现在标记块外的用户可见答案中。
+7. data_scope 和 metric_definitions 必须依据实际 SQL、表结构和已确认口径填写；data_quality 必须原样
    依据工具返回结果填写；executed_queries 必须依据 row_count、truncated、elapsed_ms 和校验状态填写。
    无法确定的字段使用 null，不得猜测。
-7. 无法确定的时间范围用 null；无数据的列表用 []。简单查询的 comparisons、drivers、anomalies、
+8. 无法确定的时间范围用 null；无数据的列表用 []。简单查询的 comparisons、trends、drivers、anomalies、
    recommendations 可以为空，不要为了填满结构而制造内容。
+9. analysis_type 必须遵守本轮 `<analysis_output_contract>`：comparison 在有数据且具备可靠基准时至少
+   填写 comparisons 和带证据的 insights；diagnosis 在此基础上还应填写带证据的 drivers 或
+   anomalies，以及通过 metric_refs 绑定证据的 recommendations。若数据不足，必须写入 limitations，
+   不得制造字段内容来满足数量要求。
 """.strip()
 
 

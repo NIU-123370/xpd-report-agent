@@ -43,7 +43,7 @@ def _registry_with_result() -> tuple[QueryResultRegistry, str]:
             {
                 "item_id": "商品-1",
                 "pay_amt": Decimal("123.45"),
-                "=danger": " =HYPERLINK(\"https://invalid\")",
+                "=danger": ' =HYPERLINK("https://invalid")',
                 "note": "含,逗号 | 换行\n测试",
             },
             {
@@ -99,7 +99,7 @@ def test_csv_export_uses_exact_result_and_neutralizes_formulas(tmp_path, monkeyp
     assert path.read_bytes().startswith(b"\xef\xbb\xbf")
     rows = list(csv.reader(io.StringIO(path.read_text(encoding="utf-8-sig"))))
     assert rows[0] == ["商品ID", "成交金额", "风险字段", "备注"]
-    assert rows[1][0:3] == ["商品-1", "123.45", "' =HYPERLINK(\"https://invalid\")"]
+    assert rows[1][0:3] == ["商品-1", "123.45", '\' =HYPERLINK("https://invalid")']
     assert rows[2][1:3] == ["", "'+1+1"]
 
 
@@ -133,17 +133,23 @@ def test_xlsx_export_is_polished_without_formulas_or_sql_footer(tmp_path, monkey
     assert workbook.sheetnames == ["经营摘要", "数据明细", "数据口径与质量", "查询审计"]
     summary_sheet = workbook["经营摘要"]
     detail_sheet = workbook["数据明细"]
-    assert "A1:H1" in {str(cell_range) for cell_range in summary_sheet.merged_cells.ranges}
+    assert "A1:P1" in {str(cell_range) for cell_range in summary_sheet.merged_cells.ranges}
     assert summary_sheet.sheet_view.showGridLines is False
-    assert summary_sheet.freeze_panes == "A5"
-    assert summary_sheet["A1"].font.name == "Arial"
+    assert summary_sheet.freeze_panes == "A4"
+    assert summary_sheet["A1"].font.name == "Microsoft YaHei"
     assert summary_sheet["A1"].font.bold is True
-    assert summary_sheet["A1"].fill.fgColor.rgb.endswith("123047")
-    assert summary_sheet["B3"].alignment.horizontal == "left"
+    assert summary_sheet["A1"].fill.fgColor.rgb.endswith("1F4E78")
+    assert summary_sheet["A3"].alignment.horizontal == "left"
     assert summary_sheet["B2"].alignment.horizontal == "left"
-    assert summary_sheet["B4"].alignment.horizontal == "left"
-    assert detail_sheet.freeze_panes == "B2"
+    assert summary_sheet["A2"].value == "报告周期"
+    assert summary_sheet["I2"].value == "数据截至"
+    assert "模型状态" not in [cell.value for cell in summary_sheet[2]]
+    assert "币种" not in [cell.value for cell in summary_sheet[2]]
+    assert "数据行数 2" in summary_sheet["A3"].value
+    assert detail_sheet.freeze_panes == "D2"
     assert detail_sheet.auto_filter.ref == "A1:D3"
+    assert "RawQueryResult" in detail_sheet.tables
+    assert detail_sheet["A1"].comment.text == "原始字段：item_id"
     assert detail_sheet.page_setup.orientation == "landscape"
     assert [detail_sheet.cell(1, column).value for column in range(1, 5)] == [
         "商品ID",
@@ -184,9 +190,7 @@ def test_xlsx_export_is_polished_without_formulas_or_sql_footer(tmp_path, monkey
         ),
     ],
 )
-def test_xlsx_analysis_type_controls_auditable_sheet_structure(
-    analysis_type, expected_sheets
-):
+def test_xlsx_analysis_type_controls_auditable_sheet_structure(analysis_type, expected_sheets):
     analysis = {
         "metrics": [
             {
@@ -207,6 +211,7 @@ def test_xlsx_analysis_type_controls_auditable_sheet_structure(
                 "relative_change": 0.2,
                 "unit": "元",
                 "baseline_label": "等长上一周期",
+                "favorability": "F",
             }
         ],
         "trends": [
@@ -259,13 +264,22 @@ def test_xlsx_analysis_type_controls_auditable_sheet_structure(
     workbook = load_workbook(io.BytesIO(content), data_only=False)
     assert workbook.sheetnames == expected_sheets
     assert workbook["经营摘要"]["A1"].value == "动态分析报表"
+    assert workbook["经营摘要"]["A7"].font.name == "Aptos"
+    assert workbook["经营摘要"]["A7"].font.size == 20
+    assert workbook["经营摘要"]["A6"].font.color.rgb.endswith("1F4E78")
+    assert workbook["经营摘要"]["A11"].font.name == "KaiTi"
+    assert workbook["经营摘要"]["A11"].font.size == 11
     assert workbook["查询审计"].cell(12, 1).value == "已执行 SQL"
     assert "SUM(pay_amt)" in workbook["查询审计"].cell(13, 1).value
     assert workbook["数据口径与质量"].max_row >= 10
     if analysis_type in {"comparison", "diagnostic"}:
         assert len(workbook["趋势与对比"]._charts) == 1
+        assert workbook["趋势与对比"]["H3"].value == "有利/不利"
+        assert workbook["趋势与对比"]["H4"].value == "有利"
+        assert workbook["趋势与对比"]["H4"].fill.fgColor.rgb.endswith("E2F0D9")
     if analysis_type == "diagnostic":
         assert len(workbook["驱动分析"]._charts) == 1
+        assert "主要贡献因素" in str(workbook["驱动分析"]._charts[0].title)
     assert all(
         cell.data_type != "f"
         for worksheet in workbook.worksheets
@@ -289,6 +303,146 @@ def test_xlsx_export_rejects_missing_analysis_type(tmp_path, monkeypatch):
 
     assert payload["ok"] is False
     assert "analysis_type must be simple, comparison, or diagnostic" in payload["error"]
+
+
+def test_xlsx_normalizes_legacy_analysis_without_empty_cells_or_english_labels():
+    analysis = {
+        "comparisons": [
+            {},
+            {"dimension": "整体", "退货件数": 4396, "件数退货率": 0.1294},
+        ],
+        "trends": [
+            {},
+            {
+                "date": "2026-07-29",
+                "session": "鞋靴场",
+                "退货件数": 100,
+                "件数退货率": 0.1455,
+            },
+            {
+                "date": "2026-07-30",
+                "session": "香水场",
+                "退货件数": 0,
+                "件数退货率": 0.12,
+            },
+        ],
+        "drivers": [
+            {},
+            {
+                "driver": "高客单商品拉高金额退货率",
+                "evidence": "金额退货率19.73%",
+                "impact": "高于件数退货率6.8个百分点",
+            },
+        ],
+        "metric_definitions": [
+            {},
+            {
+                "metric": "件数退货率",
+                "formula": "SUM(refund_itm_qty)/SUM(pay_itm_qty)",
+            },
+        ],
+        "data_scope": {
+            "requested_period": "最近30天",
+            "observed_period": "2026-07-01至2026-07-30",
+            "session_count": 12,
+            "granularity": "直播场次",
+        },
+        "data_quality": {
+            "freshness": "PASS",
+            "coverage": "完整",
+            "small_sample": "无",
+        },
+    }
+    columns = ["start_date", "refund_qty_rate", "refund_amt_rate"]
+    rows = [
+        {
+            "start_date": "2026-07-29",
+            "refund_qty_rate": 0.1455,
+            "refund_amt_rate": 0.1973,
+        }
+    ]
+    content = report_export._xlsx_bytes(
+        title="最近30天直播场次退货诊断分析",
+        summary="退货表现存在场次差异。",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT start_date, refund_qty_rate, refund_amt_rate FROM report",
+        columns=columns,
+        rows=rows,
+        truncated=False,
+        analysis_type="diagnostic",
+        analysis=analysis,
+    )
+
+    validation = report_export._validate_artifact_bytes(
+        "xlsx",
+        content,
+        title="最近30天直播场次退货诊断分析",
+        columns=columns,
+        rows=rows,
+        analysis_type="diagnostic",
+    )
+    assert validation["analysis_sheets_checked"] is True
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    trend_sheet = workbook["趋势与对比"]
+    trend_header = next(
+        row for row in range(1, trend_sheet.max_row + 1) if trend_sheet.cell(row, 1).value == "周期"
+    )
+    comparison_rows = list(trend_sheet.iter_rows(min_row=4, max_row=trend_header - 3, max_col=8))
+    assert len(comparison_rows) == 2
+    assert {row[0].value for row in comparison_rows} == {
+        "整体｜退货件数",
+        "整体｜件数退货率",
+    }
+    assert all(cell.value not in (None, "") for row in comparison_rows for cell in row)
+
+    trend_rows = list(
+        trend_sheet.iter_rows(min_row=trend_header + 1, max_row=trend_sheet.max_row, max_col=7)
+    )
+    assert len(trend_rows) == 4
+    assert any(row[2].value == 0 for row in trend_rows)
+    assert all(cell.value not in (None, "") for row in trend_rows for cell in row)
+
+    driver_sheet = workbook["驱动分析"]
+    assert driver_sheet["A4"].value == "高于件数退货率6.8个百分点"
+    assert driver_sheet["G4"].value == "高客单商品拉高金额退货率"
+    assert driver_sheet["H4"].value == "金额退货率19.73%"
+    assert all(driver_sheet.cell(4, column).value not in (None, "") for column in range(1, 10))
+
+    quality_sheet = workbook["数据口径与质量"]
+    definition_header = next(
+        row
+        for row in range(1, quality_sheet.max_row + 1)
+        if quality_sheet.cell(row, 1).value == "指标名称"
+    )
+    assert quality_sheet.cell(definition_header + 1, 1).value == "件数退货率"
+    assert all(
+        quality_sheet.cell(definition_header + 1, column).value not in (None, "")
+        for column in range(1, 8)
+    )
+    visible_labels = {
+        quality_sheet.cell(row, 1).value for row in range(1, quality_sheet.max_row + 1)
+    }
+    assert {"请求统计周期", "实际覆盖周期", "直播场次数", "数据粒度", "数据时效"} <= visible_labels
+    assert (
+        not {
+            "requested_period",
+            "observed_period",
+            "session_count",
+            "granularity",
+            "freshness",
+        }
+        & visible_labels
+    )
+    assert "通过" in {
+        quality_sheet.cell(row, 2).value for row in range(1, quality_sheet.max_row + 1)
+    }
+
+    detail_headers = [workbook["数据明细"].cell(1, column).value for column in range(1, 4)]
+    assert detail_headers == ["直播开始日期", "件数退货率", "金额退货率"]
+    workbook.close()
 
 
 def test_xlsx_export_preserves_precision_ids_timezone_and_long_text(tmp_path, monkeypatch):
@@ -347,7 +501,8 @@ def test_xlsx_export_preserves_precision_ids_timezone_and_long_text(tmp_path, mo
     assert payload["validated"] is True
     assert payload["validation"] == {
         "status": "passed",
-        "scope": "xlsx_structure_and_exported_query_rows",
+        "scope": "xlsx_structure_query_rows_and_analysis_sheets",
+        "analysis_sheets_checked": True,
         "business_conclusions_checked": False,
     }
     path = tmp_path / SESSION_A / "exports" / payload["path"]
@@ -439,6 +594,40 @@ def test_xlsx_content_validation_detects_changed_query_value():
         )
 
 
+def test_xlsx_content_validation_detects_empty_analysis_cell():
+    content = report_export._xlsx_bytes(
+        title="分析页校验",
+        summary="",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT 1",
+        columns=[],
+        rows=[],
+        truncated=False,
+        analysis_type="diagnostic",
+        analysis={
+            "comparisons": [{"metric": "退货件数", "current_value": 10}],
+            "trends": [{"period": "2026-08-01", "metric": "退货件数", "current_value": 10}],
+            "drivers": [{"statement": "场次差异", "evidence": "退货件数差异10件"}],
+            "metric_definitions": [{"name": "退货件数", "formula": "SUM(refund_itm_qty)"}],
+        },
+    )
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    workbook["趋势与对比"]["A4"] = None
+    tampered = io.BytesIO()
+    workbook.save(tampered)
+    workbook.close()
+
+    with pytest.raises(ValueError, match="趋势与对比"):
+        report_export._validate_artifact_bytes(
+            "xlsx",
+            tampered.getvalue(),
+            title="分析页校验",
+            analysis_type="diagnostic",
+        )
+
+
 def test_json_export_contains_structured_metadata_and_exact_rows(tmp_path, monkeypatch):
     payload, path = _export(tmp_path, monkeypatch, "json")
 
@@ -487,9 +676,7 @@ def test_export_rejects_cross_session_result_without_creating_file(tmp_path, mon
     assert not (tmp_path / SESSION_B).exists()
 
 
-def test_report_artifact_uploads_to_oss_and_returns_fresh_signed_url(
-    tmp_path, monkeypatch
-):
+def test_report_artifact_uploads_to_oss_and_returns_fresh_signed_url(tmp_path, monkeypatch):
     path = tmp_path / "report.csv"
     path.write_text("a,b\n1,2\n", encoding="utf-8")
     monkeypatch.setenv("XPD_REPORT_OSS_ENABLED", "true")
@@ -563,9 +750,7 @@ def test_report_artifact_uploads_to_oss_and_returns_fresh_signed_url(
     assert refreshed["download_url"].endswith("?v=2")
 
 
-def test_report_oss_object_key_uses_beijing_day_and_second_timestamp(
-    tmp_path, monkeypatch
-):
+def test_report_oss_object_key_uses_beijing_day_and_second_timestamp(tmp_path, monkeypatch):
     monkeypatch.setenv("XPD_FILE_STORAGE_PATH", str(tmp_path))
     monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Shanghai")
     report_oss.write_report_oss_context(
@@ -593,10 +778,7 @@ def test_report_oss_object_key_uses_beijing_day_and_second_timestamp(
         now=datetime(2026, 8, 5, 16, 1, 2, tzinfo=UTC),
     )
 
-    assert key == (
-        "public/dev/agent-report-files/20260806/"
-        "uid-1001-trace-9001-1785945662.xlsx"
-    )
+    assert key == ("public/dev/agent-report-files/20260806/uid-1001-trace-9001-1785945662.xlsx")
 
 
 def test_query_registry_full_read_does_not_evict_and_new_store_evicts_oldest(monkeypatch):
@@ -662,14 +844,14 @@ def test_native_file_guard_only_reads_current_session_generated_basename(tmp_pat
     (other / filename).write_text("secret", encoding="utf-8")
 
     assert hermes_report_files._safe_read_path(filename, SESSION_A) == report_path
-    assert hermes_report_files._safe_read_path(f"../{SESSION_B}/exports/{filename}", SESSION_A) is None
+    assert (
+        hermes_report_files._safe_read_path(f"../{SESSION_B}/exports/{filename}", SESSION_A) is None
+    )
     assert hermes_report_files._safe_read_path(str(report_path), SESSION_A) is None
-    assert hermes_report_files._owned_session_for_scope(
-        SESSION_A, "0123456789abcdefabcd"
-    ) == SESSION_A
-    assert hermes_report_files._owned_session_for_scope(
-        SESSION_A, "fedcba9876543210abcd"
-    ) is None
+    assert (
+        hermes_report_files._owned_session_for_scope(SESSION_A, "0123456789abcdefabcd") == SESSION_A
+    )
+    assert hermes_report_files._owned_session_for_scope(SESSION_A, "fedcba9876543210abcd") is None
 
 
 def test_native_registry_handlers_block_writes_and_cross_session_reads(tmp_path, monkeypatch):
@@ -704,18 +886,12 @@ def test_native_registry_handlers_block_writes_and_cross_session_reads(tmp_path,
 
     hermes_report_files._patch_registry_handlers()
 
-    read_result = _decode(
-        entries["read_file"].handler({"path": filename}, session_id=SESSION_A)
-    )
+    read_result = _decode(entries["read_file"].handler({"path": filename}, session_id=SESSION_A))
     assert read_result["ok"] is True
     assert Path(read_result["path"]) == exports / filename
-    denied_read = _decode(
-        entries["read_file"].handler({"path": filename}, session_id=SESSION_B)
-    )
+    denied_read = _decode(entries["read_file"].handler({"path": filename}, session_id=SESSION_B))
     assert "error" in denied_read
-    denied_write = _decode(
-        entries["write_file"].handler({"path": "x"}, session_id=SESSION_A)
-    )
+    denied_write = _decode(entries["write_file"].handler({"path": "x"}, session_id=SESSION_A))
     assert "error" in denied_write
     assert len(calls) == 1
 
@@ -734,9 +910,7 @@ def test_agent_tool_restriction_removes_native_mutations_and_unowned_exports():
                 tool("export_report_file"),
                 tool("db_execute_sql"),
             ]
-            self.valid_tool_names = {
-                item["function"]["name"] for item in self.tools
-            }
+            self.valid_tool_names = {item["function"]["name"] for item in self.tools}
 
     owned = Agent()
     hermes_report_files._restrict_agent_tools(owned, SESSION_A)

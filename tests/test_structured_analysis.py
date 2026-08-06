@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from xpd_report_agent.api.structured_analysis import (
+    STRUCTURED_ANALYSIS_INSTRUCTION,
     parse_run_clarification,
     parse_structured_analysis,
 )
@@ -78,6 +79,8 @@ def test_structured_analysis_v12_has_typed_scope_definitions_and_insights():
   "conclusion": "成交金额增长",
   "data_scope": {"period_start":"2026-08-01","period_end":"2026-08-07","grain":"商品+自然日","filters":["有效支付"],"dimensions":["item_id"],"source_tables":["daily_report"],"deduplication":"按商品和日期聚合"},
   "metric_definitions": [{"name":"退款率","formula":"SUM(refund_amt)/SUM(pay_amt)","unit":"%","numerator":"退款金额","denominator":"成交金额","grain":"整体"}],
+  "comparisons": [{"metric":"成交金额","current_value":120,"baseline_value":100,"absolute_change":20,"relative_change":0.2,"unit":"元","baseline_label":"等长上一周期","favorability":"有利"}],
+  "trends": [{"period":"2026-08-07","metric":"成交金额","current_value":120,"baseline_value":100,"absolute_change":20,"relative_change":0.2,"unit":"元","anomaly":"未见明显异常"}],
   "insights": [{"statement":"成交金额增长20%","evidence":"当前120元，基准100元","metric_refs":["成交金额"],"confidence":1.0}]
 }
 </XPD_ANALYSIS_JSON>"""
@@ -88,8 +91,19 @@ def test_structured_analysis_v12_has_typed_scope_definitions_and_insights():
     assert analysis.data_scope is not None
     assert analysis.data_scope.dimensions == ["item_id"]
     assert analysis.metric_definitions[0].denominator == "成交金额"
+    assert analysis.comparisons[0].favorability == "有利"
+    assert analysis.trends[0].period == "2026-08-07"
+    assert analysis.trends[0].current_value == 120
+    assert analysis.trends[0].anomaly == "未见明显异常"
     assert analysis.insights[0].metric_refs == ["成交金额"]
     assert analysis.insights[0].evidence == "当前120元，基准100元"
+
+
+def test_structured_analysis_prompt_requires_canonical_keys_and_chinese_visible_values():
+    assert '"trends": [{"period":' in STRUCTURED_ANALYSIS_INSTRUCTION
+    assert "canonical 英文键名" in STRUCTURED_ANALYSIS_INSTRUCTION
+    assert "有利/不利/未判定" in STRUCTURED_ANALYSIS_INSTRUCTION
+    assert "SQL、表名、原始字段名" in STRUCTURED_ANALYSIS_INSTRUCTION
 
 
 def test_run_clarification_envelope_is_machine_parsed_and_bounded():
