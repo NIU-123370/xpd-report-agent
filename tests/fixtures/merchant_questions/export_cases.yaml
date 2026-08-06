@@ -1,0 +1,12 @@
+cases:
+  - id: clarify_unknown_export_depth
+    input: 给我导出一个表格。
+    must_clarify: true
+    expected_question_contains: 哪种内容
+    expected_choices: [简单查询结果, 对比分析, 诊断分析]
+
+  - id: export_known_diagnosis
+    input: 把刚才的退款诊断导成 Excel。
+    must_clarify: false
+    expected_analysis_type: diagnosis
+    expected_sheets: [经营摘要, 趋势与对比, 驱动分析, 数据明细, 数据口径与质量, 查询审计]

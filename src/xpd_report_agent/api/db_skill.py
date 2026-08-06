@@ -22,6 +22,15 @@ _NEGATED_EXPORT = re.compile(
     r"(?:导出|下载|生成|xlsx|excel|csv|pdf|json|文件)",
     re.IGNORECASE,
 )
+_EXISTING_RESULT_REFERENCE = re.compile(
+    r"(?:刚才|刚刚|上面|上述|前面|当前|已有|现有).{0,16}"
+    r"(?:结果|数据|分析|诊断|报表|报告)?",
+    re.IGNORECASE,
+)
+_EXPLICIT_REQUERY_SIGNAL = re.compile(
+    r"(?:重新|再次|再)(?:查询|统计|计算|分析|跑数)|(?:更新|刷新)(?:数据|结果)",
+    re.IGNORECASE,
+)
 _DATABASE_QUERY_SIGNAL = re.compile(
     r"(?:数据库|SQL|查询|统计|分析|计算|排行|排名|趋势|对比|多少|哪些|找出|"
     r"最近|过去|本周|上周|本月|上月|今天|昨天|日期|时间|"
@@ -85,9 +94,13 @@ def is_export_only_request(user_message: str | None) -> bool:
     message = str(user_message or "").strip()
     if not message or _NEGATED_EXPORT.search(message):
         return False
-    return bool(_EXPORT_SIGNAL.search(message)) and not bool(
-        _DATABASE_QUERY_SIGNAL.search(message)
-    )
+    if not _EXPORT_SIGNAL.search(message):
+        return False
+    if _EXISTING_RESULT_REFERENCE.search(message) and not _EXPLICIT_REQUERY_SIGNAL.search(
+        message
+    ):
+        return True
+    return not bool(_DATABASE_QUERY_SIGNAL.search(message))
 
 
 def is_database_request(user_message: str | None) -> bool:

@@ -7,6 +7,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from xpd_report_agent.memory_governance import memory_add_is_paused, memory_policy
 from xpd_report_agent.memory_paths import (
     IDENTITY_MODE_USER_ID,
     configured_identity_mode,
@@ -177,6 +178,50 @@ def install_patch() -> None:
     from tools.memory_tool import MemoryStore
 
     APIServerAdapter = api_server_module.APIServerAdapter
+    if (
+        hasattr(MemoryStore, "add")
+        and hasattr(MemoryStore, "apply_batch")
+        and not getattr(MemoryStore, "_xpd_memory_capacity_guard", False)
+    ):
+        original_add = MemoryStore.add
+        original_apply_batch = MemoryStore.apply_batch
+
+        def guarded_add(self: Any, target: str, content: str) -> dict[str, Any]:
+            paused, used, limit = memory_add_is_paused(self, target)
+            if paused:
+                return {
+                    "success": False,
+                    "done": True,
+                    "critical": True,
+                    "error": (
+                        f"Memory is at {used:,}/{limit:,} chars and has reached the "
+                        f"{memory_policy().critical_ratio:.0%} critical watermark. "
+                        "New entries are paused; use replace/remove to consolidate first."
+                    ),
+                }
+            return original_add(self, target, content)
+
+        def guarded_apply_batch(
+            self: Any, target: str, operations: list[dict[str, Any]]
+        ) -> dict[str, Any]:
+            paused, used, limit = memory_add_is_paused(self, target)
+            has_add = any((operation or {}).get("action") == "add" for operation in operations)
+            if paused and has_add:
+                return {
+                    "success": False,
+                    "done": True,
+                    "critical": True,
+                    "error": (
+                        f"Memory is at {used:,}/{limit:,} chars and has reached the "
+                        f"{memory_policy().critical_ratio:.0%} critical watermark. "
+                        "Batch add is paused; submit only replace/remove operations."
+                    ),
+                }
+            return original_apply_batch(self, target, operations)
+
+        MemoryStore.add = guarded_add
+        MemoryStore.apply_batch = guarded_apply_batch
+        MemoryStore._xpd_memory_capacity_guard = True
     if getattr(APIServerAdapter, "_xpd_user_memory_patch", False):
         return
 

@@ -1,0 +1,535 @@
+version: "1.1"
+description: 脱敏后的商家高频与边界问题目录，用于需求梳理、相似问题检索和回归测试，不直接整库注入 Prompt。
+
+defaults:
+  timezone: Asia/Shanghai
+  unspecified_comparison: 等长上一周期
+  export_requires_analysis_type: true
+  distinguish_empty_from_zero: true
+  never_invent_missing_data: true
+
+answer_statuses:
+  success: 数据充分，可正常回答
+  no_data: 查询范围内没有记录，不能写成业务值为零
+  undefined: 因零分母等原因指标不可计算
+  insufficient_data: 缺少必要字段、样本或基准
+  partial_data: 数据延迟、周期未结束或结果被截断
+  permission_denied: 超出当前商家数据权限
+
+answer_contracts:
+  query:
+    order: [直接答案, 数据口径, 数据质量提示]
+    rules:
+      - 首句直接回答，不先复述查询过程。
+      - 明确时间范围、时区、指标公式和筛选条件。
+      - 无数据、指标为零和无法计算必须使用不同措辞。
+  comparison:
+    order: [核心结论, 当前值与基准值, 绝对变化与变化率, 主要驱动, 数据质量]
+    rules:
+      - 用户未指定基准时使用等长上一周期，并在答案中声明。
+      - 不比较长度不同或覆盖不完整的周期，除非同时提供日均等可比指标。
+      - 变化率的基准值为零时不得输出无穷大或伪造百分比。
+  diagnosis:
+    order: [核心结论, 数据事实, 驱动或异常, 建议动作, 限制]
+    rules:
+      - 数据事实、可能原因和建议动作必须分开表达。
+      - 驱动和建议必须绑定可验证指标证据。
+      - 缺少原因字段时只能定位相关性，不得声称已经证明因果。
+
+analysis_types:
+  query: 直接答案与数据口径
+  comparison: 核心结论、指标对比和主要驱动
+  diagnosis: 异常定位、证据、建议和限制
+
+questions:
+  - id: mq_001
+    category: 成交
+    utterances: [昨天成交额是多少, 昨天卖了多少钱]
+    canonical_question: 查询昨天的成交金额。
+    analysis_type: query
+    metrics: [成交金额]
+    dimensions: []
+    clarification: null
+    expected_output: [直接答案, 数据口径]
+    answer:
+      template: "昨天成交金额为 {value}{unit}。统计范围为 {period_start} 至 {period_end}（Asia/Shanghai），口径为 {formula}。"
+      evidence: [成交金额当前值, 实际数据覆盖日期, 数据最新时间]
+      guardrails: [不把下单金额当作支付成交金额, 无数据不等于成交金额为零]
+      fallback: "指定日期没有可用成交记录；说明数据最新时间和缺失原因，不返回 0 代替无数据。"
+
+  - id: mq_002
+    category: 成交
+    utterances: [今天出了多少单, 今天订单量多少]
+    canonical_question: 查询今天的支付订单数。
+    analysis_type: query
+    metrics: [支付订单数]
+    dimensions: []
+    clarification: null
+    expected_output: [直接答案, 数据口径, 周期覆盖提示]
+    answer:
+      template: "截至 {data_freshness}，今天已记录 {value}{unit}；当前周期覆盖率为 {coverage_ratio}，结果仍可能继续变化。"
+      evidence: [支付订单数, 数据截至时间, 周期覆盖率]
+      guardrails: [不得把未结束的今天描述为完整周期, 与昨天比较时应使用同一截止时刻]
+      fallback: "今天尚无已同步订单数据；区分尚未同步、查询无记录和真实零订单。"
+
+  - id: mq_003
+    category: 成交
+    utterances: [最近7天卖得怎么样, 看下近7天经营情况]
+    canonical_question: 对比最近7个完整自然日与等长上一周期的经营表现。
+    analysis_type: comparison
+    metrics: [成交金额, 支付订单数, 成交件数]
+    dimensions: [自然日]
+    clarification: null
+    expected_output: [核心结论, 指标对比, 主要驱动, 数据质量]
+    answer:
+      template: "最近7个完整自然日成交金额为 {current_value}{unit}，较等长上一周期 {direction}{change_rate}；主要变化来自 {top_driver}。"
+      evidence: [当前值, 上一周期值, 绝对变化, 变化率, Top贡献维度]
+      guardrails: [两个周期必须等长, 只把有贡献数据支持的维度写成驱动]
+      fallback: "若上一周期不完整，仅报告当前周期，并说明暂不具备可靠对比条件。"
+
+  - id: mq_004
+    category: 商品
+    utterances: [哪些商品卖得最好, 给我商品排行榜]
+    canonical_question: 查询指定周期内的商品 Top N 排行。
+    analysis_type: query
+    metrics: []
+    dimensions: [商品]
+    clarification:
+      when: 用户未指定排名指标
+      question: 商品排行按哪个指标排序？
+      choices: [成交金额, 支付订单数, 成交件数, 退款金额]
+    expected_output: [排行结果, 数据口径]
+    answer:
+      template: "按已确认的 {ranking_metric} 排序，前 {top_n} 个商品见结果；第1名为 {item}，指标值为 {value}{unit}。"
+      evidence: [排序指标, 排名值, 商品稳定标识, 查询周期]
+      guardrails: [同名商品按稳定商品ID区分, 并列值采用并列排名或声明次级排序]
+      fallback: "缺少排序指标时先澄清；缺少商品维度时说明当前数据不能生成商品排行。"
+
+  - id: mq_005
+    category: 商品
+    utterances: [哪个商品贡献了最多增长, 增长主要靠哪些商品]
+    canonical_question: 分析商品对成交金额变化的贡献。
+    analysis_type: diagnosis
+    metrics: [成交金额]
+    dimensions: [商品]
+    clarification: null
+    expected_output: [核心结论, 商品贡献, 证据, 建议]
+    answer:
+      template: "整体成交金额变化 {total_change}{unit}，其中 {item} 贡献 {contribution_rate}，是最大可验证驱动。建议优先复盘该商品。"
+      evidence: [整体变化额, 商品变化额, 贡献率, 当前与基准值]
+      guardrails: [贡献率基于变化额计算, 贡献合计与整体变化需勾稽, 不把贡献等同于因果]
+      fallback: "缺少上一周期或商品维度时，不输出商品增长贡献结论。"
+
+  - id: mq_006
+    category: 商品
+    utterances: [哪些商品最近下滑严重, 找出卖不动的商品]
+    canonical_question: 定位成交表现显著下滑的商品。
+    analysis_type: diagnosis
+    metrics: [成交金额]
+    dimensions: [商品]
+    clarification: null
+    expected_output: [异常商品, 对比基准, 变化幅度, 建议]
+    answer:
+      template: "{item} 成交金额由 {baseline_value}{unit} 降至 {current_value}{unit}，减少 {absolute_change}{unit}（{change_rate}），为主要下滑商品。"
+      evidence: [商品当前值, 商品基准值, 绝对变化, 变化率, 样本量]
+      guardrails: [基准值过小需提示小样本, 不用单一百分比夸大轻微绝对变化]
+      fallback: "没有可比基准时只列当前低表现商品，不称其为下滑。"
+
+  - id: mq_007
+    category: 退款
+    utterances: [昨天退款率多少, 查一下退款率]
+    canonical_question: 查询指定周期的金额退款率。
+    analysis_type: query
+    metrics: [金额退款率]
+    dimensions: []
+    clarification:
+      when: 用户口中的退款率无法由上下文确定
+      question: 退款率按金额还是订单数计算？
+      choices: [退款金额/成交金额, 退款订单数/支付订单数]
+    expected_output: [直接答案, 分子分母, 数据口径]
+    answer:
+      template: "指定周期金额退款率为 {rate}，按退款金额 {numerator}{unit} ÷ 成交金额 {denominator}{unit} 计算。"
+      evidence: [退款金额, 成交金额, 退款率公式, 查询周期]
+      guardrails: [按汇总分子除以汇总分母计算, 分母为零时返回无法计算而不是0%]
+      fallback: "成交金额为零或缺失时，退款率无法计算；仍可分别报告退款金额和成交金额。"
+
+  - id: mq_008
+    category: 退款
+    utterances: [退款为什么变高了, 退款率怎么突然升高了, 最近退款异常吗]
+    canonical_question: 对比退款指标并定位异常商品、场次或时段。
+    analysis_type: diagnosis
+    metrics: [退款金额, 金额退款率]
+    dimensions: [商品, 场次, 自然日]
+    clarification: null
+    expected_output: [数据事实, 异常定位, 可能原因, 限制, 建议]
+    answer:
+      template: "退款率由 {baseline_rate} 上升至 {current_rate}；{driver} 贡献了主要退款增量。现有数据只能定位相关维度，不能直接证明退款原因。"
+      evidence: [当前与基准退款率, 退款金额变化, 商品或场次贡献, 样本量]
+      guardrails: [事实与可能原因分开, 没有退款原因字段不得归因商品质量或客服]
+      fallback: "缺少退款原因字段时，建议下钻售后原因；缺少对比期时仅报告当前异常分布。"
+
+  - id: mq_009
+    category: 退款
+    utterances: [退款最多的是哪些商品, 高退款商品有哪些]
+    canonical_question: 查询退款金额或退款率最高的商品。
+    analysis_type: query
+    metrics: []
+    dimensions: [商品]
+    clarification:
+      when: 用户未指定高退款的定义
+      question: 高退款商品按什么指标判断？
+      choices: [退款金额, 金额退款率]
+    expected_output: [商品排行, 样本量, 数据口径]
+    answer:
+      template: "按 {refund_metric} 排序，{item} 最高，为 {value}{unit}；其成交样本为 {sample_size}，{sample_warning}。"
+      evidence: [退款指标, 分子分母, 成交样本量, 商品ID]
+      guardrails: [退款率排行必须同时展示样本量, 小样本高退款率不得直接判定高风险]
+      fallback: "缺少成交分母时只能按退款金额排行，不能计算退款率。"
+
+  - id: mq_010
+    category: 场次
+    utterances: [哪场直播卖得最好, 给我场次排行]
+    canonical_question: 按已确认指标查询指定周期内的直播场次排行。
+    analysis_type: query
+    metrics: []
+    dimensions: [场次]
+    clarification:
+      when: 用户未指定“最好”的判断指标
+      question: 场次排行按哪个指标判断？
+      choices: [成交金额, 支付订单数, 成交件数, 金额退款率]
+    expected_output: [场次排行, 数据口径]
+    answer:
+      template: "指定周期内，{session} 以成交金额 {value}{unit} 排名第1；统计粒度为直播场次。"
+      evidence: [场次ID, 场次时间, 成交金额, 排序规则]
+      guardrails: [跨午夜场次按稳定场次ID聚合, 不按自然日拆成两个场次]
+      fallback: "无法唯一识别场次或缺少场次ID时，先请求场次时间或名称。"
+
+  - id: mq_011
+    category: 场次
+    utterances: [昨晚那场表现怎么样, 分析一下这场直播]
+    canonical_question: 分析指定直播场次的经营表现。
+    analysis_type: comparison
+    metrics: [成交金额, 支付订单数, 成交件数, 退款金额]
+    dimensions: [场次]
+    clarification:
+      when: 无法唯一识别直播场次
+      question: 请提供场次名称、场次 ID 或直播时间。
+      choices: []
+    expected_output: [核心指标, 对比基准, 商品贡献, 数据质量]
+    answer:
+      template: "场次 {session} 成交金额为 {value}{unit}，相较 {baseline_label} {direction}{change_rate}；主要贡献商品为 {item}。"
+      evidence: [场次唯一标识, 核心指标, 可比场次定义, 商品贡献]
+      guardrails: [不同直播时长场次需同时给出小时效率, 不把不可比场次直接作优劣结论]
+      fallback: "没有合理可比场次时仅给本场事实，不伪造环比。"
+
+  - id: mq_012
+    category: 趋势
+    utterances: [最近30天成交趋势, 看一下销售走势]
+    canonical_question: 分析指定周期的成交金额日趋势。
+    analysis_type: comparison
+    metrics: [成交金额]
+    dimensions: [自然日]
+    clarification: null
+    expected_output: [趋势, 周期对比, 异常时间点]
+    answer:
+      template: "最近30个完整自然日成交金额整体呈 {trend}；最高点为 {max_date} 的 {max_value}{unit}，异常变化出现在 {anomaly_date}。"
+      evidence: [逐日值, 周期合计, 峰谷日期, 异常判断基准]
+      guardrails: [缺失日期不得当作0补齐除非口径明确, 趋势结论需覆盖完整周期]
+      fallback: "日期覆盖不足时展示已观测区间，并明确不能代表完整30天趋势。"
+
+  - id: mq_013
+    category: 趋势
+    utterances: [环比增长多少, 比上个周期怎么样]
+    canonical_question: 将当前周期与等长上一周期进行对比。
+    analysis_type: comparison
+    metrics: []
+    dimensions: []
+    clarification:
+      when: 当前周期或指标任一项无法从上下文确定
+      question: 需要对比哪个时间范围和经营指标？
+      choices: []
+    expected_output: [当前值, 对比值, 绝对变化, 变化率]
+    answer:
+      template: "{metric} 当前周期为 {current_value}{unit}，较 {baseline_label} 变化 {absolute_change}{unit}（{relative_change}）。"
+      evidence: [指标名, 当前周期, 基准周期, 当前值, 基准值]
+      guardrails: [用户只说环比但上下文无指标和周期时必须澄清, 基准为零时不输出百分比]
+      fallback: "无法构造等长基准周期时，仅提供绝对值并说明原因。"
+
+  - id: mq_014
+    category: 转化
+    utterances: [转化率怎么下降了, 最近转化怎么样]
+    canonical_question: 分析转化指标的变化与可验证驱动因素。
+    analysis_type: diagnosis
+    metrics: [转化率]
+    dimensions: [自然日, 场次]
+    clarification:
+      when: 数据中存在多种转化率口径
+      question: 转化率使用哪一组分子和分母？
+      choices: [支付订单数/观看人数, 支付人数/观看人数, 点击人数/曝光人数]
+    expected_output: [指标公式, 对比, 驱动因素, 缺失维度]
+    answer:
+      template: "按 {formula} 计算，转化率由 {baseline_rate} 变为 {current_rate}。变化主要集中在 {driver_dimension}，但不能据此证明业务原因。"
+      evidence: [分子, 分母, 当前与基准转化率, 维度贡献, 样本量]
+      guardrails: [不能平均各行转化率, 分母口径不明确必须澄清, 零分母返回无法计算]
+      fallback: "缺少曝光、观看或访客等必要分母时，明确当前数据库不能计算该转化率。"
+
+  - id: mq_015
+    category: 客户
+    utterances: [复购率多少, 老客买得怎么样]
+    canonical_question: 分析客户复购情况。
+    analysis_type: diagnosis
+    metrics: [复购率]
+    dimensions: [客户]
+    clarification:
+      when: 未确认复购观察周期，或数据无法稳定识别客户与订单
+      question: 复购需要统计哪个观察周期，并确认是否有稳定客户ID和订单ID？
+      choices: [最近30天, 最近90天, 今年至今]
+    expected_output: [能力检查, 复购口径, 结果或数据限制]
+    answer:
+      template: "在可稳定识别客户与订单的前提下，复购率为 {rate}，口径为 {repeat_buyers}/{eligible_buyers}。"
+      evidence: [稳定客户ID, 订单ID, 观察窗口, 复购人数, 可复购客户数]
+      guardrails: [聚合买家数不能推导复购率, 跨周期客户需使用同一稳定标识]
+      fallback: "缺少客户级和订单级数据时直接说明不可计算，不从聚合计数估算。"
+
+  - id: mq_016
+    category: 诊断
+    utterances: [今天销售为什么掉了, 帮我找成交下降原因]
+    canonical_question: 定位成交金额下降的主要时间、商品或场次贡献。
+    analysis_type: diagnosis
+    metrics: [成交金额]
+    dimensions: [自然日, 商品, 场次]
+    clarification: null
+    expected_output: [数据事实, 主要驱动, 证据, 建议, 限制]
+    answer:
+      template: "成交金额较可比基准减少 {absolute_change}{unit}（{change_rate}）；{top_driver} 解释了 {contribution_rate} 的下降。建议先核查该维度。"
+      evidence: [整体变化, 商品/场次/日期贡献, 贡献率, 数据覆盖率]
+      guardrails: [先证明发生下降再分析驱动, 驱动只表示数值贡献而非根本原因]
+      fallback: "若今天尚未结束，改用同截止时刻对比；无法对齐时不下下降结论。"
+
+  - id: mq_017
+    category: 诊断
+    utterances: [有什么异常, 帮我看看哪里不对]
+    canonical_question: 检查经营指标异常。
+    analysis_type: diagnosis
+    metrics: []
+    dimensions: []
+    clarification:
+      when: 未指定时间范围且没有可继承的上下文
+      question: 需要检查哪个时间范围？
+      choices: [最近7个完整自然日, 最近30个完整自然日, 昨天]
+    expected_output: [异常指标, 基准, 严重程度, 证据, 建议]
+    answer:
+      template: "在 {period} 内发现 {anomaly_count} 项值得关注的异常；最高优先级为 {anomaly}，偏离基准 {deviation}。"
+      evidence: [异常阈值, 当前值, 基准值, 样本量, 覆盖率]
+      guardrails: [没有阈值或基准时称为值得关注而非异常, 不为凑结果制造异常]
+      fallback: "没有显著异常时明确说明未发现，并列出已检查的指标和范围。"
+
+  - id: mq_018
+    category: 导出
+    utterances: [把这些数据导成Excel, 给我下载表格]
+    canonical_question: 将当前已确认的分析结果导出为 Excel。
+    analysis_type: query
+    metrics: []
+    dimensions: []
+    clarification:
+      when: 无法从上下文判断导出用途和分析深度
+      question: 这份 Excel 需要哪种内容？
+      choices: [简单查询结果, 对比分析, 诊断分析]
+    expected_output: [导出文件, 数据口径, 查询审计]
+    answer:
+      template: "已按 {analysis_type} 生成 Excel，包含 {sheet_names}；数据范围为 {period}，共 {row_count} 行。"
+      evidence: [已确认分析类型, 文件生成状态, 行数, 截断状态, 查询口径]
+      guardrails: [分析类型不明确先澄清, 不能把未查询的数据写入文件]
+      fallback: "生成失败时返回可执行的失败原因，不提供不存在的下载链接。"
+
+  - id: mq_019
+    category: 导出
+    utterances: [把退款诊断导出来, 生成退款分析表]
+    canonical_question: 将退款诊断结果导出为 Excel。
+    analysis_type: diagnosis
+    metrics: [退款金额, 金额退款率]
+    dimensions: [商品, 场次, 自然日]
+    clarification: null
+    expected_output: [经营摘要, 趋势与对比, 驱动分析, 数据明细, 数据口径与质量, 查询审计]
+    answer:
+      template: "已生成退款诊断 Excel；摘要展示退款变化、主要驱动和建议，明细与查询审计位于后续工作表。"
+      evidence: [退款指标, 对比结果, 驱动证据, 数据质量, 文件状态]
+      guardrails: [缺少证据的建议不写入摘要, SQL仅放查询审计]
+      fallback: "若结果为空，仍可导出口径与查询审计，但必须显著标注无结果。"
+
+  - id: mq_020
+    category: 口径
+    utterances: [销量是多少, 哪个商品销量最高]
+    canonical_question: 查询商品销量。
+    analysis_type: query
+    metrics: [销量]
+    dimensions: [商品]
+    clarification:
+      when: 未确认销量口径
+      question: 销量按成交件数还是支付订单数统计？
+      choices: [成交件数, 支付订单数]
+    expected_output: [直接答案, 销量口径, 排行结果]
+    answer:
+      template: "按已确认的 {sales_definition} 统计，销量为 {value}{unit}；{item} 排名第1。"
+      evidence: [销量公式, 商品ID, 查询周期, 排名值]
+      guardrails: [成交件数与支付订单数不得混用, 退款件数是否扣除需在口径中说明]
+      fallback: "未确认销量定义时先澄清，不默认把订单数当作件数。"
+
+  - id: mq_021
+    category: 时间边界
+    utterances: [今天比昨天怎么样, 今天是不是比昨天差]
+    canonical_question: 将未结束的今天与昨天同一截止时刻比较。
+    analysis_type: comparison
+    metrics: []
+    dimensions: [小时]
+    clarification:
+      when: 无法从上下文确定比较指标
+      question: 需要按哪个指标比较今天和昨天？
+      choices: [成交金额, 支付订单数, 成交件数, 金额退款率]
+    expected_output: [同进度对比, 数据截至时间, 周期覆盖率]
+    answer:
+      template: "截至 {cutoff_time}，今天 {metric} 为 {current_value}，昨天同一时刻为 {baseline_value}，变化 {absolute_change}（{relative_change}）。"
+      evidence: [相同截止时刻, 当前值, 基准值, 覆盖率]
+      guardrails: [不得用今天半天对比昨天全天, 明确Asia/Shanghai时区]
+      fallback: "无法取得小时级数据时不做同进度比较，并说明限制。"
+
+  - id: mq_022
+    category: 空结果
+    utterances: [为什么查不到数据, 这个商品是不是卖了0]
+    canonical_question: 区分无记录、字段缺失和真实业务值为零。
+    analysis_type: query
+    metrics: []
+    dimensions: []
+    clarification: null
+    expected_output: [结果状态, 查询范围, 数据最新时间, 排查建议]
+    answer:
+      template: "当前查询结果为 {status}：{reason}。这不等同于业务值为 0；数据最新时间为 {data_freshness}。"
+      evidence: [返回行数, 查询条件, 数据最新时间, 字段存在性]
+      guardrails: [null和无记录不得转换为0, 只有明确聚合结果为0才回答零]
+      fallback: "说明应检查的商品ID、日期、筛选条件或同步状态。"
+
+  - id: mq_023
+    category: 零分母
+    utterances: [为什么退款率是空的, 上期是0这期增长多少]
+    canonical_question: 处理零分母或零基期导致的不可计算指标。
+    analysis_type: comparison
+    metrics: [金额退款率]
+    dimensions: []
+    clarification: null
+    expected_output: [绝对值, 不可计算说明, 分子分母]
+    answer:
+      template: "由于 {denominator_name} 为 0，{metric} 无法计算；本期绝对变化为 {absolute_change}，不输出无限大或伪造变化率。"
+      evidence: [分子, 分母, 当前值, 基准值]
+      guardrails: [零分母不显示0%, 零基期不显示无限增长]
+      fallback: "改为报告绝对增量，并标记无可比基期。"
+
+  - id: mq_024
+    category: 小样本
+    utterances: [这个商品退款率100%是不是很严重, 找退款率最高的新品]
+    canonical_question: 在小样本条件下评估退款率。
+    analysis_type: diagnosis
+    metrics: [金额退款率, 支付订单数]
+    dimensions: [商品]
+    clarification: null
+    expected_output: [退款率, 样本量, 稳定性警告, 建议]
+    answer:
+      template: "{item} 退款率为 {rate}，但样本仅 {sample_size}，结果波动较大，暂不能据此判定为高风险商品。"
+      evidence: [退款率分子分母, 支付订单数, 小样本阈值]
+      guardrails: [必须同时展示样本量, 小样本不使用显著或必然等措辞]
+      fallback: "建议延长观察周期或达到最低样本量后复查。"
+
+  - id: mq_025
+    category: 数据质量
+    utterances: [今天的数据全了吗, 怎么数字跟后台不一样]
+    canonical_question: 检查数据新鲜度、周期覆盖和截断状态。
+    analysis_type: query
+    metrics: []
+    dimensions: []
+    clarification: null
+    expected_output: [数据最新时间, 覆盖率, 截断状态, 差异排查]
+    answer:
+      template: "数据最新时间为 {data_freshness}，请求周期覆盖率 {coverage_ratio}，结果{truncated_text}；当前结论属于 {status}。"
+      evidence: [freshness, period_coverage, returned_row_count, truncated]
+      guardrails: [部分数据不得支撑全局结论, 数据回补时标记结果可能变化]
+      fallback: "无法确认完整性时标记 partial_data，并建议同步完成后复查。"
+
+  - id: mq_026
+    category: 缺失维度
+    utterances: [为什么利润下降了, 是不是投放导致成交下降]
+    canonical_question: 在缺少成本、广告或流量维度时限定分析结论。
+    analysis_type: diagnosis
+    metrics: []
+    dimensions: []
+    clarification: null
+    expected_output: [可验证事实, 缺失字段, 可验证假设, 下一步]
+    answer:
+      template: "现有数据可确认 {verified_fact}，但缺少 {missing_dimensions}，因此不能证明 {causal_claim}。"
+      evidence: [已有指标, 缺失维度清单, 可验证贡献]
+      guardrails: [相关性不写成因果, 无成本字段不计算利润, 无广告字段不归因投放]
+      fallback: "列出需要补充的字段，并给出下一步验证查询。"
+
+  - id: mq_027
+    category: 导出边界
+    utterances: [把全部明细都导出来, 为什么导出的数据不全]
+    canonical_question: 处理超大、空结果或已截断的明细导出。
+    analysis_type: query
+    metrics: []
+    dimensions: []
+    clarification:
+      when: “全部”范围无法从当前筛选条件确定
+      question: 导出当前筛选结果还是当前商家全部可用数据？
+      choices: [当前筛选结果, 当前商家全部可用数据]
+    expected_output: [导出范围, 行数, 截断状态, 文件结果]
+    answer:
+      template: "导出范围为 {scope}，共 {row_count} 行，{truncated_text}。文件中的口径和查询审计记录了完整筛选条件。"
+      evidence: [筛选条件, 行数, 最大行数, 截断状态, 文件状态]
+      guardrails: [截断结果不得称为全部, 空结果文件必须标注原因, 防止Excel公式注入]
+      fallback: "超过限制时建议缩小周期、按月拆分或先导出汇总。"
+
+  - id: mq_028
+    category: 权限隐私
+    utterances: [查一下别的店铺数据, 导出客户手机号和订单]
+    canonical_question: 处理跨商家访问和个人敏感信息请求。
+    analysis_type: query
+    metrics: []
+    dimensions: [商家, 客户]
+    clarification: null
+    expected_output: [权限结果, 拒绝或脱敏说明, 可用替代方案]
+    answer:
+      template: "该请求超出当前商家数据范围或包含敏感个人信息，无法按原请求返回；可提供当前商家范围内的脱敏聚合结果。"
+      evidence: [当前租户范围, 字段敏感级别, 授权状态]
+      guardrails: [不得跨租户查询, 手机号等个人信息不得原样输出, 拒绝时不泄露资源是否存在]
+      fallback: "提供不含个人标识的汇总指标或提示通过正式授权流程处理。"
+
+  - id: mq_029
+    category: 时间边界
+    utterances: [这周销售怎么样, 上个月同比多少]
+    canonical_question: 处理自然周、滚动周期和历史不足的时间比较。
+    analysis_type: comparison
+    metrics: []
+    dimensions: [自然日]
+    clarification:
+      when: “这周”含义不明确，或同比所需历史不足
+      question: 时间按自然周期还是滚动周期统计？
+      choices: [本自然周, 最近7个完整自然日, 上个完整自然月]
+    expected_output: [明确日期范围, 对比基准, 历史可用性]
+    answer:
+      template: "按 {period_definition} 统计，{metric} 为 {current_value}；对比基准为 {baseline_period}。"
+      evidence: [明确起止日期, 时区, 历史覆盖范围]
+      guardrails: [自然周不等于滚动7天, 历史不足不伪造同比]
+      fallback: "同比数据不足时改为可用的环比，但必须先说明并获得用户接受。"
+
+  - id: mq_030
+    category: 预测边界
+    utterances: [预测下个月能卖多少, 降价10%能多卖多少]
+    canonical_question: 识别预测或反事实请求，并限制结论精度。
+    analysis_type: diagnosis
+    metrics: [成交金额, 成交件数]
+    dimensions: [自然日, 商品]
+    clarification: null
+    expected_output: [历史依据, 假设, 预测区间或能力限制, 风险]
+    answer:
+      template: "基于 {history_period} 和假设 {assumptions}，可给出区间 {forecast_range}；该结果是估计，不是经营保证。"
+      evidence: [历史覆盖, 趋势稳定性, 样本量, 明确假设]
+      guardrails: [数据不足不输出伪精确预测, 没有价格实验不能声称降价的因果效果]
+      fallback: "历史不足或结构变化明显时拒绝给具体数值，改为说明所需数据与实验方案。"

@@ -13,6 +13,7 @@ from xpd_report_agent.api.session_service import (
     identity_mode,
     resolve_owner_scope,
 )
+from xpd_report_agent.memory_governance import memory_policy
 from xpd_report_agent.memory_paths import (
     local_memory_dir,
     merchant_memory_path,
@@ -101,7 +102,7 @@ def _memory_specs(scope: str | None) -> list[tuple[str, Path, str, str, str, int
 
 
 def memory_file_snapshots(scope: str | None = None) -> list[dict]:
-    watermark = _consolidation_ratio()
+    policy = memory_policy()
     snapshots = []
 
     for store, path, filename, label, env_name, default_limit, read_only in _memory_specs(
@@ -129,8 +130,18 @@ def memory_file_snapshots(scope: str | None = None) -> list[dict]:
                 "used_chars": used_chars,
                 "limit_chars": limit,
                 "usage_ratio": used_chars / limit,
-                "watermark_ratio": watermark,
-                "at_watermark": used_chars >= int(limit * watermark),
+                "watermark_ratio": policy.trigger_ratio,
+                "at_watermark": used_chars >= int(limit * policy.trigger_ratio),
+                "critical_ratio": policy.critical_ratio,
+                "at_critical": used_chars >= int(limit * policy.critical_ratio),
+                "target_ratio": policy.target_ratio,
+                "write_policy": (
+                    "consolidate_only"
+                    if used_chars >= int(limit * policy.critical_ratio)
+                    else "write_and_consolidate"
+                    if used_chars >= int(limit * policy.trigger_ratio)
+                    else "normal"
+                ),
                 "modified_at": modified_at,
             }
         )

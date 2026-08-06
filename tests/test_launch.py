@@ -171,6 +171,29 @@ def test_hermes_service_rejects_runtime_version_mismatch(tmp_path):
     assert "Hermes version mismatch. Required v9.9.9." in result.stderr
 
 
+def test_hermes_service_accepts_matching_local_revision_marker(tmp_path):
+    script, env, _call_log = _stage_hermes_service(tmp_path)
+    hermes_bin = Path(env["HERMES_BIN"])
+    hermes_bin.write_text(
+        hermes_bin.read_text(encoding="utf-8").replace(
+            "upstream a61183b5",
+            "local a61183b5",
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(script), "verify"],
+        cwd=script.parents[2],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+
+
 def test_normalize_env_derives_gateway_and_fastapi_variables(tmp_path):
     config = normalize_env(
         {
@@ -182,6 +205,12 @@ def test_normalize_env_derives_gateway_and_fastapi_variables(tmp_path):
             "MYSQL_USER": "report_reader",
             "MYSQL_PASSWORD": "mysql-secret",
             "MYSQL_DATABASE": "reports",
+            "XPD_MERCHANT_QUESTION_LIBRARY_ENABLED": "false",
+            "XPD_MERCHANT_QUESTION_TOP_K": "2",
+            "XPD_MERCHANT_QUESTION_LIBRARY_PATH": "/srv/questions.yaml",
+            "XPD_METRIC_DEFINITION_LIBRARY_ENABLED": "false",
+            "XPD_METRIC_DEFINITION_TOP_K": "4",
+            "XPD_METRIC_DEFINITION_LIBRARY_PATH": "/srv/metrics.yaml",
         },
         root=tmp_path,
     )
@@ -206,6 +235,12 @@ def test_normalize_env_derives_gateway_and_fastapi_variables(tmp_path):
     assert config.env["XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED"] == "false"
     assert config.env["XPD_MERCHANT_MEMORY_ENABLED"] == "true"
     assert config.env["XPD_MERCHANT_MEMORY_CHAR_LIMIT"] == "2200"
+    assert config.env["XPD_MERCHANT_QUESTION_LIBRARY_ENABLED"] == "false"
+    assert config.env["XPD_MERCHANT_QUESTION_TOP_K"] == "2"
+    assert config.env["XPD_MERCHANT_QUESTION_LIBRARY_PATH"] == "/srv/questions.yaml"
+    assert config.env["XPD_METRIC_DEFINITION_LIBRARY_ENABLED"] == "false"
+    assert config.env["XPD_METRIC_DEFINITION_TOP_K"] == "4"
+    assert config.env["XPD_METRIC_DEFINITION_LIBRARY_PATH"] == "/srv/metrics.yaml"
     assert config.env["XPD_SCHEDULES_ENABLED"] == "false"
     assert config.env["XPD_AGENT_MAX_CONCURRENCY"] == "3"
     assert config.env["XPD_AGENT_RUN_MAX_ATTEMPTS"] == "2"

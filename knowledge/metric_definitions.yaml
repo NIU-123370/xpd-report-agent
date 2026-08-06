@@ -1,0 +1,459 @@
+version: "1.0"
+description: 电商数据分析指标公式的唯一业务口径参考。运行时按问题检索少量指标，并以真实 Schema 校验字段可用性。
+
+governance:
+  timezone: Asia/Shanghai
+  ratio_rule: 先汇总分子和分母，再相除；禁止直接平均明细比率
+  zero_denominator: 返回不可计算，不得写成 0% 或无限大
+  schema_rule: required_fields 任一缺失时不得计算，也不得用相似字段替代
+  uv_rule: UV 跨商品、场次或日期通常不可直接相加，优先使用目标粒度的汇总表
+  comparison_rule: 当前期和基准期必须口径一致；未指定时使用等长上一周期
+
+metrics:
+  - id: pay_amount
+    name: 成交金额
+    aliases: [支付金额, 销售额, GMV, 成交额]
+    category: 成交
+    stage: sql
+    definition: 有效支付口径的成交金额合计。
+    formula: SUM(pay_amt)
+    unit: 元
+    metric_type: additive
+    required_fields: [pay_amt]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats, tb_session_endtime_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 按目标粒度直接求和。
+    zero_denominator: null
+    warnings: [不得与下单口径 ord_pay_amt 混用]
+
+  - id: pay_order_count
+    name: 支付订单数
+    aliases: [成交订单数, 订单量, 支付单量]
+    category: 成交
+    stage: sql
+    definition: 有效支付订单数量合计。
+    formula: SUM(pay_ord_cnt)
+    unit: 单
+    metric_type: additive
+    required_fields: [pay_ord_cnt]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats, tb_session_endtime_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 按目标粒度直接求和。
+    zero_denominator: null
+    warnings: [商品粒度订单数跨商品求和可能重复同一订单，需依据源表口径确认]
+
+  - id: pay_item_quantity
+    name: 成交件数
+    aliases: [支付商品件数, 销量, 售出件数]
+    category: 成交
+    stage: sql
+    definition: 有效支付商品件数合计。
+    formula: SUM(pay_itm_qty)
+    unit: 件
+    metric_type: additive
+    required_fields: [pay_itm_qty]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats, tb_session_endtime_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 按目标粒度直接求和。
+    zero_denominator: null
+    warnings: [用户说销量时需确认是件数还是订单数]
+
+  - id: pay_buyer_count
+    name: 支付买家数
+    aliases: [成交人数, 支付人数, 买家数]
+    category: 成交
+    stage: sql
+    definition: 在目标统计粒度内完成支付的买家数。
+    formula: SUM(pay_byr_cnt)
+    unit: 人
+    metric_type: non_additive
+    required_fields: [pay_byr_cnt]
+    preferred_tables: [tb_session_endtime_stats, tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [直播场次, 单商品, 单日]
+    aggregation_rule: 只在源字段所属粒度内使用；跨商品、场次或日期不得直接相加去重人数。
+    zero_denominator: null
+    warnings: [优先使用目标粒度汇总表, 不得从聚合人数推导跨周期唯一买家]
+
+  - id: average_order_value
+    name: 平均订单金额
+    aliases: [订单均价, 每单金额]
+    category: 成交效率
+    stage: sql
+    definition: 每个支付订单对应的平均成交金额。
+    formula: SUM(pay_amt) / NULLIF(SUM(pay_ord_cnt), 0)
+    unit: 元/单
+    metric_type: ratio
+    required_fields: [pay_amt, pay_ord_cnt]
+    preferred_tables: [tb_session_endtime_stats, tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 汇总成交金额和支付订单数后相除。
+    zero_denominator: 支付订单数为0时返回不可计算。
+    warnings: [不等同于客单价]
+
+  - id: average_item_price
+    name: 平均件单价
+    aliases: [件单价, 平均成交单价, 每件金额]
+    category: 成交效率
+    stage: sql
+    definition: 每件支付商品对应的平均成交金额。
+    formula: SUM(pay_amt) / NULLIF(SUM(pay_itm_qty), 0)
+    unit: 元/件
+    metric_type: ratio
+    required_fields: [pay_amt, pay_itm_qty]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats, tb_session_endtime_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 汇总成交金额和成交件数后相除。
+    zero_denominator: 成交件数为0时返回不可计算。
+    warnings: []
+
+  - id: items_per_order
+    name: 每单件数
+    aliases: [连带率, 件单量, 每单购买件数]
+    category: 成交效率
+    stage: sql
+    definition: 每个支付订单包含的平均商品件数。
+    formula: SUM(pay_itm_qty) / NULLIF(SUM(pay_ord_cnt), 0)
+    unit: 件/单
+    metric_type: ratio
+    required_fields: [pay_itm_qty, pay_ord_cnt]
+    preferred_tables: [tb_session_endtime_stats, tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 汇总成交件数和支付订单数后相除。
+    zero_denominator: 支付订单数为0时返回不可计算。
+    warnings: [商品粒度订单数可能跨商品重复，整体口径优先使用场次汇总表]
+
+  - id: customer_unit_price
+    name: 客单价
+    aliases: [平均客单价, 人均成交金额, ARPU]
+    category: 成交效率
+    stage: sql
+    definition: 每位支付买家对应的平均成交金额。
+    formula: SUM(pay_amt) / NULLIF(SUM(pay_byr_cnt), 0)
+    unit: 元/人
+    metric_type: ratio
+    required_fields: [pay_amt, pay_byr_cnt]
+    preferred_tables: [tb_session_endtime_stats]
+    allowed_grains: [单场直播, 单日汇总]
+    aggregation_rule: 在不会重复买家的汇总粒度上汇总分子分母后相除。
+    zero_denominator: 支付买家数为0时返回不可计算。
+    warnings: [商品粒度买家数不可跨商品直接求和]
+
+  - id: refund_amount
+    name: 退款金额
+    aliases: [退货退款金额, 售后退款金额]
+    category: 退款
+    stage: sql
+    definition: 统计范围内的退款金额合计。
+    formula: SUM(refund_amt)
+    unit: 元
+    metric_type: additive
+    required_fields: [refund_amt]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats, tb_session_endtime_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 按目标粒度直接求和。
+    zero_denominator: null
+    warnings: [确认退款归属支付日还是退款发生日，不同口径不得混用]
+
+  - id: amount_refund_rate
+    name: 金额退款率
+    aliases: [退款率, 退款金额占比]
+    category: 退款
+    stage: sql
+    definition: 退款金额占成交金额的比例。
+    formula: SUM(refund_amt) / NULLIF(SUM(pay_amt), 0)
+    unit: "%"
+    metric_type: ratio
+    required_fields: [refund_amt, pay_amt]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats, tb_session_endtime_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 先分别汇总退款金额和成交金额，再相除。
+    zero_denominator: 成交金额为0时返回不可计算。
+    warnings: [不得直接平均各行退款率]
+
+  - id: refund_order_count
+    name: 退款订单数
+    aliases: [退款单量, 售后订单数]
+    category: 退款
+    stage: sql
+    definition: 统计范围内的退款订单数量合计。
+    formula: SUM(refund_ord_cnt)
+    unit: 单
+    metric_type: additive
+    required_fields: [refund_ord_cnt]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats, tb_session_endtime_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 按源表明确口径求和。
+    zero_denominator: null
+    warnings: [商品粒度跨商品求和可能重复同一退款订单]
+
+  - id: order_refund_rate
+    name: 订单退款率
+    aliases: [退款订单率, 退单率]
+    category: 退款
+    stage: sql
+    definition: 退款订单数占支付订单数的比例。
+    formula: SUM(refund_ord_cnt) / NULLIF(SUM(pay_ord_cnt), 0)
+    unit: "%"
+    metric_type: ratio
+    required_fields: [refund_ord_cnt, pay_ord_cnt]
+    preferred_tables: [tb_session_endtime_stats, tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 先分别汇总退款订单数和支付订单数，再相除。
+    zero_denominator: 支付订单数为0时返回不可计算。
+    warnings: [确认退款订单是否按支付归属期统计]
+
+  - id: refund_item_quantity
+    name: 退款件数
+    aliases: [退货件数, 退款商品件数]
+    category: 退款
+    stage: sql
+    definition: 统计范围内发生退款的商品件数。
+    formula: SUM(refund_itm_qty)
+    unit: 件
+    metric_type: additive
+    required_fields: [refund_itm_qty]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats, tb_session_endtime_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 按目标粒度直接求和。
+    zero_denominator: null
+    warnings: []
+
+  - id: item_refund_rate
+    name: 件数退款率
+    aliases: [退货率, 退款件数占比]
+    category: 退款
+    stage: sql
+    definition: 退款商品件数占成交商品件数的比例。
+    formula: SUM(refund_itm_qty) / NULLIF(SUM(pay_itm_qty), 0)
+    unit: "%"
+    metric_type: ratio
+    required_fields: [refund_itm_qty, pay_itm_qty]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats, tb_session_endtime_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 先分别汇总退款件数和成交件数，再相除。
+    zero_denominator: 成交件数为0时返回不可计算。
+    warnings: [不得与金额退款率混用]
+
+  - id: refund_buyer_count
+    name: 退款买家数
+    aliases: [退款人数, 售后人数]
+    category: 退款
+    stage: sql
+    definition: 目标统计粒度内发生退款的买家数。
+    formula: SUM(refund_byr_cnt)
+    unit: 人
+    metric_type: non_additive
+    required_fields: [refund_byr_cnt]
+    preferred_tables: [tb_session_endtime_stats]
+    allowed_grains: [单场直播, 单日汇总]
+    aggregation_rule: 仅在源字段所属汇总粒度使用，不跨商品、场次或日期相加去重人数。
+    zero_denominator: null
+    warnings: [跨粒度唯一退款买家需要客户级数据]
+
+  - id: buyer_refund_rate
+    name: 买家退款率
+    aliases: [退款人数占比, 人数退款率]
+    category: 退款
+    stage: sql
+    definition: 退款买家数占支付买家数的比例。
+    formula: SUM(refund_byr_cnt) / NULLIF(SUM(pay_byr_cnt), 0)
+    unit: "%"
+    metric_type: ratio
+    required_fields: [refund_byr_cnt, pay_byr_cnt]
+    preferred_tables: [tb_session_endtime_stats]
+    allowed_grains: [单场直播, 单日汇总]
+    aggregation_rule: 仅在不会重复买家的汇总粒度计算。
+    zero_denominator: 支付买家数为0时返回不可计算。
+    warnings: [商品粒度买家数不可跨商品直接求和]
+
+  - id: item_exposure_uv
+    name: 商品曝光人数
+    aliases: [曝光UV, 曝光人数]
+    category: 流量
+    stage: sql
+    definition: 目标粒度内看到商品的去重人数。
+    formula: SUM(item_exposure_uv)
+    unit: 人
+    metric_type: non_additive
+    required_fields: [item_exposure_uv]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [单商品单日, 单商品单场]
+    aggregation_rule: 仅在源字段所属粒度使用；跨商品、日期或场次不能得到全局唯一人数。
+    zero_denominator: null
+    warnings: [跨粒度求和只能称为曝光UV累计值]
+
+  - id: item_exposure_pv
+    name: 商品曝光次数
+    aliases: [曝光PV, 曝光量]
+    category: 流量
+    stage: sql
+    definition: 商品获得曝光的次数合计。
+    formula: SUM(item_exposure_pv)
+    unit: 次
+    metric_type: additive
+    required_fields: [item_exposure_pv]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 按目标粒度直接求和。
+    zero_denominator: null
+    warnings: []
+
+  - id: item_click_uv
+    name: 商品点击人数
+    aliases: [点击UV, 点击人数]
+    category: 流量
+    stage: sql
+    definition: 目标粒度内点击商品的去重人数。
+    formula: SUM(item_click_uv)
+    unit: 人
+    metric_type: non_additive
+    required_fields: [item_click_uv]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [单商品单日, 单商品单场]
+    aggregation_rule: 仅在源字段所属粒度使用；跨商品、日期或场次不能得到全局唯一人数。
+    zero_denominator: null
+    warnings: [跨粒度求和只能称为点击UV累计值]
+
+  - id: item_click_pv
+    name: 商品点击次数
+    aliases: [点击PV, 点击量]
+    category: 流量
+    stage: sql
+    definition: 商品被点击的次数合计。
+    formula: SUM(item_click_pv)
+    unit: 次
+    metric_type: additive
+    required_fields: [item_click_pv]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [整体, 自然日, 商品, 直播场次]
+    aggregation_rule: 按目标粒度直接求和。
+    zero_denominator: null
+    warnings: []
+
+  - id: item_click_rate
+    name: 商品点击率
+    aliases: [点击率, 商品曝光点击率]
+    category: 流量转化
+    stage: sql
+    definition: 商品点击人数占商品曝光人数的比例。
+    formula: SUM(item_click_uv) / NULLIF(SUM(item_exposure_uv), 0)
+    unit: "%"
+    metric_type: ratio
+    required_fields: [item_click_uv, item_exposure_uv]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [单商品, 单日, 单场直播]
+    aggregation_rule: 先分别汇总点击人数和曝光人数，再相除；跨商品汇总需说明UV重复风险。
+    zero_denominator: 商品曝光人数为0时返回不可计算。
+    warnings: [不得直接平均源字段 item_click_rate]
+
+  - id: item_pay_conversion_rate
+    name: 商品支付转化率
+    aliases: [支付转化率, 点击支付转化率, 商品转化率]
+    category: 流量转化
+    stage: sql
+    definition: 支付买家数占商品点击人数的比例。
+    formula: SUM(pay_byr_cnt) / NULLIF(SUM(item_click_uv), 0)
+    unit: "%"
+    metric_type: ratio
+    required_fields: [pay_byr_cnt, item_click_uv]
+    preferred_tables: [tb_live_goods_daily_stats, tb_live_goods_session_stats]
+    allowed_grains: [单商品, 单商品单日, 单商品单场]
+    aggregation_rule: 在商品粒度汇总分子分母后相除；源字段 pay_conversion_rate 可用于同粒度核对。
+    zero_denominator: 商品点击人数为0时返回不可计算。
+    warnings: [跨商品汇总买家数可能重复, 不得直接平均 pay_conversion_rate]
+
+  - id: watch_uv
+    name: 观看人数
+    aliases: [观看UV, 直播观看人数]
+    category: 直播流量
+    stage: sql
+    definition: 单场直播的去重观看人数。
+    formula: SUM(watch_uv)
+    unit: 人
+    metric_type: non_additive
+    required_fields: [watch_uv]
+    preferred_tables: [tb_session_endtime_stats]
+    allowed_grains: [单场直播]
+    aggregation_rule: 单场直接使用；跨场次不能相加得到唯一观看人数。
+    zero_denominator: null
+    warnings: [跨场次求和只能称为场次观看UV累计值]
+
+  - id: session_count
+    name: 直播场次数
+    aliases: [直播场次, 开播场数, 场次数]
+    category: 直播
+    stage: sql
+    definition: 统计周期内不同直播场次的数量。
+    formula: COUNT(DISTINCT live_session_id)
+    unit: 场
+    metric_type: non_additive
+    required_fields: [live_session_id]
+    preferred_tables: [tb_session_endtime_stats, tb_live_goods_session_stats]
+    allowed_grains: [整体, 自然日]
+    aggregation_rule: 始终按 live_session_id 去重计数；商品场次表中同一场直播有多行商品记录。
+    zero_denominator: null
+    warnings: [不使用商品行数代替直播场次数]
+
+  - id: absolute_change
+    name: 绝对变化
+    aliases: [变化额, 增量, 减少额, 绝对增减]
+    category: 对比分析
+    stage: post_query
+    definition: 当前值与可比基准值之差。
+    formula: current_value - baseline_value
+    unit: 与原指标一致
+    metric_type: derived
+    required_fields: [current_value, baseline_value]
+    preferred_tables: []
+    allowed_grains: [任意可比粒度]
+    aggregation_rule: 当前期与基准期必须使用相同指标公式、筛选和周期长度。
+    zero_denominator: null
+    warnings: [周期不可比时不得计算]
+
+  - id: relative_change
+    name: 变化率
+    aliases: [环比, 同比, 增长率, 降幅]
+    category: 对比分析
+    stage: post_query
+    definition: 绝对变化相对于基准值绝对值的比例。
+    formula: (current_value - baseline_value) / NULLIF(ABS(baseline_value), 0)
+    unit: "%"
+    metric_type: derived
+    required_fields: [current_value, baseline_value]
+    preferred_tables: []
+    allowed_grains: [任意可比粒度]
+    aggregation_rule: 先按一致口径取得当前值和基准值，再计算变化率。
+    zero_denominator: 基准值为0时不计算变化率，只报告绝对变化并标记新增长或无可比基期。
+    warnings: [同比需要上年同期完整数据, 环比默认等长上一周期]
+
+  - id: percentage_point_change
+    name: 百分点变化
+    aliases: [提升几个点, 下降几个百分点, 比率变化]
+    category: 对比分析
+    stage: post_query
+    definition: 当前比率与基准比率之差。
+    formula: current_rate - baseline_rate
+    unit: 个百分点
+    metric_type: derived
+    required_fields: [current_rate, baseline_rate]
+    preferred_tables: []
+    allowed_grains: [任意可比粒度]
+    aggregation_rule: 两个比率必须使用相同分子、分母和筛选口径。
+    zero_denominator: 任一周期比率不可计算时不输出百分点变化。
+    warnings: [不要把百分点变化写成百分比变化]
+
+  - id: change_contribution_rate
+    name: 变化贡献率
+    aliases: [增长贡献率, 下滑贡献率, 驱动贡献]
+    category: 驱动分析
+    stage: post_query
+    definition: 某维度变化额占整体变化额的比例。
+    formula: dimension_change / NULLIF(total_change, 0)
+    unit: "%"
+    metric_type: derived
+    required_fields: [dimension_change, total_change]
+    preferred_tables: []
+    allowed_grains: [商品, 直播场次, 日期, 其他可拆分维度]
+    aggregation_rule: 维度变化额必须与整体变化额使用相同指标、周期、筛选和去重口径。
+    zero_denominator: 整体变化额为0时不计算贡献率，只报告维度绝对变化。
+    warnings: [贡献表示数值驱动，不代表因果, 正负贡献可能使绝对贡献率合计不等于100%]

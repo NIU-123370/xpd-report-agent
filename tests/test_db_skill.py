@@ -25,7 +25,9 @@ def test_database_skill_is_injected_for_data_work_but_not_pure_export():
 def test_pure_export_reuses_snapshot_without_database_tools():
     assert is_export_only_request("xlsx") is True
     assert is_export_only_request("把刚才结果导出为 CSV") is True
+    assert is_export_only_request("把刚才的退款诊断导成 Excel") is True
     assert is_export_only_request("统计退款金额并导出 PDF") is False
+    assert is_export_only_request("重新统计刚才的退款数据并导出 PDF") is False
     assert is_export_only_request("不要导出 Excel") is False
 
     prompt = export_action_prompt("xlsx")

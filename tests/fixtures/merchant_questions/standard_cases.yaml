@@ -1,0 +1,45 @@
+cases:
+  - id: standard_yesterday_gmv
+    input: 昨天成交额是多少？
+    expected_analysis_type: query
+    expected_metrics: [成交金额]
+    must_clarify: false
+    expected_sections: [直接答案, 数据口径]
+    expected_answer:
+      status: success
+      must_include: [成交金额, 明确日期范围, Asia/Shanghai]
+      must_not_claim: [无数据等于0]
+
+  - id: standard_weekly_comparison
+    input: 最近7天卖得怎么样？
+    expected_analysis_type: comparison
+    expected_metrics: [成交金额, 支付订单数, 成交件数]
+    must_clarify: false
+    default_baseline: 等长上一周期
+    expected_sections: [核心结论, 指标对比, 主要驱动, 数据质量]
+    expected_answer:
+      status: success
+      must_include: [当前值, 基准值, 绝对变化, 变化率, 贡献证据]
+      must_not_claim: [无证据的业务原因]
+
+  - id: standard_refund_diagnosis
+    input: 最近退款为什么变高了？
+    expected_analysis_type: diagnosis
+    expected_metrics: [退款金额, 金额退款率]
+    must_clarify: false
+    expected_sections: [数据事实, 异常定位, 限制, 建议]
+    expected_answer:
+      status: success
+      must_include: [当前退款率, 基准退款率, 分子分母, 样本量]
+      must_not_claim: [已证明商品质量导致退款]
+
+  - id: standard_sales_drop
+    input: 今天销售为什么掉了？
+    expected_analysis_type: diagnosis
+    expected_metrics: [成交金额]
+    must_clarify: false
+    expected_sections: [数据事实, 主要驱动, 证据, 建议, 限制]
+    expected_answer:
+      status: success
+      must_include: [同进度或完整周期基准, 绝对变化, 贡献率]
+      must_not_claim: [数值贡献等于根本原因]

@@ -57,6 +57,9 @@ export XPD_PERIODIC_REFLECTION_ENABLED="${XPD_PERIODIC_REFLECTION_ENABLED:-true}
 export XPD_REFLECTION_INTERVAL="${XPD_REFLECTION_INTERVAL:-3}"
 export XPD_MEMORY_CHAR_LIMIT="${XPD_MEMORY_CHAR_LIMIT:-2200}"
 export XPD_USER_CHAR_LIMIT="${XPD_USER_CHAR_LIMIT:-1375}"
+export XPD_MEMORY_CONSOLIDATION_RATIO="${XPD_MEMORY_CONSOLIDATION_RATIO:-0.8}"
+export XPD_MEMORY_CRITICAL_RATIO="${XPD_MEMORY_CRITICAL_RATIO:-0.95}"
+export XPD_MEMORY_CONSOLIDATION_TARGET_RATIO="${XPD_MEMORY_CONSOLIDATION_TARGET_RATIO:-0.6}"
 export XPD_IDENTITY_MODE="${XPD_IDENTITY_MODE:-session_key}"
 export XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED="${XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED:-false}"
 export XPD_MERCHANT_MEMORY_ENABLED="${XPD_MERCHANT_MEMORY_ENABLED:-true}"
@@ -112,7 +115,7 @@ verify_hermes_runtime() {
       ;;
   esac
   case "$hermes_version_output" in
-    *"upstream ${hermes_commit_short}"*) ;;
+    *"upstream ${hermes_commit_short}"*|*"local ${hermes_commit_short}"*) ;;
     *)
       echo "Hermes revision mismatch. Required ${HERMES_AGENT_COMMIT}." >&2
       echo "Installed runtime: $hermes_version_output" >&2

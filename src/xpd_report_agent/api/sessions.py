@@ -31,6 +31,11 @@ from xpd_report_agent.api.agent_runs import (
     run_retry_attempt_count,
     validate_idempotency_key,
 )
+from xpd_report_agent.api.analysis_contracts import (
+    analysis_output_contract_prompt,
+    apply_analysis_output_contract,
+    infer_analysis_type,
+)
 from xpd_report_agent.api.artifact_store import (
     delete_session_artifacts,
     list_session_artifacts,
@@ -42,9 +47,17 @@ from xpd_report_agent.api.error_contract import (
     api_error,
     documented_error_responses,
 )
+from xpd_report_agent.api.memory_consolidation import (
+    MemoryConsolidationManager,
+    memory_consolidation_enabled,
+    memory_consolidation_scan_seconds,
+)
+from xpd_report_agent.api.merchant_questions import merchant_question_prompt
+from xpd_report_agent.api.metric_definitions import metric_definition_prompt
 from xpd_report_agent.api.prompts import (
     CHINESE_REASONING_REMINDER,
     FINAL_REFLECTION_SYSTEM_PROMPT,
+    MEMORY_CONSOLIDATION_SYSTEM_PROMPT,
     REPORT_SYSTEM_PROMPT,
 )
 from xpd_report_agent.api.reflections import ReflectionQueue
@@ -76,12 +89,15 @@ from xpd_report_agent.hermes_plugin.db_query.report_oss import (
     report_oss_config,
     write_report_oss_context,
 )
+from xpd_report_agent.memory_governance import (
+    backup_personal_memory,
+    memory_policy,
+    personal_memory_states,
+)
 from xpd_report_agent.memory_paths import (
     IDENTITY_MODE_USER_ID,
     configured_identity_mode,
-    local_memory_dir,
     merchant_memory_path,
-    user_memory_dir,
 )
 from xpd_report_agent.runtime.hermes_config import required_memory_tools_from_env
 
@@ -256,33 +272,24 @@ def hermes_api_key() -> str:
 
 def memory_capacity_notice(scope: str | None = None) -> str:
     user_scoped = configured_identity_mode() == IDENTITY_MODE_USER_ID
-    memory_dir = user_memory_dir(scope or "") if user_scoped else local_memory_dir()
-    try:
-        ratio = float(os.getenv("XPD_MEMORY_CONSOLIDATION_RATIO", "0.8"))
-    except ValueError:
-        ratio = 0.8
-    ratio = min(0.95, max(0.5, ratio))
-    stores = (
-        ("MEMORY.md", max(256, int(os.getenv("XPD_MEMORY_CHAR_LIMIT", "2200")))),
-        ("USER.md", max(256, int(os.getenv("XPD_USER_CHAR_LIMIT", "1375")))),
-    )
-    states = []
-    requires_consolidation = False
-    for filename, limit in stores:
-        path = memory_dir / filename
-        try:
-            used = len(path.read_text(encoding="utf-8")) if path.exists() else 0
-        except OSError:
-            used = 0
-        at_watermark = used >= int(limit * ratio)
-        requires_consolidation = requires_consolidation or at_watermark
-        states.append(f"{filename}={used}/{limit}")
-    instruction = (
-        "已达到整理水位：本轮 memory 写入前必须先整理，若仍无空间则跳过写入。"
-        if requires_consolidation
-        else "尚未达到整理水位：仍须去重，只保存高价值稳定信息。"
-    )
-    notice = f"记忆容量状态（整理水位 {ratio:.0%}）：{', '.join(states)}。{instruction}"
+    policy = memory_policy()
+    memory_states = personal_memory_states(scope or "")
+    states = [
+        f"{state.filename}={state.used_chars}/{state.limit_chars}" for state in memory_states
+    ]
+    if any(state.at_critical for state in memory_states):
+        instruction = (
+            f"已达到 {policy.critical_ratio:.0%} 临界水位：暂停新增，只允许压缩、替换和删除；"
+            "后台整理不会阻塞当前分析。"
+        )
+    elif any(state.at_trigger for state in memory_states):
+        instruction = (
+            f"已达到整理水位（{policy.trigger_ratio:.0%}）：仍可正常写入，同时由服务端异步整理至"
+            f"约 {policy.target_ratio:.0%}。"
+        )
+    else:
+        instruction = "处于正常写入区间：仍须去重，只保存高价值稳定信息。"
+    notice = f"记忆容量状态：{', '.join(states)}。{instruction}"
     if user_scoped and os.getenv("XPD_MERCHANT_MEMORY_ENABLED", "true").strip().lower() in {
         "1",
         "true",
@@ -318,8 +325,14 @@ def report_system_prompt(
         notices.append(STRUCTURED_ANALYSIS_INSTRUCTION)
     if skill_prompt := db_skill_prompt(user_message):
         notices.append(skill_prompt)
+    if analysis_prompt := analysis_output_contract_prompt(user_message):
+        notices.append(analysis_prompt)
     if export_prompt := export_action_prompt(user_message):
         notices.append(export_prompt)
+    if metric_prompt := metric_definition_prompt(user_message):
+        notices.append(metric_prompt)
+    if question_prompt := merchant_question_prompt(user_message):
+        notices.append(question_prompt)
     if structured_result:
         # This transport-specific instruction is deliberately last: durable
         # non-streaming Runs cannot use Hermes' blocking in-memory clarify tool.
@@ -640,7 +653,7 @@ async def _submit_session_turn(
 ) -> dict[str, Any]:
     """Submit a non-streaming turn through the shared Session/Run core."""
 
-    return await _hermes_json(
+    result = await _hermes_json(
         "POST",
         _session_turn_path(session_id),
         scope=scope,
@@ -653,6 +666,8 @@ async def _submit_session_turn(
         ),
         action=action,
     )
+    schedule_memory_consolidation(scope)
+    return result
 
 
 def _extract_chat_content(payload: dict[str, Any]) -> str:
@@ -969,6 +984,13 @@ def _run_outcome_from_content(
         }
 
     clean_content, analysis = parse_structured_analysis(content)
+    if analysis.structured:
+        analysis = apply_analysis_output_contract(
+            analysis,
+            expected_type=infer_analysis_type(
+                str((record.get("request") or {}).get("message") or "")
+            ),
+        )
     return {
         "status": "succeeded",
         "result": {
@@ -1522,12 +1544,83 @@ async def _execute_final_reflection(job: dict[str, Any]) -> dict[str, Any] | str
 
     content = redact_sensitive_text(_extract_chat_content(reflection_payload))[:12_000]
     try:
-        return json.loads(content)
+        result = json.loads(content)
     except json.JSONDecodeError:
-        return {"summary": content}
+        result = {"summary": content}
+    schedule_memory_consolidation(scope)
+    return result
+
+
+async def _execute_memory_consolidation(job: dict[str, Any]) -> dict[str, Any]:
+    scope = str(job["owner_scope"])
+    target_names = {
+        str(target.get("target"))
+        for target in job.get("targets") or []
+        if isinstance(target, dict)
+    }
+    backups = (
+        backup_personal_memory(scope)
+        if int(job.get("attempt_count") or 0) == 1
+        else []
+    )
+    policy = memory_policy()
+    session_id = new_reflection_session_id(scope)
+    await _hermes_json(
+        "POST",
+        "/api/sessions",
+        payload={"id": session_id},
+        action="create memory consolidation session",
+    )
+    try:
+        payload = await _hermes_json(
+            "POST",
+            f"/api/sessions/{session_id}/chat",
+            scope=scope,
+            timeout=_final_reflection_timeout_seconds(),
+            payload={
+                "system_message": MEMORY_CONSOLIDATION_SYSTEM_PROMPT,
+                "message": (
+                    f"只整理 targets={sorted(target_names)}。当前触发水位="
+                    f"{policy.trigger_ratio:.0%}，临界水位={policy.critical_ratio:.0%}，"
+                    f"目标水位={policy.target_ratio:.0%}。请现在使用 memory 工具完成整理。"
+                ),
+            },
+            action="consolidate personal memory",
+        )
+    finally:
+        try:
+            await _hermes_json(
+                "DELETE",
+                f"/api/sessions/{session_id}",
+                action="delete memory consolidation session",
+            )
+        except HTTPException:
+            pass
+
+    states = [
+        state
+        for state in personal_memory_states(scope)
+        if state.target in target_names
+    ]
+    if any(state.at_trigger for state in states):
+        raise api_error(
+            503,
+            code="MEMORY_CONSOLIDATION_INCOMPLETE",
+            message="Personal memory remains above the consolidation watermark.",
+            retryable=True,
+            outcome_unknown=False,
+        )
+    return {
+        "target_ratio": policy.target_ratio,
+        "target_met": all(state.usage_ratio <= policy.target_ratio for state in states),
+        "stores": [state.public() for state in states],
+        "backups": backups,
+        "model_result": _extract_chat_content(payload)[:2000],
+    }
 
 
 _reflection_queue: ReflectionQueue | None = None
+_memory_consolidation_manager: MemoryConsolidationManager | None = None
 
 
 def reflection_queue() -> ReflectionQueue:
@@ -1535,6 +1628,38 @@ def reflection_queue() -> ReflectionQueue:
     if _reflection_queue is None:
         _reflection_queue = ReflectionQueue(_execute_final_reflection)
     return _reflection_queue
+
+
+def memory_consolidation_manager() -> MemoryConsolidationManager:
+    global _memory_consolidation_manager
+    if _memory_consolidation_manager is None:
+        _memory_consolidation_manager = MemoryConsolidationManager(
+            _execute_memory_consolidation
+        )
+    return _memory_consolidation_manager
+
+
+def schedule_memory_consolidation(scope: str) -> bool:
+    if not memory_consolidation_enabled():
+        return False
+    return memory_consolidation_manager().schedule_if_needed(scope)
+
+
+def memory_consolidation_health() -> dict[str, Any]:
+    return memory_consolidation_manager().health()
+
+
+async def memory_consolidation_sweeper() -> None:
+    while True:
+        try:
+            memory_consolidation_manager().scan_and_schedule()
+        except Exception as exc:
+            logger.warning("Memory consolidation scan failed: %s", exc)
+        await asyncio.sleep(memory_consolidation_scan_seconds())
+
+
+async def shutdown_memory_consolidation() -> None:
+    await memory_consolidation_manager().shutdown()
 
 
 async def resume_reflection_jobs() -> None:
@@ -2360,6 +2485,7 @@ async def session_chat_stream(
             ):
                 yield artifact_event
         finally:
+            schedule_memory_consolidation(scope)
             _release_chat_session(session_id)
 
     return StreamingResponse(

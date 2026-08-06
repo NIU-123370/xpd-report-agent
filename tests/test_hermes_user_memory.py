@@ -41,6 +41,15 @@ class FakeMemoryStore:
     def _entries_for(self, target):
         return self.user_entries if target == "user" else self.memory_entries
 
+    def _char_limit(self, target):
+        return self.user_char_limit if target == "user" else self.memory_char_limit
+
+    def add(self, target, content):
+        return {"success": True, "target": target, "content": content}
+
+    def apply_batch(self, target, operations):
+        return {"success": True, "target": target, "operations": operations}
+
     def load_from_disk(self):
         root = Path(sys.modules["hermes_constants"].get_hermes_home()) / "memories"
         self.memory_entries = self._read_file(root / "MEMORY.md")
@@ -177,3 +186,27 @@ def test_user_mode_rejects_missing_or_mismatched_scope_before_agent_creation(
         )
 
     assert calls == []
+
+
+def test_critical_memory_watermark_pauses_new_entries(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XPD_IDENTITY_MODE", "user_id")
+    monkeypatch.setenv("XPD_MEMORY_CRITICAL_RATIO", "0.95")
+    scope = "c" * 20
+    personal = tmp_path / "memories" / "users" / scope
+    personal.mkdir(parents=True)
+    (personal / "MEMORY.md").write_text("x" * 2090, encoding="utf-8")
+    Adapter, _calls = _install_fake_hermes(monkeypatch, tmp_path)
+
+    agent = Adapter()._create_agent(
+        session_id=f"xpd_{scope}_session",
+        gateway_session_key=scope,
+    )
+    added = agent._memory_store.add("memory", "新记忆")
+    replaced = agent._memory_store.apply_batch(
+        "memory", [{"action": "replace", "old_text": "x", "content": "精简"}]
+    )
+
+    assert added["success"] is False
+    assert added["critical"] is True
+    assert replaced["success"] is True

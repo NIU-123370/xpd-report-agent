@@ -1,0 +1,24 @@
+cases:
+  - id: clarify_product_ranking_metric
+    input: 给我商品排行榜。
+    must_clarify: true
+    expected_question_contains: 按哪个指标
+    expected_choices: [成交金额, 支付订单数, 成交件数, 退款金额]
+
+  - id: clarify_refund_rate_definition
+    input: 查一下退款率。
+    must_clarify: true
+    expected_question_contains: 按金额还是订单数
+    expected_choices: [退款金额/成交金额, 退款订单数/支付订单数]
+
+  - id: clarify_sales_definition
+    input: 哪个商品销量最高？
+    must_clarify: true
+    expected_question_contains: 成交件数还是支付订单数
+    expected_choices: [成交件数, 支付订单数]
+
+  - id: clarify_session_identity
+    input: 分析一下昨晚那场直播。
+    must_clarify: true
+    expected_question_contains: 场次
+    expected_choices: []

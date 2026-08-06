@@ -394,7 +394,8 @@ def _scheduled_prompt(run: dict[str, Any]) -> str:
         f"调用 export_report_file，导出格式为 {output_format}（{format_label}）。"
         f"{xlsx_instruction}"
         "即使查询为空，也要导出带字段说明、统计周期和空数据说明的文件。\n"
-        "最终回答使用简体中文，概述统计周期、核心结论、已执行 SQL 的验证状态和下载文件；"
+        "最终回答使用简体中文，概述统计周期、核心结论、查询验证状态和下载文件，"
+        "不得输出 SQL 语句或 SQL 代码块；"
         "所有判断必须能由本次已执行查询支持。"
     )
 

@@ -15,11 +15,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from xpd_report_agent.api.agent_capacity import agent_capacity_slot
+from xpd_report_agent.api.analysis_contracts import analysis_output_contract_prompt
 from xpd_report_agent.api.error_contract import (
     REQUEST_ID_HEADER,
     install_error_contract,
     request_id_from_header,
 )
+from xpd_report_agent.api.merchant_questions import merchant_question_prompt
+from xpd_report_agent.api.metric_definitions import metric_definition_prompt
 from xpd_report_agent.api.prompts import REPORT_SYSTEM_PROMPT
 from xpd_report_agent.api.service_auth import (
     authorize_service_request,
@@ -92,9 +95,12 @@ from xpd_report_agent.api.schedules import (  # noqa: E402
 from xpd_report_agent.api.sessions import (  # noqa: E402
     agent_run_health,
     idle_session_sweeper,
+    memory_consolidation_health,
+    memory_consolidation_sweeper,
     resume_agent_runs,
     resume_reflection_jobs,
     shutdown_agent_runs,
+    shutdown_memory_consolidation,
 )
 from xpd_report_agent.api.sessions import (  # noqa: E402
     router as sessions_router,
@@ -110,9 +116,17 @@ async def lifespan(_: FastAPI):
     await resume_scheduled_reports()
     await resume_agent_runs()
     sweeper = asyncio.create_task(idle_session_sweeper(), name="xpd-idle-session-sweeper")
+    memory_sweeper = asyncio.create_task(
+        memory_consolidation_sweeper(),
+        name="xpd-memory-consolidation-sweeper",
+    )
     try:
         yield
     finally:
+        memory_sweeper.cancel()
+        with suppress(asyncio.CancelledError):
+            await memory_sweeper
+        await shutdown_memory_consolidation()
         await shutdown_agent_runs()
         await shutdown_scheduled_reports()
         sweeper.cancel()
@@ -202,10 +216,17 @@ def build_payload(req: ChatRequest, *, stream: bool) -> dict:
         for message in req.history
         if message.role in {"user", "assistant"}
     ]
+    system_prompt = SYSTEM_PROMPT
+    if analysis_prompt := analysis_output_contract_prompt(req.message):
+        system_prompt = f"{system_prompt}\n\n{analysis_prompt}"
+    if metric_prompt := metric_definition_prompt(req.message):
+        system_prompt = f"{system_prompt}\n\n{metric_prompt}"
+    if question_prompt := merchant_question_prompt(req.message):
+        system_prompt = f"{system_prompt}\n\n{question_prompt}"
     return {
         "model": hermes_model(),
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             *history,
             {"role": "user", "content": req.message},
         ],
@@ -294,6 +315,7 @@ async def health() -> dict:
         "service_auth": service_auth_health(),
         "hermes": {"ok": False, "status_code": None, "error": None},
         "agent_runs": agent_run_health(),
+        "memory_consolidation": memory_consolidation_health(),
         "db_query": {
             "ok": False,
             "required_tools": REQUIRED_DB_TOOLS,
