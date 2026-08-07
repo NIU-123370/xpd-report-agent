@@ -101,9 +101,12 @@ def test_middle_platform_openapi_declares_headers_statuses_and_models():
     assert "waiting_input" in run_schema["properties"]["status"]["enum"]
 
 
-def test_legacy_chat_openapi_operations_are_deprecated():
+def test_openapi_only_exposes_middle_platform_business_operations():
     schema = app.openapi()
-
-    assert schema["paths"]["/api/chat"]["post"]["deprecated"] is True
-    assert schema["paths"]["/api/chat/stream"]["post"]["deprecated"] is True
-    assert schema["paths"]["/api/sessions/{session_id}/chat"]["post"]["deprecated"] is True
+    assert set(schema["paths"]) == {
+        "/ready",
+        "/api/v1/agent/runs",
+        "/api/v1/agent/runs/{run_id}",
+        "/api/v1/agent/runs/{run_id}/input",
+        "/api/sessions/{session_id}/artifacts/{artifact_id}/download",
+    }

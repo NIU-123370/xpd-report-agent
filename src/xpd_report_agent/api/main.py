@@ -10,6 +10,7 @@ from typing import Literal
 import httpx
 from dotenv import dotenv_values
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -691,3 +692,37 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
 def _sse_error(payload: dict) -> str:
     return f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+MIDDLE_PLATFORM_OPENAPI_PATHS = frozenset(
+    {
+        "/ready",
+        "/api/v1/agent/runs",
+        "/api/v1/agent/runs/{run_id}",
+        "/api/v1/agent/runs/{run_id}/input",
+        "/api/sessions/{session_id}/artifacts/{artifact_id}/download",
+    }
+)
+
+
+def middle_platform_openapi() -> dict:
+    """Expose the stable middle-platform operations and readiness check."""
+
+    if app.openapi_schema is not None:
+        return app.openapi_schema
+    schema = get_openapi(
+        title="直播数据分析 Agent 中台接口",
+        version="1.0.0",
+        description="包含四个稳定业务接口和一个服务就绪检查接口。",
+        routes=app.routes,
+    )
+    schema["paths"] = {
+        path: operations
+        for path, operations in schema.get("paths", {}).items()
+        if path in MIDDLE_PLATFORM_OPENAPI_PATHS
+    }
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = middle_platform_openapi
