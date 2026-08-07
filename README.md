@@ -1,7 +1,51 @@
 # xpd-report-agent
 
-`xpd-report-agent` 验证 Hermes Agent 通过自定义 `db-query` 插件查询 MySQL
-淘宝直播报表数据库的完整链路，并提供 FastAPI Wrapper 和静态聊天页面。
+`xpd-report-agent` 是面向直播中台的数据分析 AI 微服务。服务通过 Hermes Agent 和自定义
+`db-query` 工具只读查询 MySQL/RDS，支持中文分析进度、流式答案、澄清续答以及
+Excel、CSV、Markdown、PDF、JSON 报告导出。
+
+## 快速导航
+
+| 场景 | 文档 |
+|---|---|
+| 阿里云 ECS / Docker 部署 | [`deploy/docker/README.md`](deploy/docker/README.md) |
+| 中台后端接入 5 个稳定接口 | [`docs/api/middle-platform-agent-api.md`](docs/api/middle-platform-agent-api.md) |
+| 内部测试与网页接口 | [`docs/api/internal-test-api.md`](docs/api/internal-test-api.md) |
+| Linux systemd 部署 | [`deploy/systemd/README.md`](deploy/systemd/README.md) |
+
+生产部署采用一个 Docker 容器运行 FastAPI 和 Hermes Gateway，外部依赖使用阿里云 RDS、
+模型服务和 OSS：
+
+```text
+中台后端 → FastAPI :8000 → Hermes Gateway :8642 → 模型
+                               ├→ RDS（只读查询）
+                               └→ OSS（报告文件）
+```
+
+容器达到 `healthy`、`GET /ready` 返回 `{"ok":true,"status":"ready"}`，并且
+`checks.runtime`、`checks.mysql` 都为 `true`，才表示服务可接收中台业务请求。
+
+## API 接口文档
+
+`docs/api/` 按调用对象拆成两份文档，不要混用：
+
+| 文档 | 使用对象 | 内容与稳定性 |
+|---|---|---|
+| [`middle-platform-agent-api.md`](docs/api/middle-platform-agent-api.md) | 中台后端开发者 | 正式稳定接口，包括任务创建、状态查询、SSE 流式输出、澄清续答和文件下载 |
+| [`internal-test-api.md`](docs/api/internal-test-api.md) | Agent 开发、测试、运维 | 网页调试、会话管理和内部诊断接口，不承诺对中台保持兼容 |
+
+中台只接入以下 5 个业务接口：
+
+```text
+POST /api/v1/agent/runs
+GET  /api/v1/agent/runs/{run_id}
+GET  /api/v1/agent/runs/{run_id}/stream
+POST /api/v1/agent/runs/{run_id}/input
+GET  /api/sessions/{session_id}/artifacts/{artifact_id}/download
+```
+
+发布系统或内部网关还可以使用 `GET /ready` 做就绪探测。`/health` 包含内部诊断信息，只供
+Agent 运维使用。中台不要调用 `internal-test-api.md` 中列出的网页和内部接口。
 
 数据库问题遵循以下工具链路：
 
@@ -227,3 +271,4 @@ TrueType 字体并配置 `XPD_PDF_FONT_PATH`。
 - `docs/prds/`：产品需求文档。
 - `docs/plans/`：设计和实施计划。
 - `docs/archs/`：系统架构和代码说明。
+- `docs/api/`：中台稳定接口文档和内部测试接口文档。
