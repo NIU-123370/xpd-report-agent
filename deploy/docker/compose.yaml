@@ -11,7 +11,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - hermes-data:/var/lib/xpd-report-agent/.hermes
       - report-files:/app/data/report-files
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5)"]
@@ -21,5 +20,4 @@ services:
       start_period: 120s
 
 volumes:
-  hermes-data:
   report-files:

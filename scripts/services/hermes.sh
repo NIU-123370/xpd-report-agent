@@ -43,6 +43,10 @@ export HERMES_GATEWAY_API_KEY="${HERMES_GATEWAY_API_KEY:-dev-secret}"
 export HERMES_GATEWAY_MODEL="${HERMES_GATEWAY_MODEL:-hermes-agent}"
 export HERMES_GATEWAY_ALLOW_ALL_USERS="${HERMES_GATEWAY_ALLOW_ALL_USERS:-true}"
 export HERMES_TIMEZONE="${HERMES_TIMEZONE:-Asia/Shanghai}"
+if [ -n "${HERMES_LLM_API_KEY:-}" ]; then
+  export ALIBABA_CODING_PLAN_API_KEY="${ALIBABA_CODING_PLAN_API_KEY:-$HERMES_LLM_API_KEY}"
+  export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:-$HERMES_LLM_API_KEY}"
+fi
 export MYSQL_HOST="${MYSQL_HOST:-${XPD_DB_HOST:-127.0.0.1}}"
 export MYSQL_PORT="${MYSQL_PORT:-${XPD_DB_PORT:-3306}}"
 export MYSQL_USER="${MYSQL_USER:-${XPD_DB_USERNAME:-root}}"
@@ -117,9 +121,13 @@ verify_hermes_runtime() {
   case "$hermes_version_output" in
     *"upstream ${hermes_commit_short}"*|*"local ${hermes_commit_short}"*) ;;
     *)
-      echo "Hermes revision mismatch. Required ${HERMES_AGENT_COMMIT}." >&2
-      echo "Installed runtime: $hermes_version_output" >&2
-      exit 1
+      hermes_repo="$(cd "$(dirname "$HERMES_BIN")/../.." && pwd)"
+      hermes_git_commit="$(git -C "$hermes_repo" rev-parse HEAD 2>/dev/null || true)"
+      if [ "$hermes_git_commit" != "$HERMES_AGENT_COMMIT" ]; then
+        echo "Hermes revision mismatch. Required ${HERMES_AGENT_COMMIT}." >&2
+        echo "Installed runtime: $hermes_version_output" >&2
+        exit 1
+      fi
       ;;
   esac
 }
