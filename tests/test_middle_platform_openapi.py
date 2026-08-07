@@ -107,6 +107,7 @@ def test_openapi_only_exposes_middle_platform_business_operations():
         "/ready",
         "/api/v1/agent/runs",
         "/api/v1/agent/runs/{run_id}",
+        "/api/v1/agent/runs/{run_id}/stream",
         "/api/v1/agent/runs/{run_id}/input",
         "/api/sessions/{session_id}/artifacts/{artifact_id}/download",
     }

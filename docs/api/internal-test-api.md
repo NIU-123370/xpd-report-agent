@@ -99,13 +99,14 @@ POST /api/sessions/{session_id}/chat
 
 ## 8. 中台接口回归
 
-每次发布仍需回归 4 个中台稳定接口：
+每次发布仍需回归 5 个中台稳定接口：
 
 ```text
 POST /api/v1/agent/runs
 GET  /api/v1/agent/runs/{run_id}
+GET  /api/v1/agent/runs/{run_id}/stream
 POST /api/v1/agent/runs/{run_id}/input
 GET  /api/sessions/{session_id}/artifacts/{artifact_id}/download
 ```
 
-自动接口页 `/docs` 和 `/openapi.json` 展示 4 个中台业务接口及 `GET /ready`；内部接口以本文和代码路由为准。
+自动接口页 `/docs` 和 `/openapi.json` 展示 5 个中台业务接口及 `GET /ready`；内部接口以本文和代码路由为准。

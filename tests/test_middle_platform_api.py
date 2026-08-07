@@ -201,7 +201,8 @@ def test_middle_platform_run_is_idempotent_and_recoverable(tmp_path, monkeypatch
         assert analysis["data_quality"] is None
         assert analysis["executed_queries"] == []
         assert analysis["sql"] == []
-        assert completed["result"]["reasoning"] == "先检查数据，再汇总结论。"
+        assert completed["result"]["progress"] == ["已完成分析并整理结论"]
+        assert "reasoning" not in completed["result"]
         chat_call = next(
             call for call in FakeHermesClient.calls if call["url"].endswith("/chat")
         )
@@ -216,6 +217,33 @@ def test_middle_platform_run_is_idempotent_and_recoverable(tmp_path, monkeypatch
         assert repeated.json()["run"]["run_id"] == completed["run_id"]
         chat_calls = [call for call in FakeHermesClient.calls if call["url"].endswith("/chat")]
         assert len(chat_calls) == 1
+
+
+def test_middle_platform_run_stream_returns_safe_progress_and_answer(
+    tmp_path, monkeypatch
+):
+    with configured_client(tmp_path, monkeypatch) as client:
+        created = client.post(
+            "/api/v1/agent/runs",
+            headers={**CLIENT_HEADERS, "Idempotency-Key": "stream-analysis-001"},
+            json={"message": "分析最近七天商品表现"},
+        )
+        run = wait_for_run(client, created.json()["status_url"])
+
+        response = client.get(
+            f"/api/v1/agent/runs/{run['run_id']}/stream",
+            headers=CLIENT_HEADERS,
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert "event: progress" in response.text
+        assert "已完成分析并整理结论" in response.text
+        assert "event: answer.delta" in response.text
+        assert "经营分析完成" in response.text
+        assert "event: run.completed" in response.text
+        assert "先检查数据，再汇总结论" not in response.text
+        assert "reasoning" not in response.text
 
 
 def test_middle_platform_run_waits_persistently_and_resumes_with_idempotent_input(

@@ -107,6 +107,8 @@ logger = logging.getLogger(__name__)
 _active_chat_lock = threading.Lock()
 _active_chat_sessions: set[str] = set()
 _agent_run_tasks: dict[str, asyncio.Task[None]] = {}
+_agent_run_event_lock = threading.Lock()
+_agent_run_events: dict[str, list[tuple[str, dict[str, Any]]]] = {}
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
@@ -153,7 +155,7 @@ class AgentRunResultResponse(BaseModel):
     session_id: str
     content: str
     analysis: StructuredAnalysis
-    reasoning: str
+    progress: list[str] = Field(default_factory=list)
     usage: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[AgentRunArtifactResponse] = Field(default_factory=list)
     recovered: bool
@@ -670,6 +672,137 @@ async def _submit_session_turn(
     return result
 
 
+async def _submit_agent_run_stream(
+    run_id: str,
+    session_id: str,
+    *,
+    scope: str,
+    message: str,
+    prompt_message: str,
+    timeout: float,
+) -> dict[str, Any]:
+    """Drain Hermes SSE while publishing a caller-safe live event projection."""
+
+    # Lightweight test clients and older integrations may only implement the
+    # request API. They retain the durable non-streaming execution path.
+    if not hasattr(httpx.AsyncClient, "stream"):
+        return await _submit_session_turn(
+            session_id,
+            scope=scope,
+            message=message,
+            prompt_message=prompt_message,
+            structured_result=True,
+            timeout=timeout,
+            action="run agent analysis",
+        )
+
+    content = ""
+    usage: dict[str, Any] = {}
+    buffer = ""
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            async with client.stream(
+                "POST",
+                f"{hermes_origin()}{_session_turn_path(session_id, stream=True)}",
+                headers=_hermes_headers(scope),
+                json=_session_turn_payload(
+                    scope=scope,
+                    message=message,
+                    prompt_message=prompt_message,
+                    structured_result=True,
+                ),
+            ) as response:
+                if not response.is_success:
+                    await response.aread()
+                    _raise_upstream(response, "run agent analysis", outcome_unknown=True)
+                async for chunk in response.aiter_text():
+                    if not chunk:
+                        continue
+                    buffer += chunk
+                    frames, buffer = _split_complete_sse_events(buffer)
+                    for frame in frames:
+                        event_name, raw_data = _parse_sse_event(frame)
+                        try:
+                            data = json.loads(raw_data) if raw_data else {}
+                        except (TypeError, ValueError):
+                            data = {}
+                        if not isinstance(data, dict):
+                            continue
+                        tool_name = str(data.get("tool_name") or data.get("tool") or "")
+                        if event_name in {"tool.started", "hermes.tool.started"}:
+                            step = _TOOL_PROGRESS_STARTED.get(tool_name)
+                            if step:
+                                _publish_agent_run_event(run_id, "progress", {"step": step})
+                            continue
+                        if event_name in {"tool.completed", "hermes.tool.completed"}:
+                            step = _TOOL_PROGRESS_SUMMARIES.get(tool_name)
+                            if step:
+                                _publish_agent_run_event(run_id, "progress", {"step": step})
+                            continue
+                        if event_name == "assistant.delta":
+                            delta = data.get("delta")
+                            if isinstance(delta, str) and delta:
+                                content += delta
+                                _publish_agent_run_event(
+                                    run_id, "answer.delta", {"delta": delta}
+                                )
+                            continue
+                        if event_name == "assistant.completed":
+                            completed = data.get("content")
+                            if isinstance(completed, str) and completed:
+                                content = completed
+                            continue
+                        if event_name == "run.completed":
+                            if isinstance(data.get("usage"), dict):
+                                usage = data["usage"]
+                            messages = data.get("messages")
+                            if isinstance(messages, list):
+                                finals = [
+                                    item
+                                    for item in messages
+                                    if isinstance(item, dict)
+                                    and item.get("role") == "assistant"
+                                    and not item.get("tool_calls")
+                                    and isinstance(item.get("content"), str)
+                                    and str(item.get("content") or "").strip()
+                                ]
+                                if finals:
+                                    content = str(finals[-1]["content"])
+                            continue
+                        choice = (data.get("choices") or [{}])[0]
+                        if isinstance(choice, dict):
+                            delta = choice.get("delta") or {}
+                            piece = delta.get("content") if isinstance(delta, dict) else None
+                            if isinstance(piece, str) and piece:
+                                content += piece
+                                _publish_agent_run_event(
+                                    run_id, "answer.delta", {"delta": piece}
+                                )
+    except httpx.TimeoutException as exc:
+        raise api_error(
+            504,
+            code="HERMES_TIMEOUT",
+            message="Hermes timed out while trying to run agent analysis.",
+            retryable=True,
+            outcome_unknown=True,
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise api_error(
+            502,
+            code="HERMES_CONNECTION_ERROR",
+            message="Hermes connection failed while trying to run agent analysis.",
+            retryable=True,
+            outcome_unknown=True,
+        ) from exc
+    finally:
+        schedule_memory_consolidation(scope)
+    return {
+        "session_id": session_id,
+        "message": {"role": "assistant", "content": content},
+        "usage": usage,
+    }
+
+
 def _extract_chat_content(payload: dict[str, Any]) -> str:
     message = payload.get("message") or {}
     content = message.get("content")
@@ -685,6 +818,62 @@ def _reasoning_from_messages(messages: list[dict[str, Any]]) -> str:
         if isinstance(reasoning, str) and reasoning.strip():
             parts.append(reasoning)
     return "\n\n".join(parts)
+
+
+_TOOL_PROGRESS_SUMMARIES = {
+    "db_get_schema_ddl": "已检查数据结构",
+    "db_schema_search": "已查找相关数据",
+    "db_get_table_profile": "已确认字段与数据口径",
+    "db_get_join_paths": "已检查数据关联关系",
+    "db_validate_sql": "已校验查询方案",
+    "db_execute_sql": "已完成数据查询与汇总",
+    "export_report_file": "已生成报表文件",
+}
+
+_TOOL_PROGRESS_STARTED = {
+    "db_get_schema_ddl": "正在检查数据结构",
+    "db_schema_search": "正在查找相关数据",
+    "db_get_table_profile": "正在确认字段与数据口径",
+    "db_get_join_paths": "正在检查数据关联关系",
+    "db_validate_sql": "正在校验查询方案",
+    "db_execute_sql": "正在获取并汇总数据",
+    "export_report_file": "正在生成报表文件",
+}
+
+
+def _publish_agent_run_event(run_id: str, event: str, payload: dict[str, Any]) -> None:
+    """Keep a bounded replay buffer for SSE clients attached to a live run."""
+
+    with _agent_run_event_lock:
+        if run_id not in _agent_run_events and len(_agent_run_events) >= 512:
+            _agent_run_events.pop(next(iter(_agent_run_events)), None)
+        entries = _agent_run_events.setdefault(run_id, [])
+        entries.append((event, payload))
+        if len(entries) > 2_000:
+            del entries[: len(entries) - 2_000]
+
+
+def _agent_run_events_since(
+    run_id: str, cursor: int
+) -> tuple[list[tuple[str, dict[str, Any]]], int]:
+    with _agent_run_event_lock:
+        entries = _agent_run_events.get(run_id, [])
+        return entries[cursor:].copy(), len(entries)
+
+
+def _analysis_progress_from_messages(messages: list[dict[str, Any]]) -> list[str]:
+    """Return caller-safe step summaries without exposing model chain-of-thought."""
+
+    progress: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        summary = _TOOL_PROGRESS_SUMMARIES.get(str(message.get("tool_name") or ""))
+        if summary and summary not in progress:
+            progress.append(summary)
+    if messages and "已完成分析并整理结论" not in progress:
+        progress.append("已完成分析并整理结论")
+    return progress
 
 
 def _artifact_ids(session_id: str) -> set[str]:
@@ -956,7 +1145,7 @@ def _run_outcome_from_content(
     record: dict[str, Any],
     content: str,
     *,
-    reasoning: str,
+    progress: list[str],
     usage: dict[str, Any],
     artifacts: list[dict[str, Any]],
     recovered: bool,
@@ -997,7 +1186,7 @@ def _run_outcome_from_content(
             "session_id": str(record["session_id"]),
             "content": clean_content,
             "analysis": analysis.model_dump(mode="json"),
-            "reasoning": reasoning,
+            "progress": progress,
             "usage": usage,
             "artifacts": artifacts,
             "recovered": recovered,
@@ -1066,7 +1255,7 @@ async def _inspect_agent_run(
                 _run_outcome_from_content(
                     record,
                     str(final_messages[-1]["content"]),
-                    reasoning=_reasoning_from_messages(turn_messages),
+                    progress=_analysis_progress_from_messages(turn_messages),
                     usage={},
                     artifacts=_new_run_artifacts(record),
                     recovered=True,
@@ -1095,7 +1284,7 @@ async def _result_from_hermes_payload(
     outcome = _run_outcome_from_content(
         record,
         _extract_chat_content(raw),
-        reasoning="",
+        progress=[],
         usage=raw.get("usage") or {},
         artifacts=_new_run_artifacts(record),
         recovered=False,
@@ -1331,14 +1520,13 @@ async def _execute_agent_run_exclusive(run_id: str, scope: str) -> None:
                         upstream_submission_started=True,
                     ) or record
                     submission_message = _agent_run_submission_message(record)
-                    raw = await _submit_session_turn(
+                    raw = await _submit_agent_run_stream(
+                        run_id,
                         session_id,
                         scope=scope,
                         message=submission_message,
                         prompt_message=str(record["request"]["message"]),
-                        structured_result=True,
                         timeout=_agent_chat_timeout_seconds(),
-                        action="run agent analysis",
                     )
                 effective_session_id = str(raw.get("session_id") or session_id)
                 require_owned_session(effective_session_id, scope)
@@ -2135,6 +2323,179 @@ async def get_middle_platform_agent_run(
     _request_id: Annotated[str | None, Header(alias=REQUEST_ID_HEADER)] = None,
 ) -> dict[str, Any]:
     return await get_agent_run(run_id, scope)
+
+
+def _run_sse(event: str, payload: dict[str, Any], *, event_id: int) -> str:
+    return (
+        f"id: {event_id}\n"
+        f"event: {event}\n"
+        f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    )
+
+
+@router.get(
+    "/v1/agent/runs/{run_id}/stream",
+    responses=documented_error_responses(401, 404, 422, 503),
+)
+async def stream_middle_platform_agent_run(
+    run_id: str,
+    scope: MiddlePlatformScope,
+    _request_id: Annotated[str | None, Header(alias=REQUEST_ID_HEADER)] = None,
+) -> StreamingResponse:
+    """Stream safe progress summaries and the final answer over SSE."""
+
+    try:
+        initial = agent_run_store.get_public_owned(run_id, scope)
+    except AgentRunStoreError as exc:
+        raise api_error(
+            503,
+            code="AGENT_RUN_STATE_UNAVAILABLE",
+            message="Agent run state is unavailable.",
+            retryable=False,
+            outcome_unknown=True,
+        ) from exc
+    if not initial:
+        raise api_error(404, code="AGENT_RUN_NOT_FOUND", message="Agent run not found.")
+
+    async def events() -> AsyncIterator[str]:
+        event_id = 0
+        cursor = 0
+        answer_streamed = False
+        seen_progress: set[str] = set()
+        last_status: str | None = None
+        heartbeat_at = time.monotonic()
+        while True:
+            try:
+                run = agent_run_store.get_public_owned(run_id, scope)
+            except AgentRunStoreError:
+                event_id += 1
+                yield _run_sse(
+                    "error",
+                    {"code": "AGENT_RUN_STATE_UNAVAILABLE", "message": "任务状态暂时不可用"},
+                    event_id=event_id,
+                )
+                return
+            if not run:
+                event_id += 1
+                yield _run_sse(
+                    "error",
+                    {"code": "AGENT_RUN_NOT_FOUND", "message": "分析任务不存在"},
+                    event_id=event_id,
+                )
+                return
+
+            status = str(run.get("status") or "")
+            if status != last_status:
+                step = {
+                    "pending": "任务已提交，正在等待分析资源",
+                    "running": "正在查询数据并进行分析",
+                }.get(status)
+                if step:
+                    event_id += 1
+                    yield _run_sse(
+                        "progress",
+                        {"run_id": run_id, "status": status, "step": step},
+                        event_id=event_id,
+                    )
+                last_status = status
+
+            live_events, cursor = _agent_run_events_since(run_id, cursor)
+            for live_event, live_payload in live_events:
+                payload = {"run_id": run_id, **live_payload}
+                if live_event == "progress":
+                    step = str(payload.get("step") or "")
+                    if not step or step in seen_progress:
+                        continue
+                    seen_progress.add(step)
+                    payload["status"] = status
+                elif live_event == "answer.delta":
+                    answer_streamed = True
+                event_id += 1
+                yield _run_sse(live_event, payload, event_id=event_id)
+
+            if status == "waiting_input":
+                event_id += 1
+                yield _run_sse(
+                    "clarification.required",
+                    {
+                        "run_id": run_id,
+                        "status": status,
+                        "clarification": run.get("clarification"),
+                    },
+                    event_id=event_id,
+                )
+                return
+
+            if status == "failed":
+                error = run.get("error") if isinstance(run.get("error"), dict) else {}
+                event_id += 1
+                yield _run_sse(
+                    "error",
+                    {
+                        "run_id": run_id,
+                        "code": str(error.get("code") or "AGENT_RUN_FAILED"),
+                        "message": str(error.get("message") or "分析任务执行失败"),
+                    },
+                    event_id=event_id,
+                )
+                return
+
+            if status == "succeeded":
+                run = _refresh_run_artifacts(run)
+                result = run.get("result") if isinstance(run.get("result"), dict) else {}
+                for step in result.get("progress") or []:
+                    if str(step) in seen_progress:
+                        continue
+                    seen_progress.add(str(step))
+                    event_id += 1
+                    yield _run_sse(
+                        "progress",
+                        {"run_id": run_id, "status": status, "step": str(step)},
+                        event_id=event_id,
+                    )
+                content = str(result.get("content") or "")
+                if not answer_streamed:
+                    for offset in range(0, len(content), 24):
+                        event_id += 1
+                        yield _run_sse(
+                            "answer.delta",
+                            {"run_id": run_id, "delta": content[offset : offset + 24]},
+                            event_id=event_id,
+                        )
+                        await asyncio.sleep(0)
+                for artifact in result.get("artifacts") or []:
+                    if not isinstance(artifact, dict):
+                        continue
+                    event_id += 1
+                    yield _run_sse("artifact.ready", artifact, event_id=event_id)
+                event_id += 1
+                yield _run_sse(
+                    "run.completed",
+                    {
+                        "run_id": run_id,
+                        "status": status,
+                        "session_id": result.get("session_id") or run.get("session_id"),
+                        "analysis": result.get("analysis"),
+                        "usage": result.get("usage") or {},
+                    },
+                    event_id=event_id,
+                )
+                return
+
+            if time.monotonic() - heartbeat_at >= 15:
+                yield ": keep-alive\n\n"
+                heartbeat_at = time.monotonic()
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "X-XPD-Run-Id": run_id,
+        },
+    )
 
 
 def _agent_run_submission_payload(

@@ -699,6 +699,7 @@ MIDDLE_PLATFORM_OPENAPI_PATHS = frozenset(
         "/ready",
         "/api/v1/agent/runs",
         "/api/v1/agent/runs/{run_id}",
+        "/api/v1/agent/runs/{run_id}/stream",
         "/api/v1/agent/runs/{run_id}/input",
         "/api/sessions/{session_id}/artifacts/{artifact_id}/download",
     }
@@ -713,7 +714,7 @@ def middle_platform_openapi() -> dict:
     schema = get_openapi(
         title="直播数据分析 Agent 中台接口",
         version="1.0.0",
-        description="包含四个稳定业务接口和一个服务就绪检查接口。",
+        description="包含五个稳定业务接口和一个服务就绪检查接口。",
         routes=app.routes,
     )
     schema["paths"] = {
