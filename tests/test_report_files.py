@@ -242,6 +242,8 @@ def test_xlsx_analysis_type_controls_auditable_sheet_structure(analysis_type, ex
             "source_tables": ["tb_live_goods_daily_stats"],
         },
         "data_quality": {
+            "query_count": 1,
+            "returned_row_count": 1,
             "freshness": {"latest": "2026-08-02", "lag_days": 1},
             "period_coverage": {"coverage_ratio": 1.0, "complete": True},
             "warnings": [],
@@ -272,6 +274,20 @@ def test_xlsx_analysis_type_controls_auditable_sheet_structure(analysis_type, ex
     assert workbook["查询审计"].cell(12, 1).value == "已执行 SQL"
     assert "SUM(pay_amt)" in workbook["查询审计"].cell(13, 1).value
     assert workbook["数据口径与质量"].max_row >= 10
+    quality_sheet = workbook["数据口径与质量"]
+    quality_rows = {
+        quality_sheet.cell(row, 1).value: row
+        for row in range(1, quality_sheet.max_row + 1)
+    }
+    assert quality_sheet.cell(quality_rows["查询次数"], 2).alignment.horizontal == "left"
+    assert quality_sheet.cell(quality_rows["返回行数"], 2).alignment.horizontal == "left"
+    audit_sheet = workbook["查询审计"]
+    audit_returned_row = next(
+        row
+        for row in range(1, audit_sheet.max_row + 1)
+        if audit_sheet.cell(row, 1).value == "返回行数"
+    )
+    assert audit_sheet.cell(audit_returned_row, 2).alignment.horizontal == "left"
     if analysis_type in {"comparison", "diagnostic"}:
         assert len(workbook["趋势与对比"]._charts) == 1
         assert workbook["趋势与对比"]["H3"].value == "有利/不利"

@@ -2124,8 +2124,15 @@ def _xlsx_bytes(
         widths=[34, 68],
     )
     for offset, (key, _) in enumerate(flattened_quality, start=1):
+        value_cell = quality_sheet.cell(quality_start + offset, 2)
         if key.endswith(("coverage_ratio", "rate", "ratio")):
-            quality_sheet.cell(quality_start + offset, 2).number_format = "0.00%"
+            value_cell.number_format = "0.00%"
+        if key in {"query_count", "returned_row_count"}:
+            value_cell.alignment = Alignment(
+                horizontal="left",
+                vertical="top",
+                wrap_text=True,
+            )
     if not quality_rows:
         quality_sheet.cell(quality_start + 1, 1, "未提供服务端数据质量结果。")
     quality_sheet.freeze_panes = "A4"
@@ -2152,6 +2159,13 @@ def _xlsx_bytes(
         records=audit_rows,
         widths=[24, 72],
     )
+    for offset, (label, _) in enumerate(audit_rows, start=1):
+        if label == "返回行数":
+            audit_sheet.cell(3 + offset, 2).alignment = Alignment(
+                horizontal="left",
+                vertical="top",
+                wrap_text=True,
+            )
     sql_heading_row = audit_end + 3
     audit_sheet.merge_cells(
         start_row=sql_heading_row, start_column=1, end_row=sql_heading_row, end_column=6
