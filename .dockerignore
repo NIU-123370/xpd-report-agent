@@ -1,0 +1,14 @@
+.git
+.venv
+.run
+.pytest_cache
+.ruff_cache
+.codex-spreadsheet
+configs/local.env
+configs/cloud.env
+deploy/docker/*.env
+data/report-files
+logs
+outputs
+__pycache__
+*.pyc

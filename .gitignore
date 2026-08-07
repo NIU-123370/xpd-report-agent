@@ -146,6 +146,8 @@ cython_debug/
 # xpd-report-agent local runtime state
 configs/local.env
 configs/cloud.env
+deploy/docker/*.env
+!deploy/docker/*.env.example
 data/*.sqlite
 data/merchant_questions.local.jsonl
 data/report-files/

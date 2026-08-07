@@ -51,6 +51,11 @@ NEW_ENV_KEYS = {
     "MYSQL_USER",
     "MYSQL_PASSWORD",
     "MYSQL_DATABASE",
+    "XPD_DB_HOST",
+    "XPD_DB_PORT",
+    "XPD_DB_USERNAME",
+    "XPD_DB_PASSWORD",
+    "XPD_DB_NAME",
     "XPD_MYSQL_READ_MAX_ATTEMPTS",
     "XPD_MYSQL_READ_RETRY_BACKOFF_MS",
     "HERMES_BOOTSTRAP_ON_START",
@@ -265,6 +270,20 @@ def load_env_file(path: Path) -> dict[str, str]:
 
 
 def normalize_env(raw_env: dict[str, str], *, root: Path = ROOT) -> RuntimeConfig:
+    # DMS/RDS deployment profiles use XPD_DB_* names. Keep MYSQL_* as the
+    # application's canonical names while accepting either convention.
+    db_aliases = {
+        "XPD_DB_HOST": "MYSQL_HOST",
+        "XPD_DB_PORT": "MYSQL_PORT",
+        "XPD_DB_USERNAME": "MYSQL_USER",
+        "XPD_DB_PASSWORD": "MYSQL_PASSWORD",
+        "XPD_DB_NAME": "MYSQL_DATABASE",
+    }
+    raw_env = dict(raw_env)
+    for alias, canonical in db_aliases.items():
+        if not raw_env.get(canonical) and raw_env.get(alias):
+            raw_env[canonical] = raw_env[alias]
+
     normalized = {
         key: value
         for key in NEW_ENV_KEYS

@@ -257,6 +257,25 @@ def test_normalize_env_derives_gateway_and_fastapi_variables(tmp_path):
     assert config.env["XPD_REPORT_OSS_PREFIX"] == "public/dev/agent-report-files"
 
 
+def test_normalize_env_maps_xpd_dms_aliases(tmp_path):
+    config = normalize_env(
+        {
+            "XPD_DB_HOST": "rds.internal",
+            "XPD_DB_PORT": "3307",
+            "XPD_DB_USERNAME": "main_biz_dev",
+            "XPD_DB_PASSWORD": "secret",
+            "XPD_DB_NAME": "main_biz_dev",
+        },
+        root=tmp_path,
+    )
+
+    assert config.env["MYSQL_HOST"] == "rds.internal"
+    assert config.env["MYSQL_PORT"] == "3307"
+    assert config.env["MYSQL_USER"] == "main_biz_dev"
+    assert config.env["MYSQL_PASSWORD"] == "secret"
+    assert config.env["MYSQL_DATABASE"] == "main_biz_dev"
+
+
 def test_normalize_env_does_not_map_legacy_variables(tmp_path):
     config = normalize_env(
         {

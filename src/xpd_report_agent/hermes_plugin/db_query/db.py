@@ -18,6 +18,14 @@ MYSQL_ENV_KEYS = (
     "MYSQL_DATABASE",
 )
 
+XPD_DB_ALIASES = {
+    "MYSQL_HOST": "XPD_DB_HOST",
+    "MYSQL_PORT": "XPD_DB_PORT",
+    "MYSQL_USER": "XPD_DB_USERNAME",
+    "MYSQL_PASSWORD": "XPD_DB_PASSWORD",
+    "MYSQL_DATABASE": "XPD_DB_NAME",
+}
+
 MYSQL_READ_MAX_ATTEMPTS_ENV = "XPD_MYSQL_READ_MAX_ATTEMPTS"
 MYSQL_READ_RETRY_BACKOFF_MS_ENV = "XPD_MYSQL_READ_RETRY_BACKOFF_MS"
 
@@ -61,20 +69,23 @@ LOGICAL_FOREIGN_KEYS = (
 
 
 def get_mysql_config() -> dict[str, Any]:
-    database = os.environ.get("MYSQL_DATABASE")
+    def db_env(name: str, default: str | None = None) -> str | None:
+        return os.environ.get(name) or os.environ.get(XPD_DB_ALIASES[name]) or default
+
+    database = db_env("MYSQL_DATABASE")
     if not database:
-        raise RuntimeError("MYSQL_DATABASE is not set")
+        raise RuntimeError("MYSQL_DATABASE/XPD_DB_NAME is not set")
 
     try:
-        port = int(os.environ.get("MYSQL_PORT", "3306"))
+        port = int(db_env("MYSQL_PORT", "3306") or "3306")
     except ValueError as exc:
-        raise RuntimeError("MYSQL_PORT must be an integer") from exc
+        raise RuntimeError("MYSQL_PORT/XPD_DB_PORT must be an integer") from exc
 
     return {
-        "host": os.environ.get("MYSQL_HOST", "127.0.0.1"),
+        "host": db_env("MYSQL_HOST", "127.0.0.1"),
         "port": port,
-        "user": os.environ.get("MYSQL_USER", "root"),
-        "password": os.environ.get("MYSQL_PASSWORD", ""),
+        "user": db_env("MYSQL_USER", "root"),
+        "password": db_env("MYSQL_PASSWORD", ""),
         "database": database,
     }
 

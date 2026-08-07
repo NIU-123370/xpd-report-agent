@@ -21,6 +21,24 @@ def test_get_mysql_config_reads_connection_environment(monkeypatch):
     }
 
 
+def test_get_mysql_config_accepts_xpd_dms_aliases(monkeypatch):
+    for name in db.MYSQL_ENV_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("XPD_DB_HOST", "rds.internal")
+    monkeypatch.setenv("XPD_DB_PORT", "3307")
+    monkeypatch.setenv("XPD_DB_USERNAME", "main_biz_dev")
+    monkeypatch.setenv("XPD_DB_PASSWORD", "secret")
+    monkeypatch.setenv("XPD_DB_NAME", "main_biz_dev")
+
+    assert db.get_mysql_config() == {
+        "host": "rds.internal",
+        "port": 3307,
+        "user": "main_biz_dev",
+        "password": "secret",
+        "database": "main_biz_dev",
+    }
+
+
 def test_get_mysql_config_requires_database(monkeypatch):
     monkeypatch.delenv("MYSQL_DATABASE", raising=False)
 

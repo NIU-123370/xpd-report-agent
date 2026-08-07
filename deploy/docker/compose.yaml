@@ -1,0 +1,25 @@
+services:
+  xpd-report-agent:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: xpd-report-agent:dev
+    container_name: xpd-report-agent
+    restart: unless-stopped
+    env_file:
+      - xpd-report-agent.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - hermes-data:/var/lib/xpd-report-agent/.hermes
+      - report-files:/app/data/report-files
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  hermes-data:
+  report-files:
