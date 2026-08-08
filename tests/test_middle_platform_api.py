@@ -4,6 +4,8 @@ import asyncio
 import json
 import time
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from xpd_report_agent.api import main as app_main
@@ -106,6 +108,41 @@ class FakeHermesClient:
         return FakeResponse({}, 400)
 
 
+class FakeAgentStreamResponse(FakeResponse):
+    chunks: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aiter_text(self):
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aread(self):
+        return self.content
+
+
+class FakeAgentStreamClient:
+    chunks: list[str] = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def stream(self, *args, **kwargs):
+        response = FakeAgentStreamResponse()
+        response.chunks = self.chunks.copy()
+        return response
+
+
 def configured_client(tmp_path, monkeypatch):
     FakeHermesClient.reset()
     monkeypatch.setenv("HERMES_GATEWAY_API_KEY", "gateway-test-key")
@@ -120,7 +157,13 @@ def configured_client(tmp_path, monkeypatch):
     sessions_api.agent_run_store.path = tmp_path / "agent-runs.json"
     sessions_api._agent_run_tasks.clear()
     sessions_api._active_chat_sessions.clear()
+    with sessions_api._agent_run_event_lock:
+        sessions_api._agent_run_events.clear()
     return TestClient(app_main.app)
+
+
+def agent_stream_frame(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 def wait_for_run(
@@ -246,6 +289,212 @@ def test_middle_platform_run_stream_returns_safe_progress_and_answer(
         assert "reasoning" not in response.text
 
 
+@pytest.mark.parametrize(
+    ("chunks", "expected_code"),
+    [
+        (
+            [agent_stream_frame("error", {"code": "MODEL_AUTH_FAILED"})],
+            "HERMES_STREAM_ERROR",
+        ),
+        (
+            [agent_stream_frame("assistant.delta", {"delta": "未完成的回答"})],
+            "HERMES_STREAM_INCOMPLETE",
+        ),
+    ],
+)
+def test_agent_run_real_stream_rejects_error_and_early_eof(
+    tmp_path, monkeypatch, chunks, expected_code
+):
+    configured_client(tmp_path, monkeypatch)
+    FakeAgentStreamClient.chunks = chunks
+    monkeypatch.setattr(sessions_api.httpx, "AsyncClient", FakeAgentStreamClient)
+
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(
+            sessions_api._submit_agent_run_stream(
+                "run_stream_failure",
+                "xpd_stream_failure",
+                    scope="a" * 20,
+                message="分析数据",
+                prompt_message="分析数据",
+                timeout=10,
+            )
+        )
+
+    assert raised.value.detail["code"] == expected_code
+    assert raised.value.detail["outcome_unknown"] is True
+
+
+def test_agent_run_real_stream_hides_split_private_protocol_blocks(
+    tmp_path, monkeypatch
+):
+    configured_client(tmp_path, monkeypatch)
+    run_id = "run_private_protocol"
+    private_json = '{"executed_queries":[{"sql":"SELECT secret FROM orders"}]}'
+    raw_content = (
+        "真实可见回答。<XPD_ANALYSIS_JSON>"
+        + private_json
+        + "</XPD_ANALYSIS_JSON>"
+    )
+    deltas = [
+        "真实可见回答。<XPD_ANAL",
+        "YSIS_JSON>" + private_json + "</XPD_ANALY",
+        "SIS_JSON>",
+    ]
+    FakeAgentStreamClient.chunks = [
+        *(agent_stream_frame("assistant.delta", {"delta": delta}) for delta in deltas),
+        agent_stream_frame(
+            "run.completed",
+            {"messages": [{"role": "assistant", "content": raw_content}]},
+        ),
+    ]
+    monkeypatch.setattr(sessions_api.httpx, "AsyncClient", FakeAgentStreamClient)
+
+    result = asyncio.run(
+        sessions_api._submit_agent_run_stream(
+            run_id,
+            "xpd_private_protocol",
+            scope="a" * 20,
+            message="分析数据",
+            prompt_message="分析数据",
+            timeout=10,
+        )
+    )
+    streamed = "".join(
+        str(payload.get("delta") or "")
+        for _event_id, event, payload in sessions_api._agent_run_events_after(run_id, 0)
+        if event == "answer.delta"
+    )
+
+    assert result["message"]["content"] == raw_content
+    assert streamed == "真实可见回答。"
+    assert "XPD_ANALYSIS_JSON" not in streamed
+    assert "SELECT secret" not in streamed
+
+
+def test_middle_platform_stream_resumes_after_last_event_id_without_duplicates(
+    tmp_path, monkeypatch
+):
+    long_answer = "这是一段用于验证断线续传的较长中文答案，前端不应重复追加已经收到的增量内容。"
+    with configured_client(tmp_path, monkeypatch) as client:
+        FakeHermesClient.chat_responses = [long_answer]
+        created = client.post(
+            "/api/v1/agent/runs",
+            headers={**CLIENT_HEADERS, "Idempotency-Key": "resume-stream-001"},
+            json={"message": "验证断线续传"},
+        )
+        run = wait_for_run(client, created.json()["status_url"])
+        url = f"/api/v1/agent/runs/{run['run_id']}/stream"
+        first = client.get(url, headers=CLIENT_HEADERS)
+        event_ids = [
+            int(line.removeprefix("id: "))
+            for line in first.text.splitlines()
+            if line.startswith("id: ")
+        ]
+        assert max(event_ids) <= 2**53 - 1
+        resume_id = event_ids[-2]
+        resumed = client.get(
+            url,
+            headers={**CLIENT_HEADERS, "Last-Event-ID": str(resume_id)},
+        )
+
+    resumed_ids = [
+        int(line.removeprefix("id: "))
+        for line in resumed.text.splitlines()
+        if line.startswith("id: ")
+    ]
+    assert resumed_ids == [event_id for event_id in event_ids if event_id > resume_id]
+    assert all(event_id > resume_id for event_id in resumed_ids)
+    assert '"content":"' + long_answer + '"' in first.text
+    assert "event: run.completed" in resumed.text
+
+
+def test_middle_platform_stream_uses_terminal_snapshot_after_buffer_loss(
+    tmp_path, monkeypatch
+):
+    answer = "缓存丢失后只发送权威终态，不再重复答案增量。"
+    with configured_client(tmp_path, monkeypatch) as client:
+        FakeHermesClient.chat_responses = [answer]
+        created = client.post(
+            "/api/v1/agent/runs",
+            headers={**CLIENT_HEADERS, "Idempotency-Key": "buffer-loss-stream-001"},
+            json={"message": "验证缓存丢失后的续传"},
+        )
+        run = wait_for_run(client, created.json()["status_url"])
+        url = f"/api/v1/agent/runs/{run['run_id']}/stream"
+        first = client.get(url, headers=CLIENT_HEADERS)
+        terminal_id = max(
+            int(line.removeprefix("id: "))
+            for line in first.text.splitlines()
+            if line.startswith("id: ")
+        )
+        with sessions_api._agent_run_event_lock:
+            sessions_api._agent_run_events.pop(run["run_id"], None)
+
+        resumed = client.get(
+            url,
+            headers={**CLIENT_HEADERS, "Last-Event-ID": str(terminal_id)},
+        )
+
+    assert "event: answer.delta" not in resumed.text
+    assert "event: run.completed" in resumed.text
+    assert f'"content":"{answer}"' in resumed.text
+    resumed_ids = [
+        int(line.removeprefix("id: "))
+        for line in resumed.text.splitlines()
+        if line.startswith("id: ")
+    ]
+    assert resumed_ids
+
+
+def test_middle_platform_stream_does_not_trust_future_cursor_after_buffer_loss(
+    tmp_path, monkeypatch
+):
+    answer = "未来游标不会耗尽全局事件编号。"
+    with configured_client(tmp_path, monkeypatch) as client:
+        FakeHermesClient.chat_responses = [answer]
+        created = client.post(
+            "/api/v1/agent/runs",
+            headers={**CLIENT_HEADERS, "Idempotency-Key": "future-cursor-001"},
+            json={"message": "验证未来游标"},
+        )
+        run = wait_for_run(client, created.json()["status_url"])
+        with sessions_api._agent_run_event_lock:
+            sessions_api._agent_run_events.pop(run["run_id"], None)
+        next_id_before = sessions_api._agent_run_next_event_id
+
+        resumed = client.get(
+            f"/api/v1/agent/runs/{run['run_id']}/stream",
+            headers={
+                **CLIENT_HEADERS,
+                "Last-Event-ID": str(sessions_api._MAX_SSE_EVENT_ID - 1),
+            },
+        )
+
+    assert resumed.status_code == 200
+    assert "event: run.completed" in resumed.text
+    assert f'"content":"{answer}"' in resumed.text
+    assert sessions_api._agent_run_next_event_id < sessions_api._MAX_SSE_EVENT_ID
+    assert sessions_api._agent_run_next_event_id >= next_id_before
+
+
+def test_middle_platform_stream_rejects_oversized_last_event_id(tmp_path, monkeypatch):
+    with configured_client(tmp_path, monkeypatch) as client:
+        created = client.post(
+            "/api/v1/agent/runs",
+            headers={**CLIENT_HEADERS, "Idempotency-Key": "invalid-cursor-001"},
+            json={"message": "验证非法续传游标"},
+        )
+        run = wait_for_run(client, created.json()["status_url"])
+        response = client.get(
+            f"/api/v1/agent/runs/{run['run_id']}/stream",
+            headers={**CLIENT_HEADERS, "Last-Event-ID": "9" * 5_000},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_LAST_EVENT_ID"
+
+
 def test_middle_platform_run_waits_persistently_and_resumes_with_idempotent_input(
     tmp_path, monkeypatch
 ):
@@ -274,6 +523,21 @@ def test_middle_platform_run_waits_persistently_and_resumes_with_idempotent_inpu
         assert waiting["clarification"]["question"] == "销量按件数还是订单数？"
         assert waiting["clarification"]["choices"] == ["件数", "订单数"]
         assert len([call for call in FakeHermesClient.calls if call["url"].endswith("/chat")]) == 1
+        sessions_api._publish_agent_run_event(
+            waiting["run_id"],
+            "answer.delta",
+            {"attempt_count": 1, "delta": "旧轮次澄清前言"},
+        )
+        sessions_api._publish_agent_run_event(
+            waiting["run_id"],
+            "progress",
+            {"attempt_count": 1, "step": "旧轮次分析步骤"},
+        )
+        clarification_stream = client.get(
+            f"/api/v1/agent/runs/{waiting['run_id']}/stream",
+            headers=CLIENT_HEADERS,
+        )
+        assert "event: clarification.required" in clarification_stream.text
 
     # A restarted service must leave waiting_input dormant rather than replaying
     # the original analysis or holding an Agent capacity slot.
@@ -312,6 +576,15 @@ def test_middle_platform_run_waits_persistently_and_resumes_with_idempotent_inpu
         assert completed["attempt_count"] == 2
         assert completed["result"]["content"] == "按件数统计完成"
         assert completed["clarification"] is None
+        fresh_stream = restarted.get(
+            f"/api/v1/agent/runs/{waiting['run_id']}/stream",
+            headers=CLIENT_HEADERS,
+        )
+        assert "event: clarification.required" not in fresh_stream.text
+        assert "旧轮次澄清前言" not in fresh_stream.text
+        assert "旧轮次分析步骤" not in fresh_stream.text
+        assert "event: run.completed" in fresh_stream.text
+        assert '"content":"按件数统计完成"' in fresh_stream.text
 
         chat_calls = [
             call for call in FakeHermesClient.calls if call["url"].endswith("/chat")

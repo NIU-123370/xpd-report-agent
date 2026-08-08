@@ -21,7 +21,9 @@ class QueryCursor:
         return False
 
     def execute(self, sql, params=None):
-        if self.error is not None:
+        if self.error is not None and not sql.startswith(
+            "SET SESSION MAX_EXECUTION_TIME"
+        ):
             raise self.error
 
     def fetchall(self):

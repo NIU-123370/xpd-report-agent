@@ -755,7 +755,7 @@ def test_report_artifact_uploads_to_oss_and_returns_fresh_signed_url(tmp_path, m
     expected_prefix = client.upload[0].key
     assert re.fullmatch(
         r"public/dev/agent-report-files/\d{8}/"
-        r"seller-007-trace-abc-\d{10}\.csv",
+        r"seller-007-trace-abc-\d{10}-art_c{32}\.csv",
         expected_prefix,
     )
     assert client.upload[0].bucket == "starpartner-biz"
@@ -794,7 +794,79 @@ def test_report_oss_object_key_uses_beijing_day_and_second_timestamp(tmp_path, m
         now=datetime(2026, 8, 5, 16, 1, 2, tzinfo=UTC),
     )
 
-    assert key == ("public/dev/agent-report-files/20260806/uid-1001-trace-9001-1785945662.xlsx")
+    assert key == (
+        "public/dev/agent-report-files/20260806/"
+        f"uid-1001-trace-9001-1785945662-art_{'d' * 32}.xlsx"
+    )
+
+
+def test_report_oss_object_key_distinguishes_artifacts_created_same_second(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("XPD_FILE_STORAGE_PATH", str(tmp_path))
+    monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Shanghai")
+    report_oss.write_report_oss_context(
+        SESSION_A,
+        uid="uid-1001",
+        trace_id="trace-9001",
+    )
+    config = report_oss.ReportOssConfig(
+        enabled=True,
+        endpoint="https://oss-cn-beijing.aliyuncs.com",
+        region="cn-beijing",
+        bucket="starpartner-biz",
+        prefix="public/dev/agent-report-files",
+        access_key_id="test-key",
+        access_key_secret="test-secret",
+        security_token=None,
+        download_expires_seconds=3600,
+    )
+    timestamp = datetime(2026, 8, 5, 16, 1, 2, tzinfo=UTC)
+    first_artifact_id = "art_" + "a" * 32
+    second_artifact_id = "art_" + "b" * 32
+
+    first_key = report_oss._object_key(
+        config,
+        session_id=SESSION_A,
+        artifact_id=first_artifact_id,
+        filename="经营报告.xlsx",
+        now=timestamp,
+    )
+    second_key = report_oss._object_key(
+        config,
+        session_id=SESSION_A,
+        artifact_id=second_artifact_id,
+        filename="退款报告.xlsx",
+        now=timestamp,
+    )
+
+    assert first_key != second_key
+    assert first_key.endswith(f"-{first_artifact_id}.xlsx")
+    assert second_key.endswith(f"-{second_artifact_id}.xlsx")
+
+
+def test_report_oss_object_key_rejects_invalid_artifact_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("XPD_FILE_STORAGE_PATH", str(tmp_path))
+    config = report_oss.ReportOssConfig(
+        enabled=True,
+        endpoint="https://oss-cn-beijing.aliyuncs.com",
+        region="cn-beijing",
+        bucket="starpartner-biz",
+        prefix="public/dev/agent-report-files",
+        access_key_id="test-key",
+        access_key_secret="test-secret",
+        security_token=None,
+        download_expires_seconds=3600,
+    )
+
+    with pytest.raises(ValueError, match="artifact id is invalid"):
+        report_oss._object_key(
+            config,
+            session_id=SESSION_A,
+            artifact_id="../another-object",
+            filename="经营报告.xlsx",
+        )
 
 
 def test_query_registry_full_read_does_not_evict_and_new_store_evicts_oldest(monkeypatch):

@@ -17,6 +17,7 @@ Docker 容器 xpd-report-agent
 - ECS 已安装 Docker Engine 和 Docker Compose。
 - ECS 与 RDS 位于可互通的 VPC，使用 RDS 内网地址。
 - RDS 白名单或安全组允许 ECS 私网地址访问 `3306`。
+- RDS 使用 MySQL 5.7.8 或更高版本，推荐 MySQL 8.0。
 - 数据库账号对目标库和业务表至少有 `SELECT` 权限，不要使用 root 账号。
 - ECS 安全组只向中台来源开放 `8000`，不要将 `8642` 暴露到公网。
 
@@ -64,7 +65,7 @@ chmod 600 xpd-report-agent.env
 - 模型：`HERMES_LLM_PROVIDER`、`HERMES_LLM_MODEL`、`HERMES_LLM_BASE_URL`、
   `HERMES_LLM_API_KEY`。
 - RDS：`XPD_DB_HOST`、`XPD_DB_PORT`、`XPD_DB_NAME`、`XPD_DB_USERNAME`、
-  `XPD_DB_PASSWORD`。
+  `XPD_DB_PASSWORD`；`XPD_MYSQL_QUERY_TIMEOUT_MS` 可设置单条 Agent 查询的服务端执行上限。
 - 中台鉴权：`XPD_SERVICE_API_KEY`。
 - 会话签名：`XPD_SESSION_SIGNING_SECRET`，生产环境必须长期固定且与服务密钥不同。
 - OSS：报告文件所需的 endpoint、bucket、prefix 和访问凭证。

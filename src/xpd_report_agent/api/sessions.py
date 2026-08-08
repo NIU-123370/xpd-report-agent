@@ -79,8 +79,12 @@ from xpd_report_agent.api.session_service import (
     validate_user_id,
 )
 from xpd_report_agent.api.structured_analysis import (
+    RUN_CLARIFICATION_END,
     RUN_CLARIFICATION_INSTRUCTION,
+    RUN_CLARIFICATION_START,
+    STRUCTURED_ANALYSIS_END,
     STRUCTURED_ANALYSIS_INSTRUCTION,
+    STRUCTURED_ANALYSIS_START,
     StructuredAnalysis,
     parse_run_clarification,
     parse_structured_analysis,
@@ -107,8 +111,17 @@ logger = logging.getLogger(__name__)
 _active_chat_lock = threading.Lock()
 _active_chat_sessions: set[str] = set()
 _agent_run_tasks: dict[str, asyncio.Task[None]] = {}
-_agent_run_event_lock = threading.Lock()
-_agent_run_events: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+_agent_run_event_lock = threading.RLock()
+_agent_run_events: dict[
+    str, list[tuple[int, str, dict[str, Any], str | None]]
+] = {}
+_MAX_SSE_EVENT_ID = (2**53) - 1
+# Time-seeded, process-global IDs remain monotonic without retaining one
+# counter per historical run.  Gaps are valid SSE IDs and make a rebuilt
+# post-restart snapshot newer than an ID issued by the prior process.  Use
+# microseconds so IDs remain exact even if a JavaScript client stores them as
+# Number instead of the SSE-specified string.
+_agent_run_next_event_id = time.time_ns() // 1_000
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
@@ -672,6 +685,95 @@ async def _submit_session_turn(
     return result
 
 
+_PRIVATE_STREAM_BLOCKS = (
+    (RUN_CLARIFICATION_START, RUN_CLARIFICATION_END),
+    (STRUCTURED_ANALYSIS_START, STRUCTURED_ANALYSIS_END),
+)
+
+
+def _longest_private_marker_prefix(value: str, markers: tuple[str, ...]) -> int:
+    """Return the suffix length that may become a private marker next chunk."""
+
+    maximum = min(len(value), max(len(marker) for marker in markers) - 1)
+    for length in range(maximum, 0, -1):
+        suffix = value[-length:]
+        if any(marker.startswith(suffix) for marker in markers):
+            return length
+    return 0
+
+
+class _PrivateProtocolDeltaFilter:
+    """Incrementally hide machine envelopes without delaying normal prose.
+
+    Model deltas may split a marker at any character.  The filter therefore
+    retains only the short suffix that could still become an opening/closing
+    marker; all other caller-visible text is released immediately.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._private_end: str | None = None
+
+    def feed(self, value: str) -> str:
+        if not value:
+            return ""
+        self._buffer += value
+        visible: list[str] = []
+        opening_markers = tuple(start for start, _end in _PRIVATE_STREAM_BLOCKS)
+
+        while self._buffer:
+            if self._private_end is not None:
+                end_at = self._buffer.find(self._private_end)
+                if end_at < 0:
+                    keep = _longest_private_marker_prefix(
+                        self._buffer, (self._private_end,)
+                    )
+                    self._buffer = self._buffer[-keep:] if keep else ""
+                    break
+                self._buffer = self._buffer[end_at + len(self._private_end) :]
+                self._private_end = None
+                continue
+
+            opening = [
+                (self._buffer.find(start), start, end)
+                for start, end in _PRIVATE_STREAM_BLOCKS
+                if self._buffer.find(start) >= 0
+            ]
+            if opening:
+                start_at, start_marker, end_marker = min(
+                    opening, key=lambda match: match[0]
+                )
+                visible.append(self._buffer[:start_at])
+                self._buffer = self._buffer[start_at + len(start_marker) :]
+                self._private_end = end_marker
+                continue
+
+            keep = _longest_private_marker_prefix(self._buffer, opening_markers)
+            if keep:
+                visible.append(self._buffer[:-keep])
+                self._buffer = self._buffer[-keep:]
+            else:
+                visible.append(self._buffer)
+                self._buffer = ""
+            break
+
+        return "".join(visible)
+
+    def finish(self) -> str:
+        # A retained suffix is either inside a private block or is a prefix of
+        # a private opening marker.  Fail closed instead of leaking it at EOF.
+        self._buffer = ""
+        self._private_end = None
+        return ""
+
+
+def _caller_visible_content(content: str) -> str:
+    protocol_filter = _PrivateProtocolDeltaFilter()
+    visible = protocol_filter.feed(content)
+    protocol_filter.finish()
+    return visible.strip()
+
+
 async def _submit_agent_run_stream(
     run_id: str,
     session_id: str,
@@ -680,6 +782,7 @@ async def _submit_agent_run_stream(
     message: str,
     prompt_message: str,
     timeout: float,
+    attempt_count: int = 0,
 ) -> dict[str, Any]:
     """Drain Hermes SSE while publishing a caller-safe live event projection."""
 
@@ -699,6 +802,105 @@ async def _submit_agent_run_stream(
     content = ""
     usage: dict[str, Any] = {}
     buffer = ""
+    completed = False
+    protocol_filter = _PrivateProtocolDeltaFilter()
+
+    def publish_answer_delta(delta: str) -> None:
+        visible = protocol_filter.feed(delta)
+        if visible:
+            _publish_agent_run_event(
+                run_id,
+                "answer.delta",
+                {"attempt_count": attempt_count, "delta": visible},
+            )
+
+    def process_frame(frame: str) -> None:
+        nonlocal completed, content, usage
+
+        event_name, raw_data = _parse_sse_event(frame)
+        try:
+            data = json.loads(raw_data) if raw_data else {}
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        if event_name in {"error", "run.failed", "assistant.error"}:
+            upstream_error = data.get("error")
+            upstream_code = data.get("code")
+            if isinstance(upstream_error, dict):
+                upstream_code = upstream_code or upstream_error.get("code")
+            logger.warning(
+                "Hermes Agent stream failed for %s (upstream code: %s)",
+                run_id,
+                str(upstream_code or "unknown")[:120],
+            )
+            raise api_error(
+                502,
+                code="HERMES_STREAM_ERROR",
+                message="Hermes failed while streaming the Agent analysis.",
+                retryable=False,
+                outcome_unknown=True,
+            )
+
+        tool_name = str(data.get("tool_name") or data.get("tool") or "")
+        if event_name in {"tool.started", "hermes.tool.started"}:
+            step = _TOOL_PROGRESS_STARTED.get(tool_name)
+            if step:
+                _publish_agent_run_event(
+                    run_id,
+                    "progress",
+                    {"attempt_count": attempt_count, "step": step},
+                )
+            return
+        if event_name in {"tool.completed", "hermes.tool.completed"}:
+            step = _TOOL_PROGRESS_SUMMARIES.get(tool_name)
+            if step:
+                _publish_agent_run_event(
+                    run_id,
+                    "progress",
+                    {"attempt_count": attempt_count, "step": step},
+                )
+            return
+        if event_name == "assistant.delta":
+            delta = data.get("delta")
+            if isinstance(delta, str) and delta:
+                content += delta
+                publish_answer_delta(delta)
+            return
+        if event_name == "assistant.completed":
+            final_content = data.get("content")
+            if isinstance(final_content, str) and final_content:
+                content = final_content
+            return
+        if event_name == "run.completed":
+            completed = True
+            if isinstance(data.get("usage"), dict):
+                usage = data["usage"]
+            messages = data.get("messages")
+            if isinstance(messages, list):
+                finals = [
+                    item
+                    for item in messages
+                    if isinstance(item, dict)
+                    and item.get("role") == "assistant"
+                    and not item.get("tool_calls")
+                    and isinstance(item.get("content"), str)
+                    and str(item.get("content") or "").strip()
+                ]
+                if finals:
+                    content = str(finals[-1]["content"])
+            return
+
+        choices = data.get("choices") or [{}]
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        if isinstance(choice, dict):
+            delta = choice.get("delta") or {}
+            piece = delta.get("content") if isinstance(delta, dict) else None
+            if isinstance(piece, str) and piece:
+                content += piece
+                publish_answer_delta(piece)
+
     try:
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             async with client.stream(
@@ -721,63 +923,36 @@ async def _submit_agent_run_stream(
                     buffer += chunk
                     frames, buffer = _split_complete_sse_events(buffer)
                     for frame in frames:
-                        event_name, raw_data = _parse_sse_event(frame)
-                        try:
-                            data = json.loads(raw_data) if raw_data else {}
-                        except (TypeError, ValueError):
-                            data = {}
-                        if not isinstance(data, dict):
-                            continue
-                        tool_name = str(data.get("tool_name") or data.get("tool") or "")
-                        if event_name in {"tool.started", "hermes.tool.started"}:
-                            step = _TOOL_PROGRESS_STARTED.get(tool_name)
-                            if step:
-                                _publish_agent_run_event(run_id, "progress", {"step": step})
-                            continue
-                        if event_name in {"tool.completed", "hermes.tool.completed"}:
-                            step = _TOOL_PROGRESS_SUMMARIES.get(tool_name)
-                            if step:
-                                _publish_agent_run_event(run_id, "progress", {"step": step})
-                            continue
-                        if event_name == "assistant.delta":
-                            delta = data.get("delta")
-                            if isinstance(delta, str) and delta:
-                                content += delta
-                                _publish_agent_run_event(
-                                    run_id, "answer.delta", {"delta": delta}
-                                )
-                            continue
-                        if event_name == "assistant.completed":
-                            completed = data.get("content")
-                            if isinstance(completed, str) and completed:
-                                content = completed
-                            continue
-                        if event_name == "run.completed":
-                            if isinstance(data.get("usage"), dict):
-                                usage = data["usage"]
-                            messages = data.get("messages")
-                            if isinstance(messages, list):
-                                finals = [
-                                    item
-                                    for item in messages
-                                    if isinstance(item, dict)
-                                    and item.get("role") == "assistant"
-                                    and not item.get("tool_calls")
-                                    and isinstance(item.get("content"), str)
-                                    and str(item.get("content") or "").strip()
-                                ]
-                                if finals:
-                                    content = str(finals[-1]["content"])
-                            continue
-                        choice = (data.get("choices") or [{}])[0]
-                        if isinstance(choice, dict):
-                            delta = choice.get("delta") or {}
-                            piece = delta.get("content") if isinstance(delta, dict) else None
-                            if isinstance(piece, str) and piece:
-                                content += piece
-                                _publish_agent_run_event(
-                                    run_id, "answer.delta", {"delta": piece}
-                                )
+                        process_frame(frame)
+                # SSE dispatches the final event at EOF even when the producer
+                # omits the customary blank line after it.
+                if buffer.strip():
+                    process_frame(buffer)
+        if not completed:
+            raise api_error(
+                502,
+                code="HERMES_STREAM_INCOMPLETE",
+                message="Hermes closed the Agent stream before confirming completion.",
+                retryable=False,
+                outcome_unknown=True,
+            )
+        protocol_filter.finish()
+        if not content.strip():
+            raise api_error(
+                502,
+                code="HERMES_EMPTY_RESPONSE",
+                message="Hermes completed the Agent analysis without an answer.",
+                retryable=False,
+                outcome_unknown=True,
+            )
+        if parse_run_clarification(content) is None and not _caller_visible_content(content):
+            raise api_error(
+                502,
+                code="HERMES_EMPTY_RESPONSE",
+                message="Hermes completed the Agent analysis without a visible answer.",
+                retryable=False,
+                outcome_unknown=True,
+            )
     except httpx.TimeoutException as exc:
         raise api_error(
             504,
@@ -841,24 +1016,63 @@ _TOOL_PROGRESS_STARTED = {
 }
 
 
-def _publish_agent_run_event(run_id: str, event: str, payload: dict[str, Any]) -> None:
-    """Keep a bounded replay buffer for SSE clients attached to a live run."""
+def _publish_agent_run_event(
+    run_id: str,
+    event: str,
+    payload: dict[str, Any],
+    *,
+    dedupe_key: str | None = None,
+) -> int:
+    """Append one caller-safe event and return its stable per-run SSE ID."""
 
+    global _agent_run_next_event_id
     with _agent_run_event_lock:
         if run_id not in _agent_run_events and len(_agent_run_events) >= 512:
-            _agent_run_events.pop(next(iter(_agent_run_events)), None)
+            evicted_run_id = next(iter(_agent_run_events))
+            _agent_run_events.pop(evicted_run_id, None)
         entries = _agent_run_events.setdefault(run_id, [])
-        entries.append((event, payload))
+        if dedupe_key is not None:
+            for event_id, _event, _payload, existing_key in entries:
+                if existing_key == dedupe_key:
+                    return event_id
+        event_id = _agent_run_next_event_id
+        if event_id > _MAX_SSE_EVENT_ID:
+            raise RuntimeError("Agent run SSE event ID space is exhausted.")
+        _agent_run_next_event_id += 1
+        entries.append((event_id, event, dict(payload), dedupe_key))
         if len(entries) > 2_000:
             del entries[: len(entries) - 2_000]
+        return event_id
 
 
-def _agent_run_events_since(
-    run_id: str, cursor: int
-) -> tuple[list[tuple[str, dict[str, Any]]], int]:
+def _agent_run_events_after(
+    run_id: str, last_event_id: int
+) -> list[tuple[int, str, dict[str, Any]]]:
     with _agent_run_event_lock:
-        entries = _agent_run_events.get(run_id, [])
-        return entries[cursor:].copy(), len(entries)
+        return [
+            (event_id, event, dict(payload))
+            for event_id, event, payload, _dedupe_key in _agent_run_events.get(
+                run_id, []
+            )
+            if event_id > last_event_id
+        ]
+
+
+def _agent_run_has_buffered_events(run_id: str) -> bool:
+    with _agent_run_event_lock:
+        return bool(_agent_run_events.get(run_id))
+
+
+def _buffered_agent_answer(run_id: str, attempt_count: int) -> str:
+    with _agent_run_event_lock:
+        return "".join(
+            str(payload.get("delta") or "")
+            for _event_id, event, payload, _dedupe_key in _agent_run_events.get(
+                run_id, []
+            )
+            if event == "answer.delta"
+            and int(payload.get("attempt_count") or 0) == attempt_count
+        )
 
 
 def _analysis_progress_from_messages(messages: list[dict[str, Any]]) -> list[str]:
@@ -1173,6 +1387,7 @@ def _run_outcome_from_content(
         }
 
     clean_content, analysis = parse_structured_analysis(content)
+    clean_content = _caller_visible_content(clean_content)
     if analysis.structured:
         analysis = apply_analysis_output_contract(
             analysis,
@@ -1180,6 +1395,8 @@ def _run_outcome_from_content(
                 str((record.get("request") or {}).get("message") or "")
             ),
         )
+    else:
+        analysis.conclusion = clean_content[:20_000]
     return {
         "status": "succeeded",
         "result": {
@@ -1497,6 +1714,18 @@ async def _execute_agent_run_exclusive(run_id: str, scope: str) -> None:
                     record, claimed = agent_run_store.claim_pending(run_id, scope)
                     if not record or not claimed:
                         return
+                    _publish_agent_run_event(
+                        run_id,
+                        "progress",
+                        {
+                            "status": "running",
+                            "attempt_count": int(record.get("attempt_count") or 0),
+                            "step": "正在查询数据并进行分析",
+                        },
+                        dedupe_key=(
+                            f"status:{int(record.get('attempt_count') or 0)}:running"
+                        ),
+                    )
                     session = await _get_session(session_id, scope)
                     if session.get("ended_at"):
                         raise api_error(
@@ -1527,6 +1756,7 @@ async def _execute_agent_run_exclusive(run_id: str, scope: str) -> None:
                         message=submission_message,
                         prompt_message=str(record["request"]["message"]),
                         timeout=_agent_chat_timeout_seconds(),
+                        attempt_count=int(record.get("attempt_count") or 0),
                     )
                 effective_session_id = str(raw.get("session_id") or session_id)
                 require_owned_session(effective_session_id, scope)
@@ -2256,6 +2486,17 @@ async def create_agent_run(
             outcome_unknown=True,
         ) from exc
 
+    if created:
+        _publish_agent_run_event(
+            str(record["run_id"]),
+            "progress",
+            {
+                "status": "pending",
+                "attempt_count": int(record.get("attempt_count") or 0),
+                "step": "任务已提交，正在等待分析资源",
+            },
+            dedupe_key="status:0:pending",
+        )
     if created or record.get("status") in {"pending", "running"}:
         _spawn_agent_run(record)
     elif record.get("status") == "failed":
@@ -2333,14 +2574,190 @@ def _run_sse(event: str, payload: dict[str, Any], *, event_id: int) -> str:
     )
 
 
+def _materialize_agent_run_stream_events(
+    run: dict[str, Any], *, replay_answer_deltas: bool = True
+) -> None:
+    """Project durable state into the bounded, replayable public event log."""
+
+    run_id = str(run["run_id"])
+    status = str(run.get("status") or "")
+    attempt_count = int(run.get("attempt_count") or 0)
+    if status in {"pending", "running"}:
+        step = {
+            "pending": "任务已提交，正在等待分析资源",
+            "running": "正在查询数据并进行分析",
+        }[status]
+        _publish_agent_run_event(
+            run_id,
+            "progress",
+            {
+                "status": status,
+                "attempt_count": attempt_count,
+                "step": step,
+            },
+            dedupe_key=f"status:{attempt_count}:{status}",
+        )
+        return
+
+    if status == "waiting_input":
+        clarification = (
+            run.get("clarification")
+            if isinstance(run.get("clarification"), dict)
+            else {}
+        )
+        clarification_id = str(clarification.get("clarification_id") or "")
+        _publish_agent_run_event(
+            run_id,
+            "clarification.required",
+            {
+                "status": status,
+                "attempt_count": attempt_count,
+                "clarification": clarification,
+            },
+            dedupe_key=f"terminal:{attempt_count}:clarification:{clarification_id}",
+        )
+        return
+
+    if status == "failed":
+        error = run.get("error") if isinstance(run.get("error"), dict) else {}
+        _publish_agent_run_event(
+            run_id,
+            "error",
+            {
+                "status": status,
+                "attempt_count": attempt_count,
+                "code": str(error.get("code") or "AGENT_RUN_FAILED"),
+                "message": str(error.get("message") or "分析任务执行失败"),
+            },
+            dedupe_key=f"terminal:{attempt_count}:failed",
+        )
+        return
+
+    if status != "succeeded":
+        return
+
+    result = run.get("result") if isinstance(run.get("result"), dict) else {}
+    for step in result.get("progress") or []:
+        safe_step = str(step).strip()
+        if not safe_step:
+            continue
+        digest = hashlib.sha256(safe_step.encode("utf-8")).hexdigest()[:16]
+        _publish_agent_run_event(
+            run_id,
+            "progress",
+            {
+                "status": status,
+                "attempt_count": attempt_count,
+                "step": safe_step,
+            },
+            dedupe_key=f"result-progress:{attempt_count}:{digest}",
+        )
+
+    content = _caller_visible_content(str(result.get("content") or ""))
+    streamed = _buffered_agent_answer(run_id, attempt_count)
+    if replay_answer_deltas and content.startswith(streamed):
+        missing = content[len(streamed) :]
+        for offset in range(0, len(missing), 24):
+            piece = missing[offset : offset + 24]
+            _publish_agent_run_event(
+                run_id,
+                "answer.delta",
+                {"attempt_count": attempt_count, "delta": piece},
+                dedupe_key=f"final-answer:{attempt_count}:{len(streamed) + offset}",
+            )
+
+    for artifact in result.get("artifacts") or []:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_id = str(artifact.get("artifact_id") or "")
+        if not artifact_id:
+            continue
+        _publish_agent_run_event(
+            run_id,
+            "artifact.ready",
+            {"attempt_count": attempt_count, **artifact},
+            dedupe_key=f"artifact:{artifact_id}",
+        )
+
+    # content is authoritative: clients replace any accumulated delta text
+    # with this value to converge even if an upstream completed frame corrected
+    # earlier deltas.
+    _publish_agent_run_event(
+        run_id,
+        "run.completed",
+        {
+            "status": status,
+            "attempt_count": attempt_count,
+            "session_id": result.get("session_id") or run.get("session_id"),
+            "content": content,
+            "analysis": result.get("analysis"),
+            "usage": result.get("usage") or {},
+        },
+        dedupe_key=f"terminal:{attempt_count}:succeeded",
+    )
+
+
+def _stream_event_matches_current_run(
+    event: str, payload: dict[str, Any], run: dict[str, Any]
+) -> bool:
+    """Hide terminal events from a superseded clarification/retry leg."""
+
+    status = str(run.get("status") or "")
+    attempt_count = int(run.get("attempt_count") or 0)
+    try:
+        event_attempt = int(payload.get("attempt_count") or 0)
+    except (TypeError, ValueError):
+        event_attempt = 0
+    if event == "clarification.required":
+        if status != "waiting_input" or event_attempt != attempt_count:
+            return False
+        current = run.get("clarification") or {}
+        emitted = payload.get("clarification") or {}
+        return str(current.get("clarification_id") or "") == str(
+            emitted.get("clarification_id") or ""
+        )
+    if event == "error":
+        return status == "failed" and event_attempt == attempt_count
+    if event == "run.completed":
+        return status == "succeeded" and event_attempt == attempt_count
+    if event in {"progress", "answer.delta", "artifact.ready"}:
+        return event_attempt == attempt_count
+    return True
+
+
+def _parse_last_event_id(value: str | None) -> int:
+    if value is None or not value.strip():
+        return 0
+    normalized = value.strip()
+    if (
+        len(normalized) > 16
+        or not normalized.isascii()
+        or not normalized.isdecimal()
+    ):
+        raise api_error(
+            400,
+            code="INVALID_LAST_EVENT_ID",
+            message="Last-Event-ID must be a non-negative decimal event ID.",
+        )
+    parsed = int(normalized)
+    if parsed > _MAX_SSE_EVENT_ID:
+        raise api_error(
+            400,
+            code="INVALID_LAST_EVENT_ID",
+            message="Last-Event-ID is outside the supported event ID range.",
+        )
+    return parsed
+
+
 @router.get(
     "/v1/agent/runs/{run_id}/stream",
-    responses=documented_error_responses(401, 404, 422, 503),
+    responses=documented_error_responses(400, 401, 404, 422, 503),
 )
 async def stream_middle_platform_agent_run(
     run_id: str,
     scope: MiddlePlatformScope,
     _request_id: Annotated[str | None, Header(alias=REQUEST_ID_HEADER)] = None,
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
     """Stream safe progress summaries and the final answer over SSE."""
 
@@ -2356,131 +2773,86 @@ async def stream_middle_platform_agent_run(
         ) from exc
     if not initial:
         raise api_error(404, code="AGENT_RUN_NOT_FOUND", message="Agent run not found.")
+    resume_after = _parse_last_event_id(last_event_id)
+    had_buffered_events = _agent_run_has_buffered_events(run_id)
+    buffer_was_reset = bool(resume_after and not had_buffered_events)
 
     async def events() -> AsyncIterator[str]:
-        event_id = 0
-        cursor = 0
-        answer_streamed = False
-        seen_progress: set[str] = set()
-        last_status: str | None = None
+        # Event IDs are scoped to the current in-memory replay log. If a
+        # restart or eviction removed that log, start a fresh cursor and send
+        # only current state plus the authoritative terminal snapshot. Never
+        # let an untrusted Last-Event-ID advance the process-global counter.
+        cursor = 0 if buffer_was_reset else resume_after
         heartbeat_at = time.monotonic()
         while True:
             try:
                 run = agent_run_store.get_public_owned(run_id, scope)
             except AgentRunStoreError:
-                event_id += 1
-                yield _run_sse(
+                event_id = _publish_agent_run_event(
+                    run_id,
                     "error",
-                    {"code": "AGENT_RUN_STATE_UNAVAILABLE", "message": "任务状态暂时不可用"},
-                    event_id=event_id,
+                    {
+                        "code": "AGENT_RUN_STATE_UNAVAILABLE",
+                        "message": "任务状态暂时不可用",
+                    },
+                    dedupe_key="stream-state-unavailable",
                 )
+                if event_id > cursor:
+                    yield _run_sse(
+                        "error",
+                        {
+                            "run_id": run_id,
+                            "code": "AGENT_RUN_STATE_UNAVAILABLE",
+                            "message": "任务状态暂时不可用",
+                        },
+                        event_id=event_id,
+                    )
                 return
             if not run:
-                event_id += 1
-                yield _run_sse(
+                event_id = _publish_agent_run_event(
+                    run_id,
                     "error",
                     {"code": "AGENT_RUN_NOT_FOUND", "message": "分析任务不存在"},
-                    event_id=event_id,
+                    dedupe_key="stream-run-not-found",
                 )
+                if event_id > cursor:
+                    yield _run_sse(
+                        "error",
+                        {
+                            "run_id": run_id,
+                            "code": "AGENT_RUN_NOT_FOUND",
+                            "message": "分析任务不存在",
+                        },
+                        event_id=event_id,
+                    )
                 return
 
             status = str(run.get("status") or "")
-            if status != last_status:
-                step = {
-                    "pending": "任务已提交，正在等待分析资源",
-                    "running": "正在查询数据并进行分析",
-                }.get(status)
-                if step:
-                    event_id += 1
-                    yield _run_sse(
-                        "progress",
-                        {"run_id": run_id, "status": status, "step": step},
-                        event_id=event_id,
-                    )
-                last_status = status
-
-            live_events, cursor = _agent_run_events_since(run_id, cursor)
-            for live_event, live_payload in live_events:
-                payload = {"run_id": run_id, **live_payload}
-                if live_event == "progress":
-                    step = str(payload.get("step") or "")
-                    if not step or step in seen_progress:
-                        continue
-                    seen_progress.add(step)
-                    payload["status"] = status
-                elif live_event == "answer.delta":
-                    answer_streamed = True
-                event_id += 1
-                yield _run_sse(live_event, payload, event_id=event_id)
-
-            if status == "waiting_input":
-                event_id += 1
-                yield _run_sse(
-                    "clarification.required",
-                    {
-                        "run_id": run_id,
-                        "status": status,
-                        "clarification": run.get("clarification"),
-                    },
-                    event_id=event_id,
-                )
-                return
-
-            if status == "failed":
-                error = run.get("error") if isinstance(run.get("error"), dict) else {}
-                event_id += 1
-                yield _run_sse(
-                    "error",
-                    {
-                        "run_id": run_id,
-                        "code": str(error.get("code") or "AGENT_RUN_FAILED"),
-                        "message": str(error.get("message") or "分析任务执行失败"),
-                    },
-                    event_id=event_id,
-                )
-                return
-
             if status == "succeeded":
                 run = _refresh_run_artifacts(run)
-                result = run.get("result") if isinstance(run.get("result"), dict) else {}
-                for step in result.get("progress") or []:
-                    if str(step) in seen_progress:
-                        continue
-                    seen_progress.add(str(step))
-                    event_id += 1
-                    yield _run_sse(
-                        "progress",
-                        {"run_id": run_id, "status": status, "step": str(step)},
-                        event_id=event_id,
-                    )
-                content = str(result.get("content") or "")
-                if not answer_streamed:
-                    for offset in range(0, len(content), 24):
-                        event_id += 1
-                        yield _run_sse(
-                            "answer.delta",
-                            {"run_id": run_id, "delta": content[offset : offset + 24]},
-                            event_id=event_id,
-                        )
-                        await asyncio.sleep(0)
-                for artifact in result.get("artifacts") or []:
-                    if not isinstance(artifact, dict):
-                        continue
-                    event_id += 1
-                    yield _run_sse("artifact.ready", artifact, event_id=event_id)
-                event_id += 1
-                yield _run_sse(
-                    "run.completed",
-                    {
-                        "run_id": run_id,
-                        "status": status,
-                        "session_id": result.get("session_id") or run.get("session_id"),
-                        "analysis": result.get("analysis"),
-                        "usage": result.get("usage") or {},
-                    },
-                    event_id=event_id,
-                )
-                return
+            _materialize_agent_run_stream_events(
+                run,
+                replay_answer_deltas=not buffer_was_reset,
+            )
+            emitted_terminal = False
+            for event_id, live_event, live_payload in _agent_run_events_after(
+                run_id, cursor
+            ):
+                cursor = max(cursor, event_id)
+                if not _stream_event_matches_current_run(live_event, live_payload, run):
+                    continue
+                payload = {"run_id": run_id, **live_payload}
+                if live_event == "progress":
+                    payload.setdefault("status", status)
+                yield _run_sse(live_event, payload, event_id=event_id)
+                if live_event in {"clarification.required", "error", "run.completed"}:
+                    emitted_terminal = True
+
+            if status in {"waiting_input", "failed", "succeeded"}:
+                # If Last-Event-ID already acknowledged the terminal event,
+                # returning an empty completed response is the correct replay.
+                if emitted_terminal or not _agent_run_events_after(run_id, cursor):
+                    return
 
             if time.monotonic() - heartbeat_at >= 15:
                 yield ": keep-alive\n\n"
@@ -2635,6 +3007,19 @@ async def _submit_agent_run_input(
         ) from exc
     if not resumed:
         raise api_error(404, code="AGENT_RUN_NOT_FOUND", message="Agent run not found.")
+    if accepted:
+        _publish_agent_run_event(
+            run_id,
+            "progress",
+            {
+                "status": "pending",
+                "attempt_count": int(resumed.get("attempt_count") or 0),
+                "step": "已收到补充信息，正在继续分析",
+            },
+            dedupe_key=(
+                f"status:{int(resumed.get('attempt_count') or 0)}:pending"
+            ),
+        )
     if accepted or resumed.get("status") in {"pending", "running"}:
         _spawn_agent_run(resumed)
     return _agent_run_submission_payload(resumed, response)

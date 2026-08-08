@@ -34,6 +34,7 @@ _ENDPOINT_REGION_PATTERN = re.compile(
     r"(?:^|\.)oss-([a-z0-9-]+?)(?:-internal)?\.aliyuncs\.com$"
 )
 _SESSION_ID_PATTERN = re.compile(r"xpd_[0-9a-f]{20}_[A-Za-z0-9_]+")
+_ARTIFACT_ID_PATTERN = re.compile(r"art_[0-9a-f]{32}")
 _REPORT_CONTEXT_FILENAME = ".report-oss-context.json"
 _DEFAULT_TIMEZONE = "Asia/Shanghai"
 
@@ -290,6 +291,8 @@ def _object_key(
     now: datetime | None = None,
 ) -> str:
     uid, trace_id = _report_oss_context(session_id, artifact_id)
+    if not _ARTIFACT_ID_PATTERN.fullmatch(artifact_id):
+        raise ValueError("Report OSS artifact id is invalid.")
     extension = Path(filename).suffix.lower()
     if not extension or not re.fullmatch(r"\.[a-z0-9]{1,10}", extension):
         raise ValueError("Report OSS filename extension is invalid.")
@@ -301,7 +304,9 @@ def _object_key(
         timestamp = timestamp.astimezone(timezone)
     day_directory = timestamp.strftime("%Y%m%d")
     unix_timestamp_seconds = int(timestamp.timestamp())
-    object_filename = f"{uid}-{trace_id}-{unix_timestamp_seconds}{extension}"
+    object_filename = (
+        f"{uid}-{trace_id}-{unix_timestamp_seconds}-{artifact_id}{extension}"
+    )
     return "/".join((config.prefix, day_directory, object_filename))
 
 

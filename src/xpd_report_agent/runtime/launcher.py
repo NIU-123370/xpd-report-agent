@@ -58,6 +58,7 @@ NEW_ENV_KEYS = {
     "XPD_DB_NAME",
     "XPD_MYSQL_READ_MAX_ATTEMPTS",
     "XPD_MYSQL_READ_RETRY_BACKOFF_MS",
+    "XPD_MYSQL_QUERY_TIMEOUT_MS",
     "HERMES_BOOTSTRAP_ON_START",
     "HERMES_REQUIRE_LLM_API_KEY",
     "XPD_SESSION_SIGNING_SECRET",
@@ -220,9 +221,18 @@ DEFAULTS = {
     "MYSQL_DATABASE": "taobao_reports_test",
     "XPD_MYSQL_READ_MAX_ATTEMPTS": "2",
     "XPD_MYSQL_READ_RETRY_BACKOFF_MS": "100",
+    "XPD_MYSQL_QUERY_TIMEOUT_MS": "25000",
     "FASTAPI_HOST": "127.0.0.1",
     "FASTAPI_PORT": "8000",
     "FASTAPI_RELOAD": "false",
+}
+
+DB_ENV_ALIASES = {
+    "XPD_DB_HOST": "MYSQL_HOST",
+    "XPD_DB_PORT": "MYSQL_PORT",
+    "XPD_DB_USERNAME": "MYSQL_USER",
+    "XPD_DB_PASSWORD": "MYSQL_PASSWORD",
+    "XPD_DB_NAME": "MYSQL_DATABASE",
 }
 
 
@@ -269,20 +279,20 @@ def load_env_file(path: Path) -> dict[str, str]:
         return _fallback_dotenv_values(path)
 
 
+def _normalize_db_aliases(raw_env: dict[str, str]) -> dict[str, str]:
+    """Resolve aliases inside one priority layer before layers are merged."""
+
+    normalized = dict(raw_env)
+    for alias, canonical in DB_ENV_ALIASES.items():
+        if not normalized.get(canonical) and normalized.get(alias):
+            normalized[canonical] = normalized[alias]
+    return normalized
+
+
 def normalize_env(raw_env: dict[str, str], *, root: Path = ROOT) -> RuntimeConfig:
     # DMS/RDS deployment profiles use XPD_DB_* names. Keep MYSQL_* as the
     # application's canonical names while accepting either convention.
-    db_aliases = {
-        "XPD_DB_HOST": "MYSQL_HOST",
-        "XPD_DB_PORT": "MYSQL_PORT",
-        "XPD_DB_USERNAME": "MYSQL_USER",
-        "XPD_DB_PASSWORD": "MYSQL_PASSWORD",
-        "XPD_DB_NAME": "MYSQL_DATABASE",
-    }
-    raw_env = dict(raw_env)
-    for alias, canonical in db_aliases.items():
-        if not raw_env.get(canonical) and raw_env.get(alias):
-            raw_env[canonical] = raw_env[alias]
+    raw_env = _normalize_db_aliases(raw_env)
 
     normalized = {
         key: value
@@ -327,9 +337,13 @@ def normalize_env(raw_env: dict[str, str], *, root: Path = ROOT) -> RuntimeConfi
 
 
 def load_runtime_config(*, root: Path = ROOT, environ: dict[str, str] | None = None) -> RuntimeConfig:
-    raw_env = load_env_file(root / ".env")
-    raw_env.update(load_env_file(root / "configs" / "local.env"))
-    raw_env.update(os.environ if environ is None else environ)
+    # Resolve aliases in each source before merging so a high-priority XPD_DB_*
+    # value can override a lower-priority source that used the MYSQL_* spelling.
+    raw_env = _normalize_db_aliases(load_env_file(root / ".env"))
+    raw_env.update(
+        _normalize_db_aliases(load_env_file(root / "configs" / "local.env"))
+    )
+    raw_env.update(_normalize_db_aliases(os.environ if environ is None else environ))
     return normalize_env(raw_env, root=root)
 
 

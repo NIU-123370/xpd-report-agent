@@ -10,9 +10,10 @@ def decode(payload: str) -> dict:
 
 
 class FakeCursor:
-    def __init__(self, rows, columns=None):
+    def __init__(self, rows, columns=None, executed=None):
         self.rows = rows
         self.sql = None
+        self.executed = executed if executed is not None else []
         resolved_columns = columns or (list(rows[0]) if rows else [])
         self.description = [(column,) for column in resolved_columns]
 
@@ -24,6 +25,7 @@ class FakeCursor:
 
     def execute(self, sql, params=None):
         self.sql = sql
+        self.executed.append((sql, params))
 
     def fetchall(self):
         return self.rows
@@ -34,9 +36,10 @@ class FakeConnection:
         self.rows = rows
         self.columns = columns
         self.closed = False
+        self.executed = []
 
     def cursor(self):
-        return FakeCursor(self.rows, self.columns)
+        return FakeCursor(self.rows, self.columns, self.executed)
 
     def close(self):
         self.closed = True
@@ -189,6 +192,59 @@ def test_db_execute_sql_revalidates_and_truncates(report_schema, monkeypatch):
         "warnings"
     ]
     assert "result_id" not in result
+    assert connection.closed is True
+
+
+def test_db_execute_sql_sets_bounded_server_side_timeout(
+    report_schema, monkeypatch
+):
+    connection = FakeConnection([{"item_id": "1", "pay_amt": "100.00"}])
+    monkeypatch.setattr(tools, "connect_readonly", lambda: connection)
+    monkeypatch.setenv("XPD_MYSQL_QUERY_TIMEOUT_MS", "1234")
+
+    result = decode(
+        tools.db_execute_sql(
+            {
+                "sql": (
+                    "SELECT item_id, pay_amt FROM tb_live_goods_daily_stats "
+                    "ORDER BY pay_amt DESC"
+                )
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert connection.executed[0] == (
+        "SET SESSION MAX_EXECUTION_TIME = %s",
+        (1234,),
+    )
+    assert connection.executed[1][0].startswith("SELECT * FROM (")
+
+
+def test_db_execute_sql_rejects_duplicate_cursor_columns_before_capture(
+    report_schema, monkeypatch
+):
+    connection = FakeConnection(
+        [{"item_id": "left", "right.item_id": "right"}],
+        columns=["item_id", "item_id"],
+    )
+    monkeypatch.setattr(tools, "connect_readonly", lambda: connection)
+
+    result = decode(
+        tools.db_execute_sql(
+            {
+                "sql": (
+                    "SELECT item_id AS left_item_id, pay_amt AS right_item_id "
+                    "FROM tb_live_goods_daily_stats"
+                )
+            },
+            session_id="xpd_0123456789abcdefabcd_duplicate",
+        )
+    )
+
+    assert result["ok"] is False
+    assert "Duplicate output column names" in result["error"]
+    assert "unique AS alias" in result["error"]
     assert connection.closed is True
 
 

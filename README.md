@@ -217,7 +217,8 @@ Hermes 原生 `session_search` 目前没有 owner scope 过滤，因此本地 `s
 
 生产中台调用需启用 `XPD_SERVICE_AUTH_ENABLED=true`，并使用独立
 `XPD_SERVICE_API_KEY` 作为 Bearer 凭证。生产 systemd 单元会强制启用鉴权。
-DMS/RDS 账号和权限由云端管理；应用只使用标准 MySQL 连接参数，不会自动创建、修改或强制检查云数据库账号。
+DMS/RDS 账号和权限由云端管理；应用要求 MySQL 5.7.8 或更高版本（推荐 MySQL 8.0），只使用标准
+MySQL 连接参数，不会自动创建、修改或强制检查云数据库账号。
 
 ```text
 <HERMES_HOME>/memories/
@@ -252,7 +253,7 @@ session，也不参与 `user_id` 身份隔离。切换到 `user_id` 模式后，
 地址；访问该地址时才生成临时 OSS 签名并返回 `307`，或在 `Accept: application/json` 时返回
 签名 URL 及过期时间。重新查询任务状态不会刷新 OSS 签名。
 对象按北京时间建立 `YYYYMMDD` 日目录，文件名为
-`uid-traceid-秒级Unix时间戳.扩展名`；中台的 `X-User-Id` 和 `X-Request-Id` 分别作为
+`uid-traceid-秒级Unix时间戳-artifact_id.扩展名`；中台的 `X-User-Id` 和 `X-Request-Id` 分别作为
 `uid` 和 `traceid`。本地网页没有真实 UID 时，使用稳定的用户范围标识。
 服务器上仍应通过 `XPD_FILE_STORAGE_PATH` 指向临时或持久目录，并为 OSS 配置对象生命周期。
 PDF 会嵌入中文字体；macOS 会自动寻找系统字体，Linux 生产环境应安装可嵌入的中文

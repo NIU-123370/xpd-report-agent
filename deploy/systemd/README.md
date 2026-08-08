@@ -68,7 +68,8 @@ OSS 和签名密钥。配置文件建议由 `root` 拥有，权限设为 `0640`�
 单元会设置 `LAUNCH_MANAGED=true`，因此生产运行时只读 `EnvironmentFile`，不会意外加载代码目录中的 `.env` 或 `configs/local.env`。
 数据库账号与权限由 DMS/RDS 管理员配置，并通过标准 `MYSQL_HOST` / `MYSQL_PORT` /
 `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` 参数提供给应用。建议仅授予报表查询所需的
-`SELECT` 权限；应用不负责创建、修改或强制检查 DMS/RDS 账号。
+`SELECT` 权限；数据库版本要求 MySQL 5.7.8 或更高，推荐 MySQL 8.0。应用不负责创建、修改或
+强制检查 DMS/RDS 账号。
 
 PDF 导出会将中文字体子集嵌入文件，避免服务器和下载端出现乱码。Linux 服务器需安装
 一个可嵌入的中文 TrueType 字体（例如 `fonts-wqy-zenhei`），并在
@@ -76,7 +77,7 @@ PDF 导出会将中文字体子集嵌入文件，避免服务器和下载端出�
 
 报表默认上传到 `starpartner-biz/public/dev/agent-report-files/`。OSS 账号需要该前缀的
 上传和读取权限，并建议配置对象生命周期；接口返回有限时效的签名下载 URL。
-对象按北京时间使用 `YYYYMMDD/uid-traceid-秒级Unix时间戳.扩展名`。
+对象按北京时间使用 `YYYYMMDD/uid-traceid-秒级Unix时间戳-artifact_id.扩展名`。
 
 `user_id` 模式下默认不暴露 Hermes 原生 `session_search`，因为它尚未按 owner scope 过滤。
 `XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED=true` 只是单用户兼容开关，不应在多用户中台部署中开启。

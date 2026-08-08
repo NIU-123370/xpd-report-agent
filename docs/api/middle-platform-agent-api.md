@@ -113,6 +113,7 @@ GET /api/v1/agent/runs/{run_id}/stream
 Accept: text/event-stream
 Authorization: Bearer <service-key>
 X-User-Id: user_123
+# 断线重连时附加：Last-Event-ID: <上次收到的 id>
 ```
 
 事件类型如下：
@@ -136,12 +137,15 @@ event: answer.delta
 data: {"run_id":"run_xxx","delta":"最近30天直播场次退货率"}
 
 event: run.completed
-data: {"run_id":"run_xxx","status":"succeeded","session_id":"xpd_xxx"}
+data: {"run_id":"run_xxx","status":"succeeded","session_id":"xpd_xxx","content":"最终完整答案"}
 ```
 
 该接口不会发送模型原始 `reasoning`、`thinking` 或工具内部参数。中台服务端需要关闭
-响应缓冲并保持长连接；收到终止事件后关闭连接。断线后可以重新连接，或调用状态查询接口
-取得完整最终结果。
+响应缓冲并保持长连接；收到终止事件后关闭连接。每个数据事件都有稳定的 `id`。断线重连时将最后
+收到的 `id` 通过 `Last-Event-ID` 请求头传回，服务只续发之后的事件，不得重复追加旧的
+`answer.delta`。收到 `run.completed` 时，必须使用 `data.content` 替换页面上累积的增量文本，
+它是最终权威答案；也可调用状态查询接口取得完整结果。若服务重启或缓存淘汰导致旧事件日志
+不可用，服务会跳过历史答案增量并发送当前状态及权威终态，事件 `id` 可能进入新的编号序列。
 
 ## 8. 回答澄清问题
 

@@ -147,6 +147,32 @@ def test_hermes_service_process_env_overrides_local_env(tmp_path):
     assert "hermes|plugins|enable|db-query" in calls
 
 
+def test_hermes_service_process_xpd_db_alias_overrides_file_mysql_name(tmp_path):
+    script, env, _call_log = _stage_hermes_service(
+        tmp_path,
+        local_env="MYSQL_HOST=old.internal\nMYSQL_DATABASE=old_database\n",
+    )
+    env["LAUNCH_MANAGED"] = "false"
+    env.pop("MYSQL_HOST", None)
+    env.pop("MYSQL_DATABASE", None)
+    env["XPD_DB_HOST"] = "new.internal"
+    env["XPD_DB_NAME"] = "new_database"
+    env_log = tmp_path / "database-env.log"
+    env["XPD_TEST_DATABASE_ENV_LOG"] = str(env_log)
+    hermes_bin = Path(env["HERMES_BIN"])
+    hermes_bin.write_text(
+        hermes_bin.read_text(encoding="utf-8")
+        + 'if [ "${1:-}" = "gateway" ]; then\n'
+        + '  printf "%s|%s" "$MYSQL_HOST" "$MYSQL_DATABASE" > "$XPD_TEST_DATABASE_ENV_LOG"\n'
+        + "fi\n",
+        encoding="utf-8",
+    )
+
+    _run_hermes_service(script, env)
+
+    assert env_log.read_text(encoding="utf-8") == "new.internal|new_database"
+
+
 def test_hermes_service_rejects_runtime_version_mismatch(tmp_path):
     script, env, _call_log = _stage_hermes_service(tmp_path)
     lock_path = script.parents[2] / "configs" / "hermes-runtime.lock"
@@ -211,6 +237,7 @@ def test_normalize_env_derives_gateway_and_fastapi_variables(tmp_path):
             "XPD_METRIC_DEFINITION_LIBRARY_ENABLED": "false",
             "XPD_METRIC_DEFINITION_TOP_K": "4",
             "XPD_METRIC_DEFINITION_LIBRARY_PATH": "/srv/metrics.yaml",
+            "XPD_MYSQL_QUERY_TIMEOUT_MS": "12000",
         },
         root=tmp_path,
     )
@@ -249,6 +276,7 @@ def test_normalize_env_derives_gateway_and_fastapi_variables(tmp_path):
     assert config.env["XPD_HERMES_CONNECT_MAX_ATTEMPTS"] == "3"
     assert config.env["XPD_MYSQL_READ_MAX_ATTEMPTS"] == "2"
     assert config.env["XPD_MYSQL_READ_RETRY_BACKOFF_MS"] == "100"
+    assert config.env["XPD_MYSQL_QUERY_TIMEOUT_MS"] == "12000"
     assert config.env["HERMES_TIMEZONE"] == "Asia/Shanghai"
     assert config.env["XPD_FILE_STORAGE_PATH"] == str(
         (tmp_path / "data" / "report-files").resolve()
@@ -319,6 +347,25 @@ def test_runtime_config_precedence(tmp_path):
 
     assert config.env["HERMES_GATEWAY_PORT"] == "8003"
     assert config.env["HERMES_GATEWAY_MODEL"] == "config-model"
+
+
+def test_runtime_config_preserves_priority_across_database_aliases(tmp_path):
+    (tmp_path / ".env").write_text(
+        "MYSQL_HOST=old.internal\nMYSQL_DATABASE=old_database\n",
+        encoding="utf-8",
+    )
+    config = load_runtime_config(
+        root=tmp_path,
+        environ={
+            "XPD_DB_HOST": "new.internal",
+            "XPD_DB_NAME": "new_database",
+        },
+    )
+
+    assert config.env["MYSQL_HOST"] == "new.internal"
+    assert config.env["MYSQL_DATABASE"] == "new_database"
+    assert config.env["XPD_DB_HOST"] == "new.internal"
+    assert config.env["XPD_DB_NAME"] == "new_database"
 
 
 def test_default_services_use_migrated_script_paths(tmp_path):

@@ -25,7 +25,27 @@ FORBIDDEN_NODE_TYPES = tuple(
     if hasattr(exp, name)
 )
 
-FORBIDDEN_FUNCTIONS = {"load_extension", "readfile", "writefile"}
+FORBIDDEN_FUNCTIONS = {
+    # Resource-exhaustion and blocking primitives.
+    "benchmark",
+    "master_pos_wait",
+    "sleep",
+    "source_pos_wait",
+    "wait_for_executed_gtid_set",
+    "wait_until_sql_thread_after_gtids",
+    # Advisory-lock functions mutate or retain server-side session state.
+    "get_lock",
+    "release_all_locks",
+    "release_lock",
+    # File/UDF primitives must never be reachable from generated SQL, even if
+    # the database account is accidentally granted more privileges later.
+    "load_extension",
+    "load_file",
+    "readfile",
+    "sys_eval",
+    "sys_exec",
+    "writefile",
+}
 MAX_ROWS_CAP = 1000
 
 
@@ -54,6 +74,41 @@ def validate_sql(sql: str) -> dict[str, Any]:
     if not tree.find(exp.Select):
         return {"ok": False, "error": "Only SELECT queries are allowed"}
 
+    if tree.find(exp.Lock):
+        return {
+            "ok": False,
+            "error": "Locking SELECT queries are not allowed",
+        }
+
+    # Optimizer hints can override the session MAX_EXECUTION_TIME that protects
+    # the database, so generated queries do not get to supply their own hints.
+    if tree.find(exp.Hint):
+        return {
+            "ok": False,
+            "error": "SQL optimizer hints are not allowed",
+        }
+
+    # MySQL executes the body of /*! ... */ version comments, while sqlglot
+    # intentionally treats it as a comment. Reject it so validation and server
+    # execution cannot see different statements.
+    if _has_mysql_executable_comment(tree):
+        return {
+            "ok": False,
+            "error": "MySQL executable comments are not allowed",
+        }
+
+    if tree.find(exp.Into):
+        return {
+            "ok": False,
+            "error": "SELECT INTO is not allowed",
+        }
+
+    if _has_user_variable_assignment(tree):
+        return {
+            "ok": False,
+            "error": "User-variable assignment is not allowed",
+        }
+
     if _has_select_wildcard(tree):
         return {
             "ok": False,
@@ -65,6 +120,13 @@ def validate_sql(sql: str) -> dict[str, Any]:
         return {
             "ok": False,
             "error": f"Forbidden SQL function: {forbidden_functions[0]}",
+        }
+
+    duplicate_columns = find_duplicate_column_names(_projected_column_names(tree))
+    if duplicate_columns:
+        return {
+            "ok": False,
+            "error": duplicate_column_error(duplicate_columns),
         }
 
     table_check = _check_tables(tree)
@@ -104,9 +166,65 @@ def _find_forbidden_functions(tree: exp.Expression) -> list[str]:
         expression = node[0] if isinstance(node, tuple) else node
         if isinstance(expression, exp.Anonymous):
             name = expression.name.lower()
-            if name in FORBIDDEN_FUNCTIONS:
-                names.append(name)
+        elif isinstance(expression, exp.Func):
+            name = expression.sql_name().lower()
+        else:
+            continue
+        if name in FORBIDDEN_FUNCTIONS:
+            names.append(name)
     return names
+
+
+def _has_user_variable_assignment(tree: exp.Expression) -> bool:
+    return any(
+        isinstance(assignment.this, exp.Parameter)
+        for assignment in tree.find_all(exp.PropertyEQ)
+    )
+
+
+def _has_mysql_executable_comment(tree: exp.Expression) -> bool:
+    return any(
+        comment.startswith("!")
+        for expression in tree.walk()
+        for comment in (expression.comments or ())
+    )
+
+
+def _projected_column_names(tree: exp.Expression) -> list[str]:
+    """Derive MySQL result labels, including expressions without aliases."""
+
+    labels: list[str] = []
+    for projection in tree.selects:
+        label = str(projection.alias_or_name or "")
+        if not label:
+            label = projection.sql(dialect="mysql", pretty=False)
+        labels.append(label)
+    return labels
+
+
+def find_duplicate_column_names(columns: list[str]) -> list[str]:
+    """Return duplicate result labels, comparing MySQL names case-insensitively."""
+
+    first_spelling: dict[str, str] = {}
+    duplicate_keys: set[str] = set()
+    duplicates: list[str] = []
+    for column in columns:
+        key = column.casefold()
+        if key in first_spelling:
+            if key not in duplicate_keys:
+                duplicate_keys.add(key)
+                duplicates.append(first_spelling[key])
+        else:
+            first_spelling[key] = column
+    return duplicates
+
+
+def duplicate_column_error(duplicates: list[str]) -> str:
+    labels = ", ".join(duplicates)
+    return (
+        f"Duplicate output column names are not allowed: {labels}. "
+        "Use a unique AS alias for every selected column."
+    )
 
 
 def _check_tables(tree: exp.Expression) -> dict[str, Any]:

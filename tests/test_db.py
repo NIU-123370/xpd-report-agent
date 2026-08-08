@@ -41,6 +41,7 @@ def test_get_mysql_config_accepts_xpd_dms_aliases(monkeypatch):
 
 def test_get_mysql_config_requires_database(monkeypatch):
     monkeypatch.delenv("MYSQL_DATABASE", raising=False)
+    monkeypatch.delenv("XPD_DB_NAME", raising=False)
 
     with pytest.raises(RuntimeError, match="MYSQL_DATABASE"):
         db.get_mysql_config()
@@ -62,6 +63,29 @@ def test_connect_readonly_uses_dict_cursor_and_read_only_session(monkeypatch):
     assert captured["autocommit"] is True
     assert captured["cursorclass"] is db.DictCursor
     assert captured["init_command"] == "SET SESSION TRANSACTION READ ONLY"
+
+
+def test_mysql_query_timeout_is_optional_and_bounded(monkeypatch):
+    monkeypatch.delenv(db.MYSQL_QUERY_TIMEOUT_MS_ENV, raising=False)
+    assert db.mysql_query_timeout_ms() == db.DEFAULT_MYSQL_QUERY_TIMEOUT_MS
+
+    monkeypatch.setenv(db.MYSQL_QUERY_TIMEOUT_MS_ENV, "100")
+    assert db.mysql_query_timeout_ms() == db.MIN_MYSQL_QUERY_TIMEOUT_MS
+
+    monkeypatch.setenv(db.MYSQL_QUERY_TIMEOUT_MS_ENV, "999999")
+    assert db.mysql_query_timeout_ms() == db.MAX_MYSQL_QUERY_TIMEOUT_MS
+
+    monkeypatch.setenv(db.MYSQL_QUERY_TIMEOUT_MS_ENV, "invalid")
+    assert db.mysql_query_timeout_ms() == db.DEFAULT_MYSQL_QUERY_TIMEOUT_MS
+
+
+def test_mysql_query_timeout_reports_unsupported_server_version():
+    class UnsupportedCursor:
+        def execute(self, sql, params=None):
+            raise db.pymysql.OperationalError(1193, "Unknown system variable")
+
+    with pytest.raises(RuntimeError, match="MySQL 5.7.8 or newer"):
+        db.set_mysql_query_timeout(UnsupportedCursor())
 
 
 def test_quote_ident_uses_mysql_backticks_and_rejects_unsafe_names():

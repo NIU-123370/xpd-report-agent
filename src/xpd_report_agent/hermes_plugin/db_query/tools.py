@@ -12,6 +12,7 @@ from .db import (
     get_sample_rows,
     get_schema_ddl,
     load_schema,
+    set_mysql_query_timeout,
 )
 from .join_graph import find_join_paths
 from .query_results import query_result_registry
@@ -165,11 +166,20 @@ def db_execute_sql(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
 
         started = time.time()
         limited_sql = sql_guard.wrap_with_limit(sql, max_rows=max_rows)
+
         def execute_query(conn):
             with conn.cursor() as cursor:
+                set_mysql_query_timeout(cursor)
                 cursor.execute(limited_sql)
                 description = getattr(cursor, "description", None) or ()
                 described_columns = [str(item[0]) for item in description if item]
+                duplicate_columns = sql_guard.find_duplicate_column_names(
+                    described_columns
+                )
+                if duplicate_columns:
+                    raise ValueError(
+                        sql_guard.duplicate_column_error(duplicate_columns)
+                    )
                 rows = list(cursor.fetchall())
             return described_columns, rows
 

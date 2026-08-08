@@ -18,6 +18,14 @@ if [ -z "${HERMES_AGENT_VERSION:-}" ] || [ -z "${HERMES_AGENT_COMMIT:-}" ]; then
 fi
 
 if [ "${LAUNCH_MANAGED:-false}" != "true" ]; then
+  # Normalize database aliases inside the inherited (highest-priority) layer
+  # before configuration files are sourced. This prevents a MYSQL_* value in a
+  # lower-priority file from defeating an inherited XPD_DB_* override.
+  export MYSQL_HOST="${MYSQL_HOST:-${XPD_DB_HOST:-}}"
+  export MYSQL_PORT="${MYSQL_PORT:-${XPD_DB_PORT:-}}"
+  export MYSQL_USER="${MYSQL_USER:-${XPD_DB_USERNAME:-}}"
+  export MYSQL_PASSWORD="${MYSQL_PASSWORD:-${XPD_DB_PASSWORD:-}}"
+  export MYSQL_DATABASE="${MYSQL_DATABASE:-${XPD_DB_NAME:-}}"
   xpd_inherited_exports="$(export -p)"
   if [ -f "$ROOT/.env" ]; then
     set -a
@@ -54,6 +62,7 @@ export MYSQL_PASSWORD="${MYSQL_PASSWORD:-${XPD_DB_PASSWORD:-}}"
 export MYSQL_DATABASE="${MYSQL_DATABASE:-${XPD_DB_NAME:-taobao_reports_test}}"
 export XPD_MYSQL_READ_MAX_ATTEMPTS="${XPD_MYSQL_READ_MAX_ATTEMPTS:-2}"
 export XPD_MYSQL_READ_RETRY_BACKOFF_MS="${XPD_MYSQL_READ_RETRY_BACKOFF_MS:-100}"
+export XPD_MYSQL_QUERY_TIMEOUT_MS="${XPD_MYSQL_QUERY_TIMEOUT_MS:-25000}"
 export HERMES_BOOTSTRAP_ON_START="${HERMES_BOOTSTRAP_ON_START:-false}"
 export HERMES_REQUIRE_LLM_API_KEY="${HERMES_REQUIRE_LLM_API_KEY:-true}"
 export XPD_MEMORY_ENABLED="${XPD_MEMORY_ENABLED:-true}"

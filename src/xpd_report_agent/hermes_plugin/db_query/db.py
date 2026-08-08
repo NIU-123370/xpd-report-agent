@@ -28,12 +28,18 @@ XPD_DB_ALIASES = {
 
 MYSQL_READ_MAX_ATTEMPTS_ENV = "XPD_MYSQL_READ_MAX_ATTEMPTS"
 MYSQL_READ_RETRY_BACKOFF_MS_ENV = "XPD_MYSQL_READ_RETRY_BACKOFF_MS"
+MYSQL_QUERY_TIMEOUT_MS_ENV = "XPD_MYSQL_QUERY_TIMEOUT_MS"
 
 DEFAULT_MYSQL_READ_MAX_ATTEMPTS = 2
 MAX_MYSQL_READ_MAX_ATTEMPTS = 3
 DEFAULT_MYSQL_READ_RETRY_BACKOFF_MS = 100.0
 MAX_MYSQL_READ_RETRY_BACKOFF_MS = 500.0
 MAX_MYSQL_READ_RETRY_TOTAL_DELAY_MS = 1_000.0
+DEFAULT_MYSQL_QUERY_TIMEOUT_MS = 25_000
+MIN_MYSQL_QUERY_TIMEOUT_MS = 1_000
+# Keep the server-side deadline below PyMySQL's 30-second socket deadline so
+# MySQL can cancel the statement cleanly before the client abandons it.
+MAX_MYSQL_QUERY_TIMEOUT_MS = 29_000
 
 # These codes represent an unavailable/lost connection, not a problem with the
 # submitted SQL. In particular, query timeouts (for example 3024), syntax
@@ -144,6 +150,35 @@ def mysql_read_retry_config() -> tuple[int, float]:
         maximum=MAX_MYSQL_READ_RETRY_BACKOFF_MS,
     )
     return attempts, backoff_ms / 1_000.0
+
+
+def mysql_query_timeout_ms() -> int:
+    """Return the bounded server-side deadline for Agent-generated SELECTs."""
+
+    return _bounded_int_env(
+        MYSQL_QUERY_TIMEOUT_MS_ENV,
+        DEFAULT_MYSQL_QUERY_TIMEOUT_MS,
+        minimum=MIN_MYSQL_QUERY_TIMEOUT_MS,
+        maximum=MAX_MYSQL_QUERY_TIMEOUT_MS,
+    )
+
+
+def set_mysql_query_timeout(cursor: Any) -> None:
+    """Apply the server-side SELECT deadline or fail with a clear version error."""
+
+    try:
+        cursor.execute(
+            "SET SESSION MAX_EXECUTION_TIME = %s",
+            (mysql_query_timeout_ms(),),
+        )
+    except pymysql.MySQLError as exc:
+        code = exc.args[0] if exc.args else None
+        if code == 1193:
+            raise RuntimeError(
+                "The report database must run MySQL 5.7.8 or newer so "
+                "MAX_EXECUTION_TIME can enforce the query deadline."
+            ) from exc
+        raise
 
 
 def _exception_chain(exc: BaseException):
