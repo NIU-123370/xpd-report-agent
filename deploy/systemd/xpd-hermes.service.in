@@ -11,11 +11,10 @@ StartLimitBurst=10
 Type=simple
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
-Environment=HOME=@SERVICE_HOME@
-Environment=LAUNCH_MANAGED=true
 EnvironmentFile=@ENV_FILE@
 WorkingDirectory=@PROJECT_ROOT@
-ExecStart=@PROJECT_ROOT@/scripts/services/hermes.sh run
+ExecStartPre=/usr/bin/env HOME=@SERVICE_HOME@ LAUNCH_MANAGED=true XPD_SERVICE_AUTH_ENABLED=true @PROJECT_ROOT@/.venv/bin/python -m xpd_report_agent.runtime.deployment_preflight --quiet
+ExecStart=/usr/bin/env HOME=@SERVICE_HOME@ LAUNCH_MANAGED=true XPD_SERVICE_AUTH_ENABLED=true @PROJECT_ROOT@/scripts/services/hermes.sh run
 ExecStartPost=@PROJECT_ROOT@/.venv/bin/python -S @PROJECT_ROOT@/deploy/systemd/healthcheck.py hermes --timeout-seconds 90
 TimeoutStartSec=120s
 Restart=on-failure

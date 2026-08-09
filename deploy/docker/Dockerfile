@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM public.ecr.aws/docker/library/python:3.11-slim AS python311
 
 FROM ghcr.io/astral-sh/uv:0.8.8 AS uv
@@ -6,8 +8,12 @@ FROM public.ecr.aws/docker/library/python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/var/lib/xpd-report-agent \
+    HERMES_AGENT_DIR=/opt/hermes-agent \
+    HERMES_BIN=/opt/hermes-agent/venv/bin/hermes \
+    HERMES_PY=/opt/hermes-agent/venv/bin/python \
     PATH=/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONUNBUFFERED=1 \
+    UV_CACHE_DIR=/var/cache/uv \
     UV_LINK_MODE=copy \
     UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
 
@@ -26,29 +32,48 @@ COPY --from=python311 /usr/local/lib/python3.11 /usr/local/lib/python3.11
 COPY --from=python311 /usr/local/lib/libpython3.11.so.1.0 /usr/local/lib/libpython3.11.so.1.0
 COPY --from=python311 /usr/local/include/python3.11 /usr/local/include/python3.11
 RUN ldconfig
+
 WORKDIR /app
+
+# Keep dependency and Hermes layers independent from normal source changes.
+COPY pyproject.toml uv.lock /app/
+COPY configs/hermes-runtime.lock /app/configs/hermes-runtime.lock
+
+RUN --mount=type=cache,target=/var/cache/uv \
+    uv sync --frozen --no-dev --no-install-project \
+    && bash -c 'set -euo pipefail; . configs/hermes-runtime.lock; \
+      git init "$HERMES_AGENT_DIR"; \
+      git -C "$HERMES_AGENT_DIR" remote add origin "$HERMES_AGENT_REPOSITORY"; \
+      git -C "$HERMES_AGENT_DIR" fetch --depth 1 origin "$HERMES_AGENT_COMMIT"; \
+      git -C "$HERMES_AGENT_DIR" checkout --detach FETCH_HEAD; \
+      test "$(git -C "$HERMES_AGENT_DIR" rev-parse HEAD)" = "$HERMES_AGENT_COMMIT"; \
+      UV_PROJECT_ENVIRONMENT="$HERMES_AGENT_DIR/venv" uv sync \
+        --project "$HERMES_AGENT_DIR" \
+        --frozen \
+        --no-dev \
+        --python /usr/local/bin/python3.11; \
+      plugin_requirements="$(mktemp)"; \
+      hermes_constraints="$(mktemp)"; \
+      trap '\''rm -f "$plugin_requirements" "$hermes_constraints"'\'' EXIT; \
+      /usr/local/bin/python3.12 -c '\''import pathlib, sys, tomllib; data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text()); pathlib.Path(sys.argv[2]).write_text("\n".join(data["dependency-groups"]["hermes-plugin"]) + "\n")'\'' /app/pyproject.toml "$plugin_requirements"; \
+      uv pip check --python "$HERMES_PY"; \
+      uv pip freeze --python "$HERMES_PY" --exclude-editable > "$hermes_constraints"; \
+      uv pip install \
+        --python "$HERMES_PY" \
+        --constraints "$hermes_constraints" \
+        -r "$plugin_requirements"; \
+      uv pip check --python "$HERMES_PY"; \
+      rm -f "$plugin_requirements" "$hermes_constraints"; \
+      trap - EXIT; \
+      test -f "$HERMES_AGENT_DIR/pyproject.toml"; \
+      test -x "$HERMES_BIN"'
+
 COPY . /app
 
-RUN uv lock --refresh \
-    && uv sync --frozen --no-dev \
-    && bash -c 'set -euo pipefail; . configs/hermes-runtime.lock; \
-      mkdir -p "$HOME/.hermes"; \
-      git clone "$HERMES_AGENT_REPOSITORY" "$HOME/.hermes/hermes-agent"; \
-      git -C "$HOME/.hermes/hermes-agent" checkout --detach "$HERMES_AGENT_COMMIT"; \
-      uv venv "$HOME/.hermes/hermes-agent/venv" \
-        --python /usr/local/bin/python3.11; \
-      uv pip install --python "$HOME/.hermes/hermes-agent/venv/bin/python" \
-        -e "$HOME/.hermes/hermes-agent"; \
-      requirements_file="$(mktemp)"; \
-      uv export --only-group hermes-plugin --no-hashes --no-header \
-        --output-file "$requirements_file"; \
-      uv pip install --python "$HOME/.hermes/hermes-agent/venv/bin/python" \
-        -r "$requirements_file"; \
-      rm -f "$requirements_file"; \
-      test -f "$HOME/.hermes/hermes-agent/pyproject.toml"; \
-      test -x "$HOME/.hermes/hermes-agent/venv/bin/hermes"' \
+RUN --mount=type=cache,target=/var/cache/uv \
+    uv sync --frozen --no-dev \
     && chmod +x /app/deploy/docker/entrypoint.sh \
-    && mkdir -p /app/data/report-files /app/logs /app/.run \
+    && mkdir -p "$HOME/.hermes" /app/data/report-files /app/logs /app/.run \
     && chown -R xpd-agent:xpd-agent "$HOME" /app/data /app/logs /app/.run
 
 USER xpd-agent

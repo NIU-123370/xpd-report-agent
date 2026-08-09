@@ -63,15 +63,33 @@ chmod 600 xpd-report-agent.env
 编辑 `xpd-report-agent.env`，填写以下配置：
 
 - 模型：`HERMES_LLM_PROVIDER`、`HERMES_LLM_MODEL`、`HERMES_LLM_BASE_URL`、
-  `HERMES_LLM_API_KEY`。
+  `HERMES_LLM_API_MODE`、`HERMES_LLM_API_KEY`。
 - RDS：`XPD_DB_HOST`、`XPD_DB_PORT`、`XPD_DB_NAME`、`XPD_DB_USERNAME`、
   `XPD_DB_PASSWORD`；`XPD_MYSQL_QUERY_TIMEOUT_MS` 可设置单条 Agent 查询的服务端执行上限。
 - 中台鉴权：`XPD_SERVICE_API_KEY`。
 - 会话签名：`XPD_SESSION_SIGNING_SECRET`，生产环境必须长期固定且与服务密钥不同。
 - OSS：报告文件所需的 endpoint、bucket、prefix 和访问凭证。
 
+`HERMES_GATEWAY_API_KEY`、`XPD_SERVICE_API_KEY`、`XPD_SESSION_SIGNING_SECRET` 必须是
+三个不同的高熵密钥，每个至少 32 个字符。可以分别执行三次下列命令生成：
+
+```bash
+openssl rand -hex 32
+```
+
+中台生产配置还必须保持：
+
+```text
+XPD_IDENTITY_MODE=user_id
+XPD_SERVICE_AUTH_ENABLED=true
+XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED=false
+FASTAPI_RELOAD=false
+```
+
 真实 `xpd-report-agent.env` 已被 Git 和 Docker 构建上下文忽略，禁止提交到仓库、日志或接口文档。
 如果密钥曾出现在聊天、工单或终端录屏中，应及时轮换。
+容器启动前会执行失败关闭的配置预检；缺少必填项、使用 `REPLACE_WITH_*`
+占位符、关闭鉴权或复用密钥时，服务不会带病启动。
 
 ## 4. 验证 RDS 内网
 
@@ -117,8 +135,74 @@ Image xpd-report-agent:dev Built
 
 ```bash
 docker run --rm --entrypoint sh xpd-report-agent:dev \
-  -c '/var/lib/xpd-report-agent/.hermes/hermes-agent/venv/bin/hermes --version'
+  -c '/opt/hermes-agent/venv/bin/hermes --version && \
+      uv pip check --python /opt/hermes-agent/venv/bin/python'
 ```
+
+镜像内的 Hermes 固定运行时位于 `/opt/hermes-agent`，不再放进持久化的
+`$HOME/.hermes`。这样重建镜像时不会被旧数据卷遮住新运行时。
+
+构建完成后，可在启动前单独检查配置：
+
+```bash
+docker compose run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python xpd-report-agent \
+  -m xpd_report_agent.runtime.deployment_preflight
+```
+
+### 首次从旧镜像升级
+
+旧镜像把 Hermes 运行时和会话状态混在容器可写层的
+`/var/lib/xpd-report-agent/.hermes` 中。首次升级到新状态卷前，如果要保留已有会话、
+记忆和任务，必须在新镜像构建完成后、重建容器之前停服备份。不要在 Hermes
+仍在写 SQLite/JSON 状态时直接打包。
+
+```bash
+umask 077
+XPD_STATE_BACKUP_DIR="/opt/xpd-hermes-state-$(date +%Y%m%d%H%M%S)"
+install -d -m 700 "$XPD_STATE_BACKUP_DIR"
+
+# 即使 xpd-report-agent:dev 已被新构建覆盖，也从当前容器保留旧镜像。
+docker image tag "$(docker inspect -f '{{.Image}}' xpd-report-agent)" \
+  xpd-report-agent:rollback-before-state-volume
+echo 'xpd-report-agent:rollback-before-state-volume' \
+  > /opt/xpd-report-agent-last-rollback-image
+
+curl -fsS http://127.0.0.1:8000/health | python3 -c '
+import json, sys
+active = json.load(sys.stdin)["agent_runs"]["active_tasks"]
+print(f"active_tasks={active}")
+raise SystemExit(0 if active == 0 else 1)
+'
+docker stop --time 60 xpd-report-agent
+docker cp xpd-report-agent:/var/lib/xpd-report-agent/.hermes/. \
+  "$XPD_STATE_BACKUP_DIR/"
+test -n "$(find "$XPD_STATE_BACKUP_DIR" -mindepth 1 -print -quit)" \
+  && echo "状态备份完成：$XPD_STATE_BACKUP_DIR" \
+  || { echo '状态备份为空，已恢复旧服务，请停止发布' >&2; \
+       docker start xpd-report-agent; false; }
+```
+
+只有命令输出 `active_tasks=0` 和“状态备份完成”时才能继续。任一检查失败都应立即停止
+发布，不要在运行中任务尚未归零时强制备份。
+
+将这份一致性备份恢复到固定名称的状态卷，然后直接启动新容器：
+
+```bash
+docker volume create xpd-report-agent-hermes-state
+docker run --rm --user root --entrypoint sh \
+  -v xpd-report-agent-hermes-state:/target \
+  -v "$XPD_STATE_BACKUP_DIR:/source:ro" \
+  xpd-report-agent:dev \
+  -c 'cp -a /source/. /target/ && \
+      chown -R xpd-agent:xpd-agent /target'
+docker compose up -d --force-recreate
+```
+
+这份首次迁移备份也包含旧 Hermes 目录，主要用于首次发布回滚；新镜像始终使用
+`/opt/hermes-agent`，不会执行卷中的旧运行时。备份目录中包含配置和密钥，必须保持
+`0700` 权限。如果备份或恢复失败，先执行 `docker start xpd-report-agent` 恢复旧服务，不要继续
+重建容器。纯新部署不需要执行本段。
 
 ## 6. 启动服务
 
@@ -133,6 +217,9 @@ docker compose logs --tail=100
 ```text
 Up ... (healthy)
 ```
+
+`healthy` 是部署的必要条件，但不等于模型推理和 OSS 业务链路已经验收；还必须
+完成第 8 节的真实 Agent 查询和文件下载测试。
 
 ## 7. 就绪验收
 
@@ -196,6 +283,15 @@ curl -N --max-time 300 \
 正常会收到 `progress`、`answer.delta`，最后收到 `run.completed`。完整的 5 个中台接口、澄清续答
 和文件下载流程见 [`../../docs/api/middle-platform-agent-api.md`](../../docs/api/middle-platform-agent-api.md)。
 
+再创建一个明确要求“查询数据并生成 Excel”的任务，验收 OSS 链路。该任务必须同时
+满足：
+
+- `run.status=succeeded`，且结果不是空字符串；
+- SSE 出现 `artifact.ready`，`run.result.artifacts` 至少有一项；
+- 使用第 5 个中台接口实际下载成功，返回的 Excel 可以打开且中文正常。
+
+上述三项全部通过，才说明模型、RDS、报告生成、OSS 上传和下载都已实际工作。
+
 接口文档分工：
 
 | 文档 | 使用对象 | 说明 |
@@ -217,7 +313,58 @@ http://<ECS内网IP>:8000
 中台后端必须携带 `Authorization: Bearer <service-key>` 和稳定的 `X-User-Id`。服务密钥只能保存
 在中台后端，不得下发到浏览器。建议在安全组、内部负载均衡或 API 网关层进一步限制来源。
 
-## 10. 日常运维
+## 10. 更新、回滚与日常运维
+
+### 从 Codeup 更新
+
+发布前先确认没有运行中的长任务，仓库没有未处理的服务器本地改动。真实
+`xpd-report-agent.env` 是 Git 忽略文件，不会被拉取覆盖。
+
+```bash
+cd /opt/xpd-report-agent
+git status --short
+git fetch origin master
+git merge --ff-only origin/master
+
+cd deploy/docker
+XPD_ROLLBACK_TAG="xpd-report-agent:rollback-$(date +%Y%m%d%H%M%S)"
+docker image tag xpd-report-agent:dev "$XPD_ROLLBACK_TAG"
+echo "$XPD_ROLLBACK_TAG" > /opt/xpd-report-agent-last-rollback-image
+
+docker compose build --progress=plain
+docker compose run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python xpd-report-agent \
+  -m xpd_report_agent.runtime.deployment_preflight
+docker compose up -d --force-recreate
+docker compose ps
+```
+
+如果 `git status --short` 有输出，先确认改动来源，不要在服务器上盲目执行
+`git reset --hard`。`docker compose restart` 只会重启当前容器，不会加载新代码或新镜像；
+代码或镜像更新必须使用 `docker compose up -d --force-recreate`。
+
+发布后依次执行第 7 节的就绪检查和第 8 节的真实业务验收。在它们全部通过前，
+不要删除回滚镜像和状态备份。
+
+### 回滚镜像
+
+如果新版启动失败或真实业务验收不通过，使用发布前保留的镜像立即回滚：
+
+```bash
+cd /opt/xpd-report-agent/deploy/docker
+XPD_ROLLBACK_TAG="$(cat /opt/xpd-report-agent-last-rollback-image)"
+docker image inspect "$XPD_ROLLBACK_TAG" >/dev/null
+docker image tag "$XPD_ROLLBACK_TAG" xpd-report-agent:dev
+docker compose up -d --force-recreate --no-build
+docker compose ps
+curl -fsS http://127.0.0.1:8000/ready
+```
+
+首次引入 `hermes-state` 卷时，回滚依赖第 5 节保留的完整状态备份；不要跳过首次迁移。
+镜像回滚只恢复运行服务，服务器 Git 工作树仍保留新版代码；确认原因后，通过新的
+Codeup 修复提交再次发布，不在生产机上直接改代码。
+
+### 日常命令
 
 ```bash
 docker compose ps
@@ -232,9 +379,9 @@ docker compose logs --since=10m \
   | grep -E 'ERROR|Traceback|AuthError|RuntimeError'
 ```
 
-更新代码并重新生成容器前，先确认会话、记忆和文件的持久化策略。`docker compose restart` 会保留
-当前容器层；`docker compose down` 会删除容器，不能把容器可写层当作长期数据存储。报告文件由
-Compose 命名卷保存，生产环境还应定期验证 OSS 上传和下载。
+Hermes 会话、记忆和任务由 `xpd-report-agent-hermes-state` 命名卷保存，报告文件由
+`report-files` 卷保存并上传 OSS。`docker compose down` 不会删除命名卷；不要在生产环境
+执行 `docker compose down -v`。应定期备份状态卷，并实际验证 OSS 上传和下载。
 
 ## 11. 常见问题
 

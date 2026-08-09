@@ -9,12 +9,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from xpd_report_agent.paths import PROJECT_ROOT
 
 ROOT = PROJECT_ROOT
 DEFAULT_TIMEOUT_SECONDS = 60
+_NO_PROXY_OPENER = build_opener(ProxyHandler({}))
 
 
 class LaunchError(RuntimeError):
@@ -46,6 +47,7 @@ NEW_ENV_KEYS = {
     "HERMES_LLM_BASE_URL",
     "HERMES_LLM_API_MODE",
     "HERMES_LLM_API_KEY",
+    "HERMES_AGENT_DIR",
     "MYSQL_HOST",
     "MYSQL_PORT",
     "MYSQL_USER",
@@ -236,6 +238,19 @@ DB_ENV_ALIASES = {
 }
 
 
+def _health_probe_host(configured_host: str) -> str:
+    """Convert wildcard bind addresses into directly reachable probe hosts."""
+
+    host = configured_host.strip()
+    if host in {"", "0.0.0.0"}:
+        return "127.0.0.1"
+    if host in {"::", "[::]"}:
+        return "[::1]"
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 def _fallback_dotenv_values(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -366,6 +381,8 @@ class LaunchManager:
         self.services = services or self._default_services()
 
     def _default_services(self) -> dict[str, ServiceSpec]:
+        hermes_probe_host = _health_probe_host(self.env["HERMES_GATEWAY_HOST"])
+        fastapi_probe_host = _health_probe_host(self.env["FASTAPI_HOST"])
         return {
             "hermes": ServiceSpec(
                 name="hermes",
@@ -375,7 +392,7 @@ class LaunchManager:
                     "run",
                 ],
                 health_url=(
-                    f"http://{self.env['HERMES_GATEWAY_HOST']}:"
+                    f"http://{hermes_probe_host}:"
                     f"{self.env['HERMES_GATEWAY_PORT']}/v1/health"
                 ),
                 health_token=self.env["HERMES_GATEWAY_API_KEY"],
@@ -388,7 +405,7 @@ class LaunchManager:
                     "run",
                 ],
                 health_url=(
-                    f"http://{self.env['FASTAPI_HOST']}:"
+                    f"http://{fastapi_probe_host}:"
                     f"{self.env['FASTAPI_PORT']}/health"
                 ),
             ),
@@ -448,7 +465,7 @@ class LaunchManager:
             headers["Authorization"] = f"Bearer {spec.health_token}"
         request = Request(spec.health_url, headers=headers)
         try:
-            with urlopen(request, timeout=timeout) as response:
+            with _NO_PROXY_OPENER.open(request, timeout=timeout) as response:
                 return 200 <= response.status < 300
         except HTTPError as exc:
             return 200 <= exc.code < 300

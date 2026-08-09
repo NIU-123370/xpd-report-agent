@@ -51,6 +51,7 @@ export HERMES_GATEWAY_API_KEY="${HERMES_GATEWAY_API_KEY:-dev-secret}"
 export HERMES_GATEWAY_MODEL="${HERMES_GATEWAY_MODEL:-hermes-agent}"
 export HERMES_GATEWAY_ALLOW_ALL_USERS="${HERMES_GATEWAY_ALLOW_ALL_USERS:-true}"
 export HERMES_TIMEZONE="${HERMES_TIMEZONE:-Asia/Shanghai}"
+export HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HOME/.hermes/hermes-agent}"
 if [ -n "${HERMES_LLM_API_KEY:-}" ]; then
   export ALIBABA_CODING_PLAN_API_KEY="${ALIBABA_CODING_PLAN_API_KEY:-$HERMES_LLM_API_KEY}"
   export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:-$HERMES_LLM_API_KEY}"
@@ -107,7 +108,7 @@ export API_SERVER_KEY="$HERMES_GATEWAY_API_KEY"
 export GATEWAY_ALLOW_ALL_USERS="$HERMES_GATEWAY_ALLOW_ALL_USERS"
 
 verify_hermes_runtime() {
-  HERMES_BIN="${HERMES_BIN:-$HOME/.hermes/hermes-agent/venv/bin/hermes}"
+  HERMES_BIN="${HERMES_BIN:-$HERMES_AGENT_DIR/venv/bin/hermes}"
   if [ ! -x "$HERMES_BIN" ]; then
     echo "Hermes executable was not found: $HERMES_BIN" >&2
     exit 1
@@ -130,8 +131,7 @@ verify_hermes_runtime() {
   case "$hermes_version_output" in
     *"upstream ${hermes_commit_short}"*|*"local ${hermes_commit_short}"*) ;;
     *)
-      hermes_repo="$(cd "$(dirname "$HERMES_BIN")/../.." && pwd)"
-      hermes_git_commit="$(git -C "$hermes_repo" rev-parse HEAD 2>/dev/null || true)"
+      hermes_git_commit="$(git -C "$HERMES_AGENT_DIR" rev-parse HEAD 2>/dev/null || true)"
       if [ "$hermes_git_commit" != "$HERMES_AGENT_COMMIT" ]; then
         echo "Hermes revision mismatch. Required ${HERMES_AGENT_COMMIT}." >&2
         echo "Installed runtime: $hermes_version_output" >&2
@@ -171,8 +171,8 @@ configure_hermes_runtime() {
 }
 
 prepare_hermes() {
-  HERMES_PY="${HERMES_PY:-$HOME/.hermes/hermes-agent/venv/bin/python}"
-  HERMES_BIN="${HERMES_BIN:-$HOME/.hermes/hermes-agent/venv/bin/hermes}"
+  HERMES_PY="${HERMES_PY:-$HERMES_AGENT_DIR/venv/bin/python}"
+  HERMES_BIN="${HERMES_BIN:-$HERMES_AGENT_DIR/venv/bin/hermes}"
   if [ ! -x "$HERMES_PY" ]; then
     echo "Hermes Python was not found: $HERMES_PY" >&2
     echo "Install Hermes or set HERMES_PY to its Python interpreter." >&2
@@ -184,24 +184,35 @@ prepare_hermes() {
   fi
   verify_hermes_runtime
 
-  if command -v uv >/dev/null 2>&1; then
-    plugin_requirements="$(mktemp -t xpd-report-agent-hermes.XXXXXX)"
-    trap 'rm -f "$plugin_requirements"' EXIT
-    uv export \
-      --only-group hermes-plugin \
-      --no-hashes \
-      --no-header \
-      --output-file "$plugin_requirements"
-    uv pip install --python "$HERMES_PY" -r "$plugin_requirements"
-    rm -f "$plugin_requirements"
-    trap - EXIT
-  else
-    "$HERMES_PY" -c 'import alibabacloud_oss_v2, openpyxl, pymysql, pypdf, reportlab, sqlglot, yaml' || {
-      echo "uv is unavailable and Hermes plugin dependencies are missing." >&2
-      echo "Install uv, then run this prepare command again." >&2
-      exit 1
-    }
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "uv is required to prepare the Hermes plugin environment." >&2
+    exit 1
   fi
+
+  upstream_constraints="$(mktemp -t xpd-report-agent-hermes-constraints.XXXXXX)"
+  trap 'rm -f "$upstream_constraints"' EXIT
+
+  # Restore the pinned upstream environment first. This repairs a venv that an
+  # older plugin installation polluted before we freeze the upstream pins.
+  UV_PROJECT_ENVIRONMENT="$HERMES_AGENT_DIR/venv" uv sync \
+    --project "$HERMES_AGENT_DIR" \
+    --frozen \
+    --no-dev \
+    --python "$HERMES_PY"
+
+  # Freeze every installed, non-editable upstream dependency as a constraint
+  # so plugin installation cannot silently upgrade Hermes' pins again.
+  uv pip check --python "$HERMES_PY"
+  uv pip freeze \
+    --python "$HERMES_PY" \
+    --exclude-editable > "$upstream_constraints"
+  uv pip install \
+    --python "$HERMES_PY" \
+    --constraints "$upstream_constraints" \
+    --group hermes-plugin
+  uv pip check --python "$HERMES_PY"
+  rm -f "$upstream_constraints"
+  trap - EXIT
 
   sync_project_assets
   configure_hermes_runtime
@@ -218,7 +229,7 @@ run_hermes() {
     sync_project_assets
     configure_hermes_runtime
   fi
-  HERMES_BIN="${HERMES_BIN:-$HOME/.hermes/hermes-agent/venv/bin/hermes}"
+  HERMES_BIN="${HERMES_BIN:-$HERMES_AGENT_DIR/venv/bin/hermes}"
   if [ ! -x "$HERMES_BIN" ]; then
     echo "Hermes executable was not found: $HERMES_BIN" >&2
     exit 1

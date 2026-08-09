@@ -3,17 +3,18 @@ Description=XPD Report Agent - prepare Hermes runtime
 Documentation=file://@PROJECT_ROOT@/deploy/systemd/README.md
 Wants=network-online.target
 After=network-online.target
+Conflicts=xpd-report-agent.target xpd-hermes.service xpd-fastapi.service
+Before=xpd-report-agent.target xpd-hermes.service xpd-fastapi.service
 
 [Service]
 Type=oneshot
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
-Environment=HOME=@SERVICE_HOME@
-Environment=LAUNCH_MANAGED=true
 EnvironmentFile=@ENV_FILE@
 WorkingDirectory=@PROJECT_ROOT@
-ExecStart=@PROJECT_ROOT@/scripts/services/hermes.sh prepare
-TimeoutStartSec=10min
+ExecStartPre=/usr/bin/env HOME=@SERVICE_HOME@ LAUNCH_MANAGED=true XPD_SERVICE_AUTH_ENABLED=true @PROJECT_ROOT@/.venv/bin/python -m xpd_report_agent.runtime.deployment_preflight --quiet
+ExecStart=/usr/bin/env HOME=@SERVICE_HOME@ LAUNCH_MANAGED=true XPD_SERVICE_AUTH_ENABLED=true @PROJECT_ROOT@/scripts/services/hermes.sh prepare
+TimeoutStartSec=60min
 UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true

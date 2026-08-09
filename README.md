@@ -23,7 +23,8 @@ Excel、CSV、Markdown、PDF、JSON 报告导出。
 ```
 
 容器达到 `healthy`、`GET /ready` 返回 `{"ok":true,"status":"ready"}`，并且
-`checks.runtime`、`checks.mysql` 都为 `true`，才表示服务可接收中台业务请求。
+`checks.runtime`、`checks.mysql` 都为 `true`，是服务可接收流量的必要条件。正式发布还必须
+完成一次真实 RDS 分析任务和一次 Excel 生成/OSS 下载测试。
 
 ## API 接口文档
 
@@ -128,8 +129,9 @@ cp configs/local.env.example configs/local.env
 预设分析仍复用同一条 Hermes Session 流式链路，完整执行 Schema 检查、SQL 校验和只读查询；
 普通分析不会自动生成文件，用户明确要求导出时才走现有文件导出流程。
 
-生产环境必须单独设置高熵 `XPD_SESSION_SIGNING_SECRET`，并将整个 Hermes Home
-（默认 `~/.hermes`）挂载到持久卷；不要只持久化项目目录。
+生产环境必须单独设置高熵 `XPD_SESSION_SIGNING_SECRET`，并将 Hermes 状态目录
+（默认 `~/.hermes`）挂载到持久卷；不要只持久化项目目录。Docker 镜像中的固定
+Hermes 运行时位于 `/opt/hermes-agent`，与持久化状态分离，避免旧数据卷遮住新版运行时。
 
 ## 启动
 

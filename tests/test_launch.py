@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from xpd_report_agent.runtime import launcher as launcher_module
 from xpd_report_agent.runtime.launcher import (
     LaunchError,
     LaunchManager,
@@ -122,9 +123,15 @@ def test_hermes_service_run_preserves_explicit_bootstrap(tmp_path):
 
     calls = call_log.read_text(encoding="utf-8").splitlines()
     assert calls[0] == "hermes|--version"
-    assert calls[1].startswith("uv|export|")
-    assert calls[2].startswith("uv|pip|install|")
-    assert calls[3:] == [
+    assert calls[1].startswith("uv|sync|--project|")
+    assert "|--frozen|--no-dev|--python|" in calls[1]
+    assert calls[2].startswith("uv|pip|check|--python|")
+    assert calls[3].startswith("uv|pip|freeze|--python|")
+    assert calls[4].startswith("uv|pip|install|--python|")
+    assert "|--constraints|" in calls[4]
+    assert calls[4].endswith("|--group|hermes-plugin")
+    assert calls[5].startswith("uv|pip|check|--python|")
+    assert calls[6:] == [
         "project-python|scripts/configure_hermes.py",
         "hermes|plugins|enable|db-query",
         "hermes|gateway|run|--external-supervisor",
@@ -143,8 +150,31 @@ def test_hermes_service_process_env_overrides_local_env(tmp_path):
 
     calls = call_log.read_text(encoding="utf-8").splitlines()
     assert calls[0] == "hermes|--version"
-    assert calls[1].startswith("uv|export|")
+    assert calls[1].startswith("uv|sync|--project|")
+    assert calls[2].startswith("uv|pip|check|--python|")
+    assert any(call.endswith("|--group|hermes-plugin") for call in calls)
     assert "hermes|plugins|enable|db-query" in calls
+
+
+def test_hermes_service_supports_explicit_agent_directory(tmp_path):
+    script, env, call_log = _stage_hermes_service(tmp_path)
+    custom_agent_dir = tmp_path / "custom-hermes-agent"
+    custom_bin = custom_agent_dir / "venv" / "bin"
+    custom_bin.mkdir(parents=True)
+    source_hermes = Path(env.pop("HERMES_BIN"))
+    custom_hermes = custom_bin / "hermes"
+    custom_hermes.write_text(source_hermes.read_text(encoding="utf-8"), encoding="utf-8")
+    custom_hermes.chmod(0o755)
+    env.pop("HERMES_PY", None)
+    env["HERMES_AGENT_DIR"] = str(custom_agent_dir)
+
+    _run_hermes_service(script, env)
+
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "hermes|--version",
+        "project-python|scripts/configure_hermes.py",
+        "hermes|gateway|run|--external-supervisor",
+    ]
 
 
 def test_hermes_service_process_xpd_db_alias_overrides_file_mysql_name(tmp_path):
@@ -378,6 +408,85 @@ def test_default_services_use_migrated_script_paths(tmp_path):
     assert manager.services["fastapi"].command[1] == str(
         tmp_path / "scripts" / "services" / "fastapi.sh"
     )
+
+
+def test_default_service_health_urls_probe_loopback_for_wildcard_binds(tmp_path):
+    config = normalize_env(
+        {
+            "HERMES_GATEWAY_HOST": "0.0.0.0",
+            "FASTAPI_HOST": "::",
+        },
+        root=tmp_path,
+    )
+    manager = LaunchManager(root=tmp_path, env=config.env)
+
+    assert manager.services["hermes"].health_url == "http://127.0.0.1:8642/v1/health"
+    assert manager.services["fastapi"].health_url == "http://[::1]:8000/health"
+
+
+def test_launch_health_probe_uses_no_proxy_opener(tmp_path, monkeypatch):
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class RecordingOpener:
+        def __init__(self):
+            self.urls: list[str] = []
+
+        def open(self, request, timeout):
+            self.urls.append(request.full_url)
+            return Response()
+
+    opener = RecordingOpener()
+    monkeypatch.setattr(launcher_module, "_NO_PROXY_OPENER", opener)
+    spec = ServiceSpec(
+        name="probe",
+        command=[],
+        health_url="http://127.0.0.1:9999/health",
+    )
+    manager = LaunchManager(
+        root=tmp_path,
+        env=os.environ.copy(),
+        services={"probe": spec},
+    )
+
+    assert manager.probe(spec)
+    assert opener.urls == ["http://127.0.0.1:9999/health"]
+
+
+def test_systemd_units_force_runtime_env_and_prepare_offline():
+    systemd_dir = PROJECT_ROOT / "deploy" / "systemd"
+    hermes = (systemd_dir / "xpd-hermes.service.in").read_text(encoding="utf-8")
+    fastapi = (systemd_dir / "xpd-fastapi.service.in").read_text(encoding="utf-8")
+    prepare = (systemd_dir / "xpd-hermes-prepare.service.in").read_text(
+        encoding="utf-8"
+    )
+
+    preflight = (
+        "ExecStartPre=/usr/bin/env HOME=@SERVICE_HOME@ LAUNCH_MANAGED=true "
+        "XPD_SERVICE_AUTH_ENABLED=true @PROJECT_ROOT@/.venv/bin/python "
+        "-m xpd_report_agent.runtime.deployment_preflight --quiet"
+    )
+    assert preflight in hermes
+    assert preflight in fastapi
+    assert preflight in prepare
+    forced_environment = (
+        "ExecStart=/usr/bin/env HOME=@SERVICE_HOME@ LAUNCH_MANAGED=true "
+        "XPD_SERVICE_AUTH_ENABLED=true"
+    )
+    assert forced_environment in hermes
+    assert forced_environment in fastapi
+    assert (
+        "Conflicts=xpd-report-agent.target xpd-hermes.service xpd-fastapi.service"
+        in prepare
+    )
+    assert "TimeoutStartSec=60min" in prepare
+    assert forced_environment in prepare
 
 
 def test_launch_start_stop_sleep_service(tmp_path):

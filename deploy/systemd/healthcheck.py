@@ -13,8 +13,10 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 def _probe_host(configured_host: str) -> str:
     host = configured_host.strip()
-    if host in {"", "0.0.0.0", "::", "[::]"}:
+    if host in {"", "0.0.0.0"}:
         return "127.0.0.1"
+    if host in {"::", "[::]"}:
+        return "[::1]"
     if ":" in host and not host.startswith("["):
         return f"[{host}]"
     return host

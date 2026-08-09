@@ -11,12 +11,10 @@ StartLimitBurst=10
 Type=simple
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
-Environment=HOME=@SERVICE_HOME@
-Environment=LAUNCH_MANAGED=true
 EnvironmentFile=@ENV_FILE@
-Environment=XPD_SERVICE_AUTH_ENABLED=true
 WorkingDirectory=@PROJECT_ROOT@
-ExecStart=@PROJECT_ROOT@/scripts/services/fastapi.sh run
+ExecStartPre=/usr/bin/env HOME=@SERVICE_HOME@ LAUNCH_MANAGED=true XPD_SERVICE_AUTH_ENABLED=true @PROJECT_ROOT@/.venv/bin/python -m xpd_report_agent.runtime.deployment_preflight --quiet
+ExecStart=/usr/bin/env HOME=@SERVICE_HOME@ LAUNCH_MANAGED=true XPD_SERVICE_AUTH_ENABLED=true @PROJECT_ROOT@/scripts/services/fastapi.sh run
 ExecStartPost=@PROJECT_ROOT@/.venv/bin/python -S @PROJECT_ROOT@/deploy/systemd/healthcheck.py fastapi --timeout-seconds 60
 TimeoutStartSec=90s
 Restart=on-failure

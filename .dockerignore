@@ -1,4 +1,10 @@
 .git
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.env
+**/*.env.*
 .venv
 .run
 .pytest_cache

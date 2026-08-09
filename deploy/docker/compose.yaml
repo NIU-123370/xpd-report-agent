@@ -6,18 +6,27 @@ services:
     image: xpd-report-agent:dev
     container_name: xpd-report-agent
     restart: unless-stopped
+    stop_grace_period: 60s
     env_file:
       - xpd-report-agent.env
     ports:
       - "8000:8000"
     volumes:
+      - hermes-state:/var/lib/xpd-report-agent/.hermes
       - report-files:/app/data/report-files
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8000/ready', timeout=5).close()"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 120s
 
 volumes:
+  hermes-state:
+    name: xpd-report-agent-hermes-state
   report-files:

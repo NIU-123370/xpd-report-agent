@@ -33,11 +33,16 @@
 sudo -u xpd-agent -H bash -lc '
   set -euo pipefail
   mkdir -p "$HOME/.hermes"
-  git clone https://github.com/NousResearch/hermes-agent.git "$HOME/.hermes/hermes-agent"
-  git -C "$HOME/.hermes/hermes-agent" checkout --detach a61183b56fdb45b9d2a0f2f6b8482e665ccf702f
-  uv venv "$HOME/.hermes/hermes-agent/venv" --python 3.11
-  uv pip install --python "$HOME/.hermes/hermes-agent/venv/bin/python" \
-    -e "$HOME/.hermes/hermes-agent"
+  HERMES_AGENT_DIR="$HOME/.hermes/hermes-agent"
+  git init "$HERMES_AGENT_DIR"
+  git -C "$HERMES_AGENT_DIR" remote add origin \
+    https://github.com/NousResearch/hermes-agent.git
+  git -C "$HERMES_AGENT_DIR" fetch --depth 1 origin \
+    a61183b56fdb45b9d2a0f2f6b8482e665ccf702f
+  git -C "$HERMES_AGENT_DIR" checkout --detach FETCH_HEAD
+  UV_PROJECT_ENVIRONMENT="$HERMES_AGENT_DIR/venv" uv sync \
+    --project "$HERMES_AGENT_DIR" --frozen --no-dev --python 3.11
+  uv pip check --python "$HERMES_AGENT_DIR/venv/bin/python"
   "$HOME/.hermes/hermes-agent/venv/bin/hermes" --version
 '
 ```
@@ -52,8 +57,10 @@ sudo -u xpd-agent -H bash -lc '
 sudo -u xpd-agent -H /opt/xpd-report-agent/scripts/services/hermes.sh verify
 ```
 
-复制 `xpd-report-agent.env.example` 到上表的 `@ENV_FILE@`，填入真实的模型、MySQL、
-OSS 和签名密钥。配置文件建议由 `root` 拥有，权限设为 `0640`，且不要放入 Git。
+复制 `deploy/systemd/xpd-report-agent.env.example` 到上表的 `@ENV_FILE@`，填入真实的
+模型、MySQL、OSS 和三个不同的高熵密钥。配置文件建议由 `root` 拥有，服务用户组
+可读，权限设为 `0640`，且不要放入 Git。三个 systemd 单元都会在启动前执行
+`deployment_preflight`，安全配置不完整时会直接失败，不会启动一半可用的服务。
 
 确保以下位置持久化且对 `@SERVICE_USER@` 可写：
 
@@ -84,15 +91,21 @@ PDF 导出会将中文字体子集嵌入文件，避免服务器和下载端出�
 
 ## 3. 首次准备与启动
 
-依赖安装、Hermes 配置或项目 Skill/插件变更后，先单次执行：
+依赖安装、Hermes 配置或项目 Skill/插件变更后，先停止对外服务，再单次执行
+准备单元：
 
 ```bash
 sudo systemctl daemon-reload
+sudo systemctl stop xpd-report-agent.target
 sudo systemctl start xpd-hermes-prepare.service
 sudo systemctl enable --now xpd-report-agent.target
 ```
 
-`xpd-hermes-prepare.service` 是一次性单元，不要 `enable`；这样进程重试时不会反复安装依赖。
+`xpd-hermes-prepare.service` 是一次性单元，不要 `enable`。它与运行中的 target、Hermes
+和 FastAPI 互斥，避免在 Agent 正在执行任务时修改 Hermes venv。上线更新后必须再启动
+target，进程日常重试不会反复安装依赖。准备单元最长允许运行 60 分钟，避免在
+网络较慢时中途终止 frozen sync；应通过 `journalctl -u xpd-hermes-prepare.service -f`
+观察实际进度。
 
 常用运维命令：
 
@@ -109,4 +122,8 @@ sudo systemctl stop xpd-report-agent.target
 
 FastAPI `/health` 返回值还包含 Hermes、MySQL、记忆、报表 OSS 和定时功能等下游就绪状态，应交给监控系统告警。定时功能关闭时会显示 `enabled=false`，不会使健康检查失败。下游故障不应通过无限重启 FastAPI 来处理；systemd 的职责是在进程退出时拉起它。
 
-每个单元在 5 分钟内最多启动 10 次，避免配置错误导致永久重启风暴。触发限制后，修复配置并执行 `systemctl reset-failed xpd-hermes xpd-fastapi`再启动。
+健康检查通过只是必要条件。每次正式发布还应使用中台 Run 接口完成一次真实 RDS
+查询，再生成并下载一个 Excel，确认模型、数据库、报告生成和 OSS 整条链路都可用。
+
+每个单元在 5 分钟内最多启动 10 次，避免配置错误导致永久重启风暴。触发限制后，修复配置并执行
+`systemctl reset-failed xpd-hermes xpd-fastapi` 再启动。
