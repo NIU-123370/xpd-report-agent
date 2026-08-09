@@ -41,17 +41,22 @@ COPY configs/hermes-runtime.lock /app/configs/hermes-runtime.lock
 ENV UV_HTTP_TIMEOUT=300
 
 RUN --mount=type=cache,target=/var/cache/uv \
+    --mount=type=bind,source=deploy/docker/hermes-seed,target=/tmp/hermes-seed,ro \
     uv sync --frozen --no-dev --no-install-project \
     && bash -c 'set -euo pipefail; . configs/hermes-runtime.lock; \
-      git init "$HERMES_AGENT_DIR"; \
-      git -C "$HERMES_AGENT_DIR" remote add origin "$HERMES_AGENT_REPOSITORY"; \
-      for attempt in 1 2 3; do \
-        git -c http.version=HTTP/1.1 -C "$HERMES_AGENT_DIR" fetch \
-          --depth 1 origin "$HERMES_AGENT_COMMIT" && break; \
-        test "$attempt" -lt 3; \
-        sleep 5; \
-      done; \
-      git -C "$HERMES_AGENT_DIR" checkout --detach FETCH_HEAD; \
+      if [ -s /tmp/hermes-seed/hermes-agent.tar ]; then \
+        tar -xf /tmp/hermes-seed/hermes-agent.tar -C /opt; \
+      else \
+        git init "$HERMES_AGENT_DIR"; \
+        git -C "$HERMES_AGENT_DIR" remote add origin "$HERMES_AGENT_REPOSITORY"; \
+        for attempt in 1 2 3; do \
+          git -c http.version=HTTP/1.1 -C "$HERMES_AGENT_DIR" fetch \
+            --depth 1 origin "$HERMES_AGENT_COMMIT" && break; \
+          test "$attempt" -lt 3; \
+          sleep 5; \
+        done; \
+        git -C "$HERMES_AGENT_DIR" checkout --detach FETCH_HEAD; \
+      fi; \
       test "$(git -C "$HERMES_AGENT_DIR" rev-parse HEAD)" = "$HERMES_AGENT_COMMIT"; \
       UV_PROJECT_ENVIRONMENT="$HERMES_AGENT_DIR/venv" uv sync \
         --project "$HERMES_AGENT_DIR" \
