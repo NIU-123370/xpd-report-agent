@@ -34,6 +34,8 @@ def test_dockerfile_keeps_expensive_dependencies_in_a_stable_layer():
     assert dockerfile.count("uv pip check --python") >= 2
     assert "uv pip freeze --python" in dockerfile
     assert "--constraints" in dockerfile
+    assert "git -c http.version=HTTP/1.1" in dockerfile
+    assert "for attempt in 1 2 3" in dockerfile
 
 
 def test_compose_persists_state_and_allows_graceful_shutdown():

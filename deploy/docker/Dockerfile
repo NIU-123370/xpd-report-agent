@@ -42,7 +42,12 @@ RUN --mount=type=cache,target=/var/cache/uv \
     && bash -c 'set -euo pipefail; . configs/hermes-runtime.lock; \
       git init "$HERMES_AGENT_DIR"; \
       git -C "$HERMES_AGENT_DIR" remote add origin "$HERMES_AGENT_REPOSITORY"; \
-      git -C "$HERMES_AGENT_DIR" fetch --depth 1 origin "$HERMES_AGENT_COMMIT"; \
+      for attempt in 1 2 3; do \
+        git -c http.version=HTTP/1.1 -C "$HERMES_AGENT_DIR" fetch \
+          --depth 1 origin "$HERMES_AGENT_COMMIT" && break; \
+        test "$attempt" -lt 3; \
+        sleep 5; \
+      done; \
       git -C "$HERMES_AGENT_DIR" checkout --detach FETCH_HEAD; \
       test "$(git -C "$HERMES_AGENT_DIR" rev-parse HEAD)" = "$HERMES_AGENT_COMMIT"; \
       UV_PROJECT_ENVIRONMENT="$HERMES_AGENT_DIR/venv" uv sync \
