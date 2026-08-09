@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 FROM public.ecr.aws/docker/library/python:3.11-slim AS python311
 
 FROM ghcr.io/astral-sh/uv:0.8.8 AS uv

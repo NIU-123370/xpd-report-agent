@@ -25,6 +25,7 @@ def test_dockerfile_separates_hermes_runtime_from_persistent_state():
 def test_dockerfile_keeps_expensive_dependencies_in_a_stable_layer():
     dockerfile = _read(DOCKER_DIR / "Dockerfile")
 
+    assert "docker.io/docker/dockerfile" not in dockerfile
     dependency_copy = dockerfile.index("COPY pyproject.toml uv.lock /app/")
     source_copy = dockerfile.index("COPY . /app")
     assert dependency_copy < source_copy
