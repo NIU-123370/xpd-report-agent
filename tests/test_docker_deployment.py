@@ -37,14 +37,18 @@ def test_dockerfile_keeps_expensive_dependencies_in_a_stable_layer():
     assert "git -c http.version=HTTP/1.1" in dockerfile
     assert "for attempt in 1 2 3" in dockerfile
     assert "ENV UV_HTTP_TIMEOUT=300" in dockerfile
-    assert "source=deploy/docker/hermes-seed" in dockerfile
-    assert "test \"$(git -C \"$HERMES_AGENT_DIR\" rev-parse HEAD)\"" in dockerfile
+    assert "from=hermes_seed" in dockerfile
+    assert "sha256sum -c hermes-agent.tar.gz.sha256" in dockerfile
+    assert "rev-parse --verify HEAD^{commit}" in dockerfile
 
 
 def test_compose_persists_state_and_allows_graceful_shutdown():
     compose = yaml.safe_load(_read(DOCKER_DIR / "compose.yaml"))
     service = compose["services"]["xpd-report-agent"]
 
+    assert service["build"]["additional_contexts"] == {
+        "hermes_seed": "./hermes-seed"
+    }
     assert service["stop_grace_period"] == "60s"
     assert "hermes-state:/var/lib/xpd-report-agent/.hermes" in service["volumes"]
     assert "report-files:/app/data/report-files" in service["volumes"]
@@ -80,6 +84,8 @@ def test_docker_context_excludes_secret_environment_files():
     }
 
     assert {".env", ".env.*", "**/.env", "**/.env.*", "deploy/docker/*.env"} <= patterns
+    assert "deploy/docker/hermes-seed/*.tar.gz" in patterns
+    assert "deploy/docker/hermes-seed/*.sha256" in patterns
 
 
 def test_docker_environment_template_contains_production_model_and_identity_config():

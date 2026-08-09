@@ -13,6 +13,8 @@
 configs/local.env
 configs/cloud.env
 deploy/docker/*.env
+deploy/docker/hermes-seed/*.tar.gz
+deploy/docker/hermes-seed/*.sha256
 data/report-files
 logs
 outputs

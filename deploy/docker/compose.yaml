@@ -3,6 +3,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+      additional_contexts:
+        hermes_seed: ./hermes-seed
     image: xpd-report-agent:dev
     container_name: xpd-report-agent
     restart: unless-stopped

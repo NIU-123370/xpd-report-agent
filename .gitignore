@@ -148,7 +148,8 @@ configs/local.env
 configs/cloud.env
 deploy/docker/*.env
 !deploy/docker/*.env.example
-deploy/docker/hermes-seed/*.tar
+deploy/docker/hermes-seed/*.tar.gz
+deploy/docker/hermes-seed/*.sha256
 data/*.sqlite
 data/merchant_questions.local.jsonl
 data/report-files/
