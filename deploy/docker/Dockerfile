@@ -37,6 +37,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock /app/
 COPY configs/hermes-runtime.lock /app/configs/hermes-runtime.lock
 
+# Large binary wheels can exceed uv's 30-second default on restricted ECS links.
+ENV UV_HTTP_TIMEOUT=300
+
 RUN --mount=type=cache,target=/var/cache/uv \
     uv sync --frozen --no-dev --no-install-project \
     && bash -c 'set -euo pipefail; . configs/hermes-runtime.lock; \
