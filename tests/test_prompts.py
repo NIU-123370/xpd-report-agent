@@ -17,6 +17,10 @@ def test_wrapper_prompt_owns_global_contract_and_delegates_database_workflow():
     assert "长期记忆" in SYSTEM_PROMPT
     assert "最终回答规则" in SYSTEM_PROMPT
     assert "严格区分“数据事实”“分析推断”“建议动作”" in SYSTEM_PROMPT
+    assert "一级章节必须按“一、”“二、”“三、”依次编号" in SYSTEM_PROMPT
+    assert "章节内的多个要点使用“- ”短条目" in SYSTEM_PROMPT
+    assert "一、核心结论 + 二、关键指标对比" in SYSTEM_PROMPT
+    assert "一、核心结论 + 二、异常定位" in SYSTEM_PROMPT
     assert "用户可见的最终答案中不得输出 SQL" in SYSTEM_PROMPT
     assert "导出文件的“查询审计”工作表" in SYSTEM_PROMPT
     assert "简单查询、对比分析、诊断分析" in SYSTEM_PROMPT
