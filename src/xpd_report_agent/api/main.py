@@ -22,8 +22,10 @@ from xpd_report_agent.api.error_contract import (
     install_error_contract,
     request_id_from_header,
 )
+from xpd_report_agent.api.hermes_routing import probe_hermes_nodes, resolve_hermes_node
 from xpd_report_agent.api.merchant_questions import merchant_question_prompt
 from xpd_report_agent.api.metric_definitions import metric_definition_prompt
+from xpd_report_agent.api.metrics import create_metrics_router
 from xpd_report_agent.api.prompts import REPORT_SYSTEM_PROMPT
 from xpd_report_agent.api.service_auth import (
     authorize_service_request,
@@ -32,6 +34,7 @@ from xpd_report_agent.api.service_auth import (
     service_auth_health,
 )
 from xpd_report_agent.hermes_plugin.db_query.db import connect_readonly
+from xpd_report_agent.hermes_pool import hermes_pool, resolved_hermes_pool
 from xpd_report_agent.paths import PROJECT_ROOT
 from xpd_report_agent.runtime.hermes_clarify import clarify_timeout_seconds
 from xpd_report_agent.runtime.hermes_config import required_memory_tools_from_env
@@ -142,9 +145,7 @@ install_error_contract(app)
 @app.middleware("http")
 async def enforce_service_auth(request: Request, call_next):
     path = request.url.path
-    protected = path.startswith("/api/") and not path.startswith(
-        "/api/internal/scheduled-reports/"
-    )
+    protected = path.startswith("/api/") and not path.startswith("/api/internal/scheduled-reports/")
     if protected:
         try:
             authorize_service_request(request.headers.get("Authorization"))
@@ -160,6 +161,19 @@ async def enforce_service_auth(request: Request, call_next):
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+
+async def _hermes_pool_metrics() -> dict[str, int]:
+    pool = await resolved_hermes_pool()
+    node_health = await probe_hermes_nodes(pool, api_key=hermes_api_key())
+    return {
+        "healthy": sum(
+            1 for node in pool.nodes if bool(node_health.get(node.node_id, {}).get("ok"))
+        ),
+        "total": len(pool.nodes),
+    }
+
+
+app.include_router(create_metrics_router(hermes_provider=_hermes_pool_metrics))
 app.include_router(sessions_router)
 app.include_router(memories_router)
 app.include_router(schedules_router)
@@ -188,9 +202,7 @@ def hermes_base_url() -> str:
 
 
 def hermes_origin() -> str:
-    host = os.getenv("HERMES_GATEWAY_HOST", "127.0.0.1")
-    port = os.getenv("HERMES_GATEWAY_PORT", "8642")
-    return f"http://{host}:{port}"
+    return hermes_pool().primary_node.origin
 
 
 def hermes_api_key() -> str:
@@ -213,9 +225,7 @@ def require_hermes_api_key() -> str:
 
 def build_payload(req: ChatRequest, *, stream: bool) -> dict:
     history = [
-        message.model_dump()
-        for message in req.history
-        if message.role in {"user", "assistant"}
+        message.model_dump() for message in req.history if message.role in {"user", "assistant"}
     ]
     system_prompt = SYSTEM_PROMPT
     if analysis_prompt := analysis_output_contract_prompt(req.message):
@@ -307,14 +317,45 @@ async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/live")
+async def live() -> dict[str, bool]:
+    """Process-only liveness check with no downstream network dependency."""
+
+    return {"ok": True}
+
+
 @app.get("/health")
 async def health() -> dict:
+    pool = None
+    discovery_error = None
+    try:
+        pool = await resolved_hermes_pool()
+    except Exception as exc:
+        discovery_error = f"{type(exc).__name__}: {exc}"
+    nodes = pool.nodes if pool is not None else ()
     result = {
         "ok": False,
-        "hermes_base_url": hermes_base_url(),
+        "hermes_base_url": pool.primary_node.base_url if pool is not None else None,
         "hermes_api_key_configured": bool(hermes_api_key()),
         "service_auth": service_auth_health(),
-        "hermes": {"ok": False, "status_code": None, "error": None},
+        "hermes": {
+            "ok": False,
+            "status_code": None,
+            "error": None,
+            "healthy_nodes": 0,
+            "total_nodes": len(nodes),
+            "degraded": False,
+            "nodes": [
+                {
+                    "node_id": node.node_id,
+                    "origin": node.origin,
+                    "ok": False,
+                    "status_code": None,
+                    "error": None,
+                }
+                for node in nodes
+            ],
+        },
         "agent_runs": agent_run_health(),
         "memory_consolidation": memory_consolidation_health(),
         "db_query": {
@@ -365,6 +406,16 @@ async def health() -> dict:
         },
     }
 
+    if pool is None:
+        message = discovery_error or "Hermes service discovery is unavailable."
+        result["hermes"]["error"] = message
+        result["db_query"]["error"] = message
+        result["memory"]["error"] = message
+        result["clarify"]["error"] = message
+        result["report_files"]["error"] = message
+        result["cron"]["error"] = message
+        return result
+
     if not hermes_api_key():
         result["hermes"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
         result["db_query"]["error"] = "HERMES_GATEWAY_API_KEY is not set"
@@ -376,18 +427,46 @@ async def health() -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
-            response = await client.get(
-                f"{hermes_base_url()}/health",
-                headers={"Authorization": f"Bearer {hermes_api_key()}"},
+            auth_headers = {"Authorization": f"Bearer {hermes_api_key()}"}
+            node_responses = await asyncio.gather(
+                *(
+                    client.get(f"{node.base_url}/health", headers=auth_headers)
+                    for node in pool.nodes
+                ),
+                return_exceptions=True,
             )
-            result["hermes"]["status_code"] = response.status_code
-            result["hermes"]["ok"] = response.is_success
-            if not response.is_success:
-                result["hermes"]["error"] = response.text[:500]
+            healthy_nodes = []
+            for node, node_response, node_health in zip(
+                pool.nodes,
+                node_responses,
+                result["hermes"]["nodes"],
+                strict=True,
+            ):
+                if isinstance(node_response, Exception):
+                    node_health["error"] = type(node_response).__name__
+                    continue
+                node_health["status_code"] = node_response.status_code
+                node_health["ok"] = node_response.is_success
+                if node_response.is_success:
+                    healthy_nodes.append(node)
+                else:
+                    node_health["error"] = node_response.text[:500]
+
+            result["hermes"]["healthy_nodes"] = len(healthy_nodes)
+            result["hermes"]["ok"] = bool(healthy_nodes)
+            result["hermes"]["degraded"] = bool(
+                healthy_nodes and len(healthy_nodes) < len(pool.nodes)
+            )
+            primary_health = result["hermes"]["nodes"][0]
+            result["hermes"]["status_code"] = primary_health["status_code"]
+            if not healthy_nodes:
+                result["hermes"]["error"] = "No Hermes node passed its health check."
+                raise RuntimeError(result["hermes"]["error"])
+            capability_node = healthy_nodes[0]
 
             toolsets_response = await client.get(
-                f"{hermes_base_url()}/toolsets",
-                headers={"Authorization": f"Bearer {hermes_api_key()}"},
+                f"{capability_node.base_url}/toolsets",
+                headers=auth_headers,
             )
             result["db_query"]["toolsets_status_code"] = toolsets_response.status_code
             result["clarify"]["toolsets_status_code"] = toolsets_response.status_code
@@ -395,19 +474,17 @@ async def health() -> dict:
             if toolsets_response.is_success:
                 available_tools = extract_available_db_tools(toolsets_response.json())
                 missing_tools = [
-                    tool_name
-                    for tool_name in REQUIRED_DB_TOOLS
-                    if tool_name not in available_tools
+                    tool_name for tool_name in REQUIRED_DB_TOOLS if tool_name not in available_tools
                 ]
                 result["db_query"]["available_tools"] = available_tools
                 result["db_query"]["missing_tools"] = missing_tools
                 result["db_query"]["ok"] = not missing_tools
                 if missing_tools:
-                    result["db_query"]["error"] = "Required db-query tools are not exposed by Hermes API Server."
+                    result["db_query"]["error"] = (
+                        "Required db-query tools are not exposed by Hermes API Server."
+                    )
 
-                available_memory_tools = extract_available_memory_tools(
-                    toolsets_response.json()
-                )
+                available_memory_tools = extract_available_memory_tools(toolsets_response.json())
                 missing_memory_tools = [
                     tool_name
                     for tool_name in REQUIRED_MEMORY_TOOLS
@@ -418,13 +495,10 @@ async def health() -> dict:
                 result["memory"]["ok"] = not missing_memory_tools
                 if missing_memory_tools:
                     result["memory"]["error"] = (
-                        "Required session_search/memory tools are not exposed by "
-                        "Hermes API Server."
+                        "Required session_search/memory tools are not exposed by Hermes API Server."
                     )
 
-                available_clarify_tools = extract_available_clarify_tools(
-                    toolsets_response.json()
-                )
+                available_clarify_tools = extract_available_clarify_tools(toolsets_response.json())
                 missing_clarify_tools = [
                     tool_name
                     for tool_name in REQUIRED_CLARIFY_TOOLS
@@ -458,8 +532,8 @@ async def health() -> dict:
                 result["report_files"]["error"] = toolsets_response.text[:500]
 
             clarify_response = await client.get(
-                f"{hermes_origin()}/api/clarifications/health",
-                headers={"Authorization": f"Bearer {hermes_api_key()}"},
+                f"{capability_node.origin}/api/clarifications/health",
+                headers=auth_headers,
             )
             result["clarify"]["patch_status_code"] = clarify_response.status_code
             if clarify_response.is_success:
@@ -473,15 +547,13 @@ async def health() -> dict:
                     and clarify_health.get("enabled")
                 )
                 if not result["clarify"]["ok"] and result["clarify"]["error"] is None:
-                    result["clarify"]["error"] = (
-                        "Hermes clarify runtime bridge is not ready."
-                    )
+                    result["clarify"]["error"] = "Hermes clarify runtime bridge is not ready."
             elif result["clarify"]["error"] is None:
                 result["clarify"]["error"] = clarify_response.text[:500]
 
             report_file_response = await client.get(
-                f"{hermes_origin()}/api/report-files/health",
-                headers={"Authorization": f"Bearer {hermes_api_key()}"},
+                f"{capability_node.origin}/api/report-files/health",
+                headers=auth_headers,
             )
             result["report_files"]["patch_status_code"] = report_file_response.status_code
             if report_file_response.is_success:
@@ -494,10 +566,7 @@ async def health() -> dict:
                     and patch_health.get("storage_configured")
                     and patch_health.get("storage_writable")
                 )
-                if (
-                    not result["report_files"]["ok"]
-                    and result["report_files"]["error"] is None
-                ):
+                if not result["report_files"]["ok"] and result["report_files"]["error"] is None:
                     result["report_files"]["error"] = (
                         "Hermes report file runtime bridge is not ready."
                     )
@@ -506,8 +575,8 @@ async def health() -> dict:
 
             if schedules_enabled():
                 cron_response = await client.get(
-                    f"{hermes_origin()}/api/xpd-cron/health",
-                    headers={"Authorization": f"Bearer {hermes_api_key()}"},
+                    f"{pool.scheduler_node.origin}/api/xpd-cron/health",
+                    headers=auth_headers,
                 )
                 result["cron"]["patch_status_code"] = cron_response.status_code
                 if cron_response.is_success:
@@ -520,19 +589,13 @@ async def health() -> dict:
                                 and cron_health.get("native")
                             ),
                             "enabled": True,
-                            "timezone": cron_health.get(
-                                "timezone", result["cron"]["timezone"]
-                            ),
+                            "timezone": cron_health.get("timezone", result["cron"]["timezone"]),
                             "ticker_alive": bool(cron_health.get("ticker_alive")),
-                            "ticker_interval_seconds": cron_health.get(
-                                "ticker_interval_seconds"
-                            ),
+                            "ticker_interval_seconds": cron_health.get("ticker_interval_seconds"),
                         }
                     )
                     if not result["cron"]["ok"]:
-                        result["cron"]["error"] = (
-                            "Hermes native cron bridge is not ready."
-                        )
+                        result["cron"]["error"] = "Hermes native cron bridge is not ready."
                 else:
                     result["cron"]["error"] = cron_response.text[:500]
     except Exception as exc:
@@ -579,6 +642,8 @@ def _mysql_readiness_check() -> dict:
         if connection is not None:
             with suppress(Exception):
                 connection.close()
+
+
 @app.get(
     "/ready",
     response_model=ReadinessResponse,
@@ -608,12 +673,16 @@ async def chat(req: ChatRequest, response: Response) -> dict:
     )
     key = require_hermes_api_key()
     payload = build_payload(req, stream=False)
+    node = await resolve_hermes_node(
+        "/v1/chat/completions",
+        api_key=key,
+    )
 
     try:
         async with agent_capacity_slot():
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 response = await client.post(
-                    f"{hermes_base_url()}/chat/completions",
+                    f"{node.base_url}/chat/completions",
                     headers={
                         "Authorization": f"Bearer {key}",
                         "Content-Type": "application/json",
@@ -648,6 +717,10 @@ async def chat(req: ChatRequest, response: Response) -> dict:
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     key = require_hermes_api_key()
     payload = build_payload(req, stream=True)
+    node = await resolve_hermes_node(
+        "/v1/chat/completions",
+        api_key=key,
+    )
 
     async def events():
         try:
@@ -655,7 +728,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     async with client.stream(
                         "POST",
-                        f"{hermes_base_url()}/chat/completions",
+                        f"{node.base_url}/chat/completions",
                         headers={
                             "Authorization": f"Bearer {key}",
                             "Content-Type": "application/json",

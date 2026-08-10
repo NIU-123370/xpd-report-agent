@@ -31,6 +31,17 @@ def _write_command_stub(path: Path) -> None:
     path.chmod(0o755)
 
 
+def _write_flock_stub(path: Path) -> None:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import fcntl\n"
+        "import sys\n"
+        "fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def _stage_hermes_service(
     tmp_path: Path,
     *,
@@ -65,6 +76,7 @@ def _stage_hermes_service(
     bin_dir.mkdir()
     for name in ("project-python", "hermes-python", "hermes", "uv"):
         _write_command_stub(bin_dir / name)
+    _write_flock_stub(bin_dir / "flock")
     (bin_dir / "hermes").write_text(
         (bin_dir / "hermes").read_text(encoding="utf-8")
         + 'if [ "${1:-}" = "--version" ]; then\n'
@@ -79,6 +91,7 @@ def _stage_hermes_service(
     env.update(
         {
             "HOME": str(home),
+            "HERMES_HOME": str(home / ".hermes"),
             "LAUNCH_MANAGED": "true",
             "PROJECT_PYTHON": str(bin_dir / "project-python"),
             "HERMES_PY": str(bin_dir / "hermes-python"),
@@ -110,7 +123,7 @@ def test_hermes_service_run_does_not_bootstrap_by_default(tmp_path):
 
     assert call_log.read_text(encoding="utf-8").splitlines() == [
         "hermes|--version",
-        "project-python|scripts/configure_hermes.py",
+        (f"project-python|scripts/configure_hermes.py|--config|{env['HERMES_HOME']}/config.yaml"),
         "hermes|gateway|run|--external-supervisor",
     ]
 
@@ -132,7 +145,7 @@ def test_hermes_service_run_preserves_explicit_bootstrap(tmp_path):
     assert calls[4].endswith("|--group|hermes-plugin")
     assert calls[5].startswith("uv|pip|check|--python|")
     assert calls[6:] == [
-        "project-python|scripts/configure_hermes.py",
+        (f"project-python|scripts/configure_hermes.py|--config|{env['HERMES_HOME']}/config.yaml"),
         "hermes|plugins|enable|db-query",
         "hermes|gateway|run|--external-supervisor",
     ]
@@ -172,9 +185,101 @@ def test_hermes_service_supports_explicit_agent_directory(tmp_path):
 
     assert call_log.read_text(encoding="utf-8").splitlines() == [
         "hermes|--version",
-        "project-python|scripts/configure_hermes.py",
+        (f"project-python|scripts/configure_hermes.py|--config|{env['HERMES_HOME']}/config.yaml"),
         "hermes|gateway|run|--external-supervisor",
     ]
+
+
+def test_hermes_stateful_worker_forces_cron_off(tmp_path):
+    script, env, _call_log = _stage_hermes_service(tmp_path)
+    role_log = tmp_path / "node-role.log"
+    env.update(
+        {
+            "XPD_HERMES_NODE_ID": "hermes-2",
+            "XPD_HERMES_SCHEDULER_NODE": "hermes-0",
+            "XPD_HERMES_CRON_PATCH": "true",
+            "XPD_SCHEDULES_ENABLED": "true",
+            "XPD_TEST_NODE_ROLE_LOG": str(role_log),
+        }
+    )
+    project_python = Path(env["PROJECT_PYTHON"])
+    project_python.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s|%s|%s" "$XPD_HERMES_NODE_ID" '
+        '"$XPD_HERMES_CRON_PATCH" "$XPD_SCHEDULES_ENABLED" '
+        '> "$XPD_TEST_NODE_ROLE_LOG"\n',
+        encoding="utf-8",
+    )
+    project_python.chmod(0o755)
+
+    _run_hermes_service(script, env)
+
+    assert role_log.read_text(encoding="utf-8") == "hermes-2|false|false"
+
+
+def test_hermes_service_serializes_shared_home_configuration(tmp_path):
+    script, env, _call_log = _stage_hermes_service(tmp_path)
+    shared_home = tmp_path / "shared hermes home"
+    env["HERMES_HOME"] = str(shared_home)
+    env["HERMES_BOOTSTRAP_ON_START"] = "true"
+    guard_dir = tmp_path / "configure.guard"
+    overlap_log = tmp_path / "configure.overlap"
+    configure_log = tmp_path / "configure.log"
+    env.update(
+        {
+            "XPD_TEST_CONFIGURE_GUARD": str(guard_dir),
+            "XPD_TEST_CONFIGURE_OVERLAP": str(overlap_log),
+            "XPD_TEST_CONFIGURE_LOG": str(configure_log),
+        }
+    )
+    project_python = Path(env["PROJECT_PYTHON"])
+    project_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'if ! mkdir "$XPD_TEST_CONFIGURE_GUARD" 2>/dev/null; then\n'
+        '  printf "overlap\\n" >> "$XPD_TEST_CONFIGURE_OVERLAP"\n'
+        "  exit 90\n"
+        "fi\n"
+        'printf "configured\\n" >> "$XPD_TEST_CONFIGURE_LOG"\n',
+        encoding="utf-8",
+    )
+    project_python.chmod(0o755)
+    hermes_bin = Path(env["HERMES_BIN"])
+    hermes_bin.write_text(
+        hermes_bin.read_text(encoding="utf-8")
+        + 'if [ "${1:-}" = "plugins" ] && [ "${2:-}" = "enable" ]; then\n'
+        + '  if [ ! -d "$XPD_TEST_CONFIGURE_GUARD" ]; then\n'
+        + '    printf "plugin-outside-lock\\n" >> "$XPD_TEST_CONFIGURE_OVERLAP"\n'
+        + "    exit 91\n"
+        + "  fi\n"
+        + "  sleep 0.2\n"
+        + '  rmdir "$XPD_TEST_CONFIGURE_GUARD"\n'
+        + "fi\n",
+        encoding="utf-8",
+    )
+
+    processes = [
+        subprocess.Popen(
+            ["bash", str(script), "run"],
+            cwd=script.parents[2],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    results = [process.communicate(timeout=10) for process in processes]
+
+    assert [process.returncode for process in processes] == [0, 0], results
+    assert not overlap_log.exists()
+    assert configure_log.read_text(encoding="utf-8").splitlines() == [
+        "configured",
+        "configured",
+    ]
+    assert (shared_home / ".xpd-bootstrap.lock").is_file()
+    assert (shared_home / "plugins" / "db-query" / "plugin.yaml").is_file()
+    assert (shared_home / "skills" / "db-multitable-query" / "SKILL.md").is_file()
 
 
 def test_hermes_service_process_xpd_db_alias_overrides_file_mysql_name(tmp_path):

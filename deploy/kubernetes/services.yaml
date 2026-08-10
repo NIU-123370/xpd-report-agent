@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-headless
+  namespace: xpd-report-agent
+  labels:
+    app.kubernetes.io/name: hermes
+    app.kubernetes.io/part-of: xpd-report-agent
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: hermes
+    app.kubernetes.io/part-of: xpd-report-agent
+  ports:
+    - name: http
+      port: 8642
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xpd-report-agent
+  namespace: xpd-report-agent
+  annotations:
+    service.beta.kubernetes.io/alibaba-cloud-loadbalancer-address-type: intranet
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8000"
+  labels:
+    app.kubernetes.io/name: xpd-report-agent
+    app.kubernetes.io/part-of: xpd-report-agent
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: xpd-report-agent
+    app.kubernetes.io/part-of: xpd-report-agent
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

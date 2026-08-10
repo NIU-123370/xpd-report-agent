@@ -1,0 +1,49 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hermes
+  namespace: xpd-report-agent
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: hermes
+  minReplicas: 2
+  maxReplicas: 10
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 1800
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+        - type: Percent
+          value: 25
+          periodSeconds: 300
+  metrics:
+    # 主指标：活跃任务与等待任务之和，按每个 Hermes 约 7 个计算副本数。
+    - type: External
+      external:
+        metric:
+          name: xpd_agent_demand
+        target:
+          type: AverageValue
+          averageValue: "7"
+    # 兜底指标：自定义指标异常时，CPU 过载仍然可以触发扩容。
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65

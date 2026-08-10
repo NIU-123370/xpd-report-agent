@@ -1,0 +1,256 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xpd-report-agent
+  namespace: xpd-report-agent
+  labels:
+    app.kubernetes.io/name: xpd-report-agent
+    app.kubernetes.io/part-of: xpd-report-agent
+spec:
+  replicas: 1
+  strategy:
+    # FastAPI owns process-local queues and recovery workers. Recreate keeps the
+    # production invariant of exactly one scheduler during an application release.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: xpd-report-agent
+      app.kubernetes.io/part-of: xpd-report-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: xpd-report-agent
+        app.kubernetes.io/part-of: xpd-report-agent
+    spec:
+      serviceAccountName: xpd-report-agent
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        xpd-report-agent: "true"
+      containers:
+        - name: fastapi
+          image: REPLACE_FASTAPI_IMAGE:REPLACE_TAG
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: xpd-report-agent-config
+            - secretRef:
+                name: xpd-report-agent-secrets
+          env:
+            - name: XPD_CONTAINER_ROLE
+              value: fastapi
+            - name: XPD_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HERMES_GATEWAY_HOST
+              value: hermes-0.hermes-headless
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          startupProbe:
+            httpGet:
+              path: /live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: hermes-state
+              mountPath: /var/lib/xpd-report-agent/.hermes
+            - name: report-files
+              mountPath: /app/data/report-files
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: hermes-state
+          persistentVolumeClaim:
+            claimName: hermes-state
+        - name: report-files
+          persistentVolumeClaim:
+            claimName: report-files
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hermes
+  namespace: xpd-report-agent
+  labels:
+    app.kubernetes.io/name: hermes
+    app.kubernetes.io/part-of: xpd-report-agent
+spec:
+  serviceName: hermes-headless
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hermes
+      app.kubernetes.io/part-of: xpd-report-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hermes
+        app.kubernetes.io/part-of: xpd-report-agent
+    spec:
+      serviceAccountName: default
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 420
+      nodeSelector:
+        xpd-report-agent: "true"
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: xpd-report-agent
+                  app.kubernetes.io/part-of: xpd-report-agent
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: hermes
+          image: REPLACE_HERMES_IMAGE:REPLACE_TAG
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              if [ "$POD_NAME" = "$XPD_HERMES_SCHEDULER_NODE" ]; then
+                export XPD_HERMES_CRON_PATCH="$XPD_SCHEDULES_ENABLED"
+              else
+                export XPD_HERMES_CRON_PATCH=false
+                export XPD_SCHEDULES_ENABLED=false
+              fi
+              exec /app/deploy/docker/entrypoint.sh
+          envFrom:
+            - configMapRef:
+                name: xpd-report-agent-config
+            - secretRef:
+                name: xpd-report-agent-secrets
+          env:
+            - name: XPD_CONTAINER_ROLE
+              value: hermes
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: XPD_HERMES_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: XPD_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: http
+              containerPort: 8642
+              protocol: TCP
+          startupProbe:
+            exec:
+              command:
+                - /app/.venv/bin/python
+                - -c
+                - >-
+                  import os, urllib.request;
+                  r=urllib.request.Request('http://127.0.0.1:8642/v1/health',
+                  headers={'Authorization':'Bearer '+os.environ['HERMES_GATEWAY_API_KEY']});
+                  urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=5).close()
+            periodSeconds: 10
+            timeoutSeconds: 6
+            failureThreshold: 18
+          readinessProbe:
+            exec:
+              command:
+                - /app/.venv/bin/python
+                - -c
+                - >-
+                  import os, urllib.request;
+                  r=urllib.request.Request('http://127.0.0.1:8642/v1/health',
+                  headers={'Authorization':'Bearer '+os.environ['HERMES_GATEWAY_API_KEY']});
+                  urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=5).close()
+            periodSeconds: 10
+            timeoutSeconds: 6
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - /app/.venv/bin/python
+                - -c
+                - >-
+                  import os, urllib.request;
+                  r=urllib.request.Request('http://127.0.0.1:8642/v1/health',
+                  headers={'Authorization':'Bearer '+os.environ['HERMES_GATEWAY_API_KEY']});
+                  urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=5).close()
+            periodSeconds: 30
+            timeoutSeconds: 6
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          lifecycle:
+            preStop:
+              exec:
+                # EndpointSlice marks this Pod terminating before SIGTERM. The
+                # delay gives in-flight HTTP work time to finish while FastAPI
+                # stops assigning new work and migrates durable sticky routes.
+                command: ["/bin/sh", "-c", "sleep 300"]
+          volumeMounts:
+            - name: hermes-state
+              mountPath: /var/lib/xpd-report-agent/.hermes
+            - name: report-files
+              mountPath: /app/data/report-files
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: hermes-state
+          persistentVolumeClaim:
+            claimName: hermes-state
+        - name: report-files
+          persistentVolumeClaim:
+            claimName: report-files

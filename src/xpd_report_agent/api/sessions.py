@@ -47,6 +47,10 @@ from xpd_report_agent.api.error_contract import (
     api_error,
     documented_error_responses,
 )
+from xpd_report_agent.api.hermes_routing import (
+    forget_session_route,
+    resolve_hermes_node,
+)
 from xpd_report_agent.api.memory_consolidation import (
     MemoryConsolidationManager,
     memory_consolidation_enabled,
@@ -112,9 +116,7 @@ _active_chat_lock = threading.Lock()
 _active_chat_sessions: set[str] = set()
 _agent_run_tasks: dict[str, asyncio.Task[None]] = {}
 _agent_run_event_lock = threading.RLock()
-_agent_run_events: dict[
-    str, list[tuple[int, str, dict[str, Any], str | None]]
-] = {}
+_agent_run_events: dict[str, list[tuple[int, str, dict[str, Any], str | None]]] = {}
 _MAX_SSE_EVENT_ID = (2**53) - 1
 # Time-seeded, process-global IDs remain monotonic without retaining one
 # counter per historical run.  Gaps are valid SSE IDs and make a rebuilt
@@ -272,12 +274,6 @@ def _env_enabled(name: str, default: bool = True) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def hermes_origin() -> str:
-    host = os.getenv("HERMES_GATEWAY_HOST", "127.0.0.1")
-    port = os.getenv("HERMES_GATEWAY_PORT", "8642")
-    return f"http://{host}:{port}"
-
-
 def hermes_api_key() -> str:
     key = os.getenv("HERMES_GATEWAY_API_KEY", "")
     if not key:
@@ -289,9 +285,7 @@ def memory_capacity_notice(scope: str | None = None) -> str:
     user_scoped = configured_identity_mode() == IDENTITY_MODE_USER_ID
     policy = memory_policy()
     memory_states = personal_memory_states(scope or "")
-    states = [
-        f"{state.filename}={state.used_chars}/{state.limit_chars}" for state in memory_states
-    ]
+    states = [f"{state.filename}={state.used_chars}/{state.limit_chars}" for state in memory_states]
     if any(state.at_critical for state in memory_states):
         instruction = (
             f"已达到 {policy.critical_ratio:.0%} 临界水位：暂停新增，只允许压缩、替换和删除；"
@@ -425,6 +419,7 @@ def _raise_upstream(
     action: str,
     *,
     outcome_unknown: bool = False,
+    node_id: str | None = None,
 ) -> None:
     if response.is_success:
         return
@@ -471,6 +466,7 @@ def _raise_upstream(
         retryable=retryable,
         outcome_unknown=outcome_unknown and retryable,
         upstream_status=upstream_status,
+        node_id=node_id,
         body=body,
     )
 
@@ -507,6 +503,13 @@ async def _hermes_json(
     timeout: float | None = 15.0,
     action: str,
 ) -> dict[str, Any]:
+    api_key = hermes_api_key()
+    node = await resolve_hermes_node(
+        path,
+        scope=scope,
+        payload=payload,
+        api_key=api_key,
+    )
     attempts = _hermes_connect_attempts()
     safe_retry = _safe_http_retry(method)
     response: httpx.Response | None = None
@@ -515,8 +518,11 @@ async def _hermes_json(
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 response = await client.request(
                     method,
-                    f"{hermes_origin()}{path}",
-                    headers=_hermes_headers(scope),
+                    f"{node.origin}{path}",
+                    headers={
+                        **_hermes_headers(scope),
+                        "X-XPD-Hermes-Node": node.node_id,
+                    },
                     json=payload,
                 )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
@@ -533,6 +539,7 @@ async def _hermes_json(
                 retryable=True,
                 outcome_unknown=False,
                 attempts=attempt,
+                node_id=node.node_id,
             ) from exc
         except httpx.TimeoutException as exc:
             if safe_retry and attempt < attempts:
@@ -545,6 +552,7 @@ async def _hermes_json(
                 retryable=True,
                 outcome_unknown=not safe_retry,
                 attempts=attempt,
+                node_id=node.node_id,
             ) from exc
         except httpx.HTTPError as exc:
             if safe_retry and attempt < attempts:
@@ -557,6 +565,7 @@ async def _hermes_json(
                 retryable=True,
                 outcome_unknown=not safe_retry,
                 attempts=attempt,
+                node_id=node.node_id,
             ) from exc
 
         if response.status_code in {429, 502, 503, 504} and safe_retry and attempt < attempts:
@@ -566,7 +575,12 @@ async def _hermes_json(
 
     if response is None:  # pragma: no cover - loop always returns or raises
         raise RuntimeError("Hermes request produced no response.")
-    _raise_upstream(response, action, outcome_unknown=not safe_retry)
+    _raise_upstream(
+        response,
+        action,
+        outcome_unknown=not safe_retry,
+        node_id=node.node_id,
+    )
     if not response.content:
         return {}
     return response.json()
@@ -574,9 +588,7 @@ async def _hermes_json(
 
 async def _get_session(session_id: str, scope: str) -> dict[str, Any]:
     require_owned_session(session_id, scope)
-    payload = await _hermes_json(
-        "GET", f"/api/sessions/{session_id}", action="read session"
-    )
+    payload = await _hermes_json("GET", f"/api/sessions/{session_id}", action="read session")
     return payload.get("session") or {}
 
 
@@ -725,9 +737,7 @@ class _PrivateProtocolDeltaFilter:
             if self._private_end is not None:
                 end_at = self._buffer.find(self._private_end)
                 if end_at < 0:
-                    keep = _longest_private_marker_prefix(
-                        self._buffer, (self._private_end,)
-                    )
+                    keep = _longest_private_marker_prefix(self._buffer, (self._private_end,))
                     self._buffer = self._buffer[-keep:] if keep else ""
                     break
                 self._buffer = self._buffer[end_at + len(self._private_end) :]
@@ -740,9 +750,7 @@ class _PrivateProtocolDeltaFilter:
                 if self._buffer.find(start) >= 0
             ]
             if opening:
-                start_at, start_marker, end_marker = min(
-                    opening, key=lambda match: match[0]
-                )
+                start_at, start_marker, end_marker = min(opening, key=lambda match: match[0])
                 visible.append(self._buffer[:start_at])
                 self._buffer = self._buffer[start_at + len(start_marker) :]
                 self._private_end = end_marker
@@ -804,6 +812,12 @@ async def _submit_agent_run_stream(
     buffer = ""
     completed = False
     protocol_filter = _PrivateProtocolDeltaFilter()
+    stream_path = _session_turn_path(session_id, stream=True)
+    node = await resolve_hermes_node(
+        stream_path,
+        scope=scope,
+        api_key=hermes_api_key(),
+    )
 
     def publish_answer_delta(delta: str) -> None:
         visible = protocol_filter.feed(delta)
@@ -905,8 +919,11 @@ async def _submit_agent_run_stream(
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             async with client.stream(
                 "POST",
-                f"{hermes_origin()}{_session_turn_path(session_id, stream=True)}",
-                headers=_hermes_headers(scope),
+                f"{node.origin}{stream_path}",
+                headers={
+                    **_hermes_headers(scope),
+                    "X-XPD-Hermes-Node": node.node_id,
+                },
                 json=_session_turn_payload(
                     scope=scope,
                     message=message,
@@ -916,7 +933,12 @@ async def _submit_agent_run_stream(
             ) as response:
                 if not response.is_success:
                     await response.aread()
-                    _raise_upstream(response, "run agent analysis", outcome_unknown=True)
+                    _raise_upstream(
+                        response,
+                        "run agent analysis",
+                        outcome_unknown=True,
+                        node_id=node.node_id,
+                    )
                 async for chunk in response.aiter_text():
                     if not chunk:
                         continue
@@ -1051,9 +1073,7 @@ def _agent_run_events_after(
     with _agent_run_event_lock:
         return [
             (event_id, event, dict(payload))
-            for event_id, event, payload, _dedupe_key in _agent_run_events.get(
-                run_id, []
-            )
+            for event_id, event, payload, _dedupe_key in _agent_run_events.get(run_id, [])
             if event_id > last_event_id
         ]
 
@@ -1067,11 +1087,8 @@ def _buffered_agent_answer(run_id: str, attempt_count: int) -> str:
     with _agent_run_event_lock:
         return "".join(
             str(payload.get("delta") or "")
-            for _event_id, event, payload, _dedupe_key in _agent_run_events.get(
-                run_id, []
-            )
-            if event == "answer.delta"
-            and int(payload.get("attempt_count") or 0) == attempt_count
+            for _event_id, event, payload, _dedupe_key in _agent_run_events.get(run_id, [])
+            if event == "answer.delta" and int(payload.get("attempt_count") or 0) == attempt_count
         )
 
 
@@ -1099,11 +1116,7 @@ def _artifact_ids(session_id: str) -> set[str]:
 
 
 def _artifact_ready_event(artifact: dict[str, Any]) -> str:
-    return (
-        "event: artifact.ready\ndata: "
-        + json.dumps(artifact, ensure_ascii=False)
-        + "\n\n"
-    )
+    return "event: artifact.ready\ndata: " + json.dumps(artifact, ensure_ascii=False) + "\n\n"
 
 
 _SSE_EVENT_BOUNDARY = re.compile(r"\r\n\r\n|\n\n|\r\r")
@@ -1264,9 +1277,7 @@ def _agent_outcome_reconcile_seconds() -> float:
 
 def _final_reflection_timeout_seconds() -> float:
     try:
-        configured = float(
-            os.getenv("XPD_FINAL_REFLECTION_TIMEOUT_SECONDS", "180")
-        )
+        configured = float(os.getenv("XPD_FINAL_REFLECTION_TIMEOUT_SECONDS", "180"))
     except (TypeError, ValueError):
         configured = 180.0
     return max(30.0, min(600.0, configured))
@@ -1313,17 +1324,14 @@ def _run_error(exc: Exception, request_id: str) -> dict[str, Any]:
 
 def _new_run_artifacts(record: dict[str, Any]) -> list[dict[str, Any]]:
     existing = {
-        str(artifact_id)
-        for artifact_id in (record.get("checkpoint") or {}).get("artifact_ids", [])
+        str(artifact_id) for artifact_id in (record.get("checkpoint") or {}).get("artifact_ids", [])
     }
     try:
         artifacts = list_session_artifacts(str(record["session_id"]))
     except (OSError, ValueError):
         return []
     return [
-        artifact
-        for artifact in artifacts
-        if str(artifact.get("artifact_id") or "") not in existing
+        artifact for artifact in artifacts if str(artifact.get("artifact_id") or "") not in existing
     ]
 
 
@@ -1507,9 +1515,7 @@ async def _result_from_hermes_payload(
         recovered=False,
     )
     if outcome.get("status") == "succeeded":
-        outcome["result"]["session_id"] = str(
-            raw.get("session_id") or record["session_id"]
-        )
+        outcome["result"]["session_id"] = str(raw.get("session_id") or record["session_id"])
     return outcome
 
 
@@ -1707,7 +1713,7 @@ async def _execute_agent_run_exclusive(run_id: str, scope: str) -> None:
 
             try:
                 # Keep the durable run pending while it waits for one of the
-                # two global analysis slots. The submission checkpoint is set
+                # global analysis slots. The submission checkpoint is set
                 # only after capacity is acquired, so a restart cannot mistake
                 # a queued request for an unknown Hermes outcome.
                 async with agent_capacity_slot():
@@ -1722,9 +1728,7 @@ async def _execute_agent_run_exclusive(run_id: str, scope: str) -> None:
                             "attempt_count": int(record.get("attempt_count") or 0),
                             "step": "正在查询数据并进行分析",
                         },
-                        dedupe_key=(
-                            f"status:{int(record.get('attempt_count') or 0)}:running"
-                        ),
+                        dedupe_key=(f"status:{int(record.get('attempt_count') or 0)}:running"),
                     )
                     session = await _get_session(session_id, scope)
                     if session.get("ended_at"):
@@ -1738,16 +1742,18 @@ async def _execute_agent_run_exclusive(run_id: str, scope: str) -> None:
                         scope=scope,
                         title_message=str(record["request"]["message"]),
                         raw_user_id=str(
-                            (record.get("checkpoint") or {}).get("report_uid")
-                            or scope
+                            (record.get("checkpoint") or {}).get("report_uid") or scope
                         ),
                         trace_id=str(record["request_id"]),
                     )
-                    record = agent_run_store.update_checkpoint(
-                        run_id,
-                        scope,
-                        upstream_submission_started=True,
-                    ) or record
+                    record = (
+                        agent_run_store.update_checkpoint(
+                            run_id,
+                            scope,
+                            upstream_submission_started=True,
+                        )
+                        or record
+                    )
                     submission_message = _agent_run_submission_message(record)
                     raw = await _submit_agent_run_stream(
                         run_id,
@@ -1821,9 +1827,7 @@ async def _execute_agent_run(run_id: str, scope: str) -> None:
         session_id = str(record["session_id"])
         with agent_run_store.execution_claim(f"run:{run_id}") as run_claimed:
             if run_claimed:
-                with agent_run_store.execution_claim(
-                    f"session:{session_id}"
-                ) as session_claimed:
+                with agent_run_store.execution_claim(f"session:{session_id}") as session_claimed:
                     if session_claimed:
                         await _execute_agent_run_exclusive(run_id, scope)
                         return
@@ -1918,9 +1922,7 @@ async def _execute_final_reflection(job: dict[str, Any]) -> dict[str, Any] | str
         content = message.get("content")
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
-        transcript_lines.append(
-            f"turn={turn_number} role={role}: {redact_sensitive_text(content)}"
-        )
+        transcript_lines.append(f"turn={turn_number} role={role}: {redact_sensitive_text(content)}")
     transcript = "\n".join(transcript_lines)
     if len(transcript) > 24_000:
         transcript = "[较早内容已截断]\n" + transcript[-24_000:]
@@ -1972,15 +1974,9 @@ async def _execute_final_reflection(job: dict[str, Any]) -> dict[str, Any] | str
 async def _execute_memory_consolidation(job: dict[str, Any]) -> dict[str, Any]:
     scope = str(job["owner_scope"])
     target_names = {
-        str(target.get("target"))
-        for target in job.get("targets") or []
-        if isinstance(target, dict)
+        str(target.get("target")) for target in job.get("targets") or [] if isinstance(target, dict)
     }
-    backups = (
-        backup_personal_memory(scope)
-        if int(job.get("attempt_count") or 0) == 1
-        else []
-    )
+    backups = backup_personal_memory(scope) if int(job.get("attempt_count") or 0) == 1 else []
     policy = memory_policy()
     session_id = new_reflection_session_id(scope)
     await _hermes_json(
@@ -2015,11 +2011,7 @@ async def _execute_memory_consolidation(job: dict[str, Any]) -> dict[str, Any]:
         except HTTPException:
             pass
 
-    states = [
-        state
-        for state in personal_memory_states(scope)
-        if state.target in target_names
-    ]
+    states = [state for state in personal_memory_states(scope) if state.target in target_names]
     if any(state.at_trigger for state in states):
         raise api_error(
             503,
@@ -2051,9 +2043,7 @@ def reflection_queue() -> ReflectionQueue:
 def memory_consolidation_manager() -> MemoryConsolidationManager:
     global _memory_consolidation_manager
     if _memory_consolidation_manager is None:
-        _memory_consolidation_manager = MemoryConsolidationManager(
-            _execute_memory_consolidation
-        )
+        _memory_consolidation_manager = MemoryConsolidationManager(_execute_memory_consolidation)
     return _memory_consolidation_manager
 
 
@@ -2159,9 +2149,7 @@ async def create_session(req: SessionCreateRequest, scope: SessionScope) -> dict
     payload: dict[str, Any] = {"id": session_id}
     if req.title:
         payload["title"] = req.title
-    raw = await _hermes_json(
-        "POST", "/api/sessions", payload=payload, action="create session"
-    )
+    raw = await _hermes_json("POST", "/api/sessions", payload=payload, action="create session")
     return {"ok": True, "session": _normalized_session(raw.get("session") or {})}
 
 
@@ -2196,9 +2184,7 @@ async def list_sessions(
                 turns = None
         return _normalized_session(session, completed_turn_count=turns)
 
-    normalized_page = await asyncio.gather(
-        *(normalize_with_turns(session) for session in page)
-    )
+    normalized_page = await asyncio.gather(*(normalize_with_turns(session) for session in page))
     return {
         "ok": True,
         "data": normalized_page,
@@ -2277,9 +2263,7 @@ async def download_session_artifact(
                     "ok": True,
                     "filename": artifact["filename"],
                     "download_url": download_url,
-                    "download_url_expires_at": artifact.get(
-                        "_remote_download_url_expires_at"
-                    ),
+                    "download_url_expires_at": artifact.get("_remote_download_url_expires_at"),
                 },
                 headers={
                     "Cache-Control": "private, no-store",
@@ -2365,9 +2349,7 @@ async def create_middle_platform_agent_run(
     request: Request,
     response: Response,
     scope: MiddlePlatformScope,
-    idempotency_key: Annotated[
-        str, Header(alias=IDEMPOTENCY_KEY_HEADER)
-    ],
+    idempotency_key: Annotated[str, Header(alias=IDEMPOTENCY_KEY_HEADER)],
     raw_user_id: Annotated[str, Header(alias=CLIENT_USER_ID_HEADER)],
     _request_id: Annotated[str | None, Header(alias=REQUEST_ID_HEADER)] = None,
 ) -> dict[str, Any]:
@@ -2416,12 +2398,8 @@ async def create_agent_run(
     request: Request,
     response: Response,
     scope: SessionScope,
-    idempotency_key: Annotated[
-        str, Header(alias=IDEMPOTENCY_KEY_HEADER)
-    ],
-    raw_user_id: Annotated[
-        str | None, Header(alias=CLIENT_USER_ID_HEADER)
-    ] = None,
+    idempotency_key: Annotated[str, Header(alias=IDEMPOTENCY_KEY_HEADER)],
+    raw_user_id: Annotated[str | None, Header(alias=CLIENT_USER_ID_HEADER)] = None,
 ) -> dict[str, Any]:
     """Submit one durable, idempotent Agent turn for middle-platform use."""
 
@@ -2447,15 +2425,18 @@ async def create_agent_run(
             code="SESSION_CLOSED",
             message="Closed sessions are read-only.",
         )
+    hermes_node_id = (
+        await resolve_hermes_node(
+            f"/api/sessions/{session_id}",
+            scope=scope,
+            api_key=hermes_api_key(),
+        )
+    ).node_id
 
     try:
         message_payload = await _session_messages_payload(session_id)
         baseline_message_count = len(
-            [
-                message
-                for message in message_payload.get("data") or []
-                if isinstance(message, dict)
-            ]
+            [message for message in message_payload.get("data") or [] if isinstance(message, dict)]
         )
         artifact_ids = sorted(_artifact_ids(session_id))
         record, created = agent_run_store.create_or_get(
@@ -2467,6 +2448,7 @@ async def create_agent_run(
             checkpoint={
                 "baseline_message_count": baseline_message_count,
                 "artifact_ids": artifact_ids,
+                "hermes_node_id": hermes_node_id,
                 "upstream_submission_started": False,
                 "report_uid": _report_uid(scope, raw_user_id),
             },
@@ -2513,11 +2495,14 @@ async def create_agent_run(
                     scope,
                     upstream_submission_started=False,
                 )
-                record = agent_run_store.retry(
-                    str(record["run_id"]),
-                    scope,
-                    max_attempts=_agent_run_max_attempts(),
-                ) or record
+                record = (
+                    agent_run_store.retry(
+                        str(record["run_id"]),
+                        scope,
+                        max_attempts=_agent_run_max_attempts(),
+                    )
+                    or record
+                )
             except RunRetryNotAllowedError:
                 pass
             else:
@@ -2601,9 +2586,7 @@ def _materialize_agent_run_stream_events(
 
     if status == "waiting_input":
         clarification = (
-            run.get("clarification")
-            if isinstance(run.get("clarification"), dict)
-            else {}
+            run.get("clarification") if isinstance(run.get("clarification"), dict) else {}
         )
         clarification_id = str(clarification.get("clarification_id") or "")
         _publish_agent_run_event(
@@ -2729,11 +2712,7 @@ def _parse_last_event_id(value: str | None) -> int:
     if value is None or not value.strip():
         return 0
     normalized = value.strip()
-    if (
-        len(normalized) > 16
-        or not normalized.isascii()
-        or not normalized.isdecimal()
-    ):
+    if len(normalized) > 16 or not normalized.isascii() or not normalized.isdecimal():
         raise api_error(
             400,
             code="INVALID_LAST_EVENT_ID",
@@ -2835,9 +2814,7 @@ async def stream_middle_platform_agent_run(
                 replay_answer_deltas=not buffer_was_reset,
             )
             emitted_terminal = False
-            for event_id, live_event, live_payload in _agent_run_events_after(
-                run_id, cursor
-            ):
+            for event_id, live_event, live_payload in _agent_run_events_after(run_id, cursor):
                 cursor = max(cursor, event_id)
                 if not _stream_event_matches_current_run(live_event, live_payload, run):
                     continue
@@ -2870,9 +2847,7 @@ async def stream_middle_platform_agent_run(
     )
 
 
-def _agent_run_submission_payload(
-    record: dict[str, Any], response: Response
-) -> dict[str, Any]:
+def _agent_run_submission_payload(record: dict[str, Any], response: Response) -> dict[str, Any]:
     public = _refresh_run_artifacts(agent_run_store.public_run(record))
     response.status_code = 202 if public["status"] in {"pending", "running"} else 200
     return {
@@ -2961,11 +2936,7 @@ async def _submit_agent_run_input(
         )
     message_payload = await _session_messages_payload(session_id)
     baseline_message_count = len(
-        [
-            message
-            for message in message_payload.get("data") or []
-            if isinstance(message, dict)
-        ]
+        [message for message in message_payload.get("data") or [] if isinstance(message, dict)]
     )
     artifact_ids = sorted(_artifact_ids(session_id))
     try:
@@ -3016,9 +2987,7 @@ async def _submit_agent_run_input(
                 "attempt_count": int(resumed.get("attempt_count") or 0),
                 "step": "已收到补充信息，正在继续分析",
             },
-            dedupe_key=(
-                f"status:{int(resumed.get('attempt_count') or 0)}:pending"
-            ),
+            dedupe_key=(f"status:{int(resumed.get('attempt_count') or 0)}:pending"),
         )
     if accepted or resumed.get("status") in {"pending", "running"}:
         _spawn_agent_run(resumed)
@@ -3088,9 +3057,7 @@ async def session_chat(
     req: SessionChatRequest,
     request: Request,
     scope: SessionScope,
-    raw_user_id: Annotated[
-        str | None, Header(alias=CLIENT_USER_ID_HEADER)
-    ] = None,
+    raw_user_id: Annotated[str | None, Header(alias=CLIENT_USER_ID_HEADER)] = None,
 ) -> dict:
     session = await _get_session(session_id, scope)
     if _scheduled_session_metadata(session_id):
@@ -3151,9 +3118,7 @@ async def session_chat_stream(
     req: SessionChatRequest,
     request: Request,
     scope: SessionScope,
-    raw_user_id: Annotated[
-        str | None, Header(alias=CLIENT_USER_ID_HEADER)
-    ] = None,
+    raw_user_id: Annotated[str | None, Header(alias=CLIENT_USER_ID_HEADER)] = None,
 ) -> StreamingResponse:
     session = await _get_session(session_id, scope)
     if _scheduled_session_metadata(session_id):
@@ -3174,6 +3139,12 @@ async def session_chat_stream(
             trace_id=str(request.state.request_id),
         )
         existing_artifact_ids = _artifact_ids(session_id)
+        stream_path = _session_turn_path(session_id, stream=True)
+        node = await resolve_hermes_node(
+            stream_path,
+            scope=scope,
+            api_key=hermes_api_key(),
+        )
     except Exception:
         _release_chat_session(session_id)
         raise
@@ -3186,8 +3157,11 @@ async def session_chat_stream(
                     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                         async with client.stream(
                             "POST",
-                            f"{hermes_origin()}{_session_turn_path(session_id, stream=True)}",
-                            headers=_hermes_headers(scope),
+                            f"{node.origin}{stream_path}",
+                            headers={
+                                **_hermes_headers(scope),
+                                "X-XPD-Hermes-Node": node.node_id,
+                            },
                             json=_session_turn_payload(
                                 scope=scope,
                                 message=req.message,
@@ -3200,10 +3174,9 @@ async def session_chat_stream(
                                     + json.dumps(
                                         {
                                             "message": "Hermes session stream failed.",
+                                            "node_id": node.node_id,
                                             "status_code": response.status_code,
-                                            "body": body.decode(
-                                                "utf-8", errors="replace"
-                                            )[:1000],
+                                            "body": body.decode("utf-8", errors="replace")[:1000],
                                         },
                                         ensure_ascii=False,
                                     )
@@ -3221,7 +3194,11 @@ async def session_chat_stream(
                 yield (
                     "event: error\ndata: "
                     + json.dumps(
-                        {"message": "Hermes session stream failed.", "error": str(exc)}
+                        {
+                            "message": "Hermes session stream failed.",
+                            "node_id": node.node_id,
+                            "error": str(exc),
+                        }
                     )
                     + "\n\n"
                 )
@@ -3242,9 +3219,7 @@ async def session_chat_stream(
     )
 
 
-@router.post(
-    "/sessions/{session_id}/clarifications/{clarification_id}/answer"
-)
+@router.post("/sessions/{session_id}/clarifications/{clarification_id}/answer")
 async def answer_clarification(
     session_id: str,
     clarification_id: str,
@@ -3304,12 +3279,11 @@ async def close_session(
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, scope: SessionScope) -> dict:
     require_owned_session(session_id, scope)
-    raw = await _hermes_json(
-        "DELETE", f"/api/sessions/{session_id}", action="delete session"
-    )
+    raw = await _hermes_json("DELETE", f"/api/sessions/{session_id}", action="delete session")
     reflection_queue().delete_for_session(session_id)
     schedule_store().delete_run_for_session(session_id)
     delete_session_artifacts(session_id)
+    forget_session_route(session_id)
     return {
         "ok": True,
         "session_id": session_id,

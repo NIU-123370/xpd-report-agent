@@ -34,9 +34,7 @@ class FakeAsyncClient:
 
     async def get(self, url, headers=None):
         if url.endswith("/api/clarifications/health"):
-            return FakeResponse(
-                {"ok": True, "enabled": True, "timeout_seconds": 300}
-            )
+            return FakeResponse({"ok": True, "enabled": True, "timeout_seconds": 300})
         if url.endswith("/api/report-files/health"):
             return FakeResponse(
                 {
@@ -151,6 +149,34 @@ def test_health_reports_missing_key(monkeypatch):
     body = response.json()
     assert body["ok"] is False
     assert body["hermes_api_key_configured"] is False
+
+
+def test_live_has_no_downstream_dependency(monkeypatch):
+    async def failing_discovery():
+        raise AssertionError("liveness must not discover Hermes")
+
+    monkeypatch.setattr(app_main, "resolved_hermes_pool", failing_discovery)
+
+    response = TestClient(app_main.app).get("/live")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+def test_health_reports_dynamic_discovery_failure_without_crashing(monkeypatch):
+    async def failing_discovery():
+        raise RuntimeError("EndpointSlice API unavailable")
+
+    monkeypatch.setattr(app_main, "resolved_hermes_pool", failing_discovery)
+
+    response = TestClient(app_main.app).get("/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert body["hermes_base_url"] is None
+    assert body["hermes"]["total_nodes"] == 0
+    assert "EndpointSlice API unavailable" in body["hermes"]["error"]
     assert body["db_query"]["ok"] is False
 
 
@@ -194,6 +220,42 @@ def test_health_treats_disabled_schedules_as_healthy(monkeypatch):
     assert body["cron"]["ok"] is True
     assert body["cron"]["enabled"] is False
     assert body["cron"]["patch_status_code"] is None
+
+
+def test_health_reports_multi_node_degradation_without_failing_ready_runtime(
+    monkeypatch,
+):
+    class DegradedPoolClient(FakeAsyncClient):
+        async def get(self, url, headers=None):
+            if url == "http://hermes-2:8642/v1/health":
+                return FakeResponse(status_code=503, text="unavailable")
+            return await super().get(url, headers=headers)
+
+    monkeypatch.setenv("HERMES_GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("XPD_SCHEDULES_ENABLED", "false")
+    monkeypatch.setenv(
+        "HERMES_GATEWAY_NODES",
+        (
+            "hermes-1=http://hermes-1:8642,"
+            "hermes-2=http://hermes-2:8642,"
+            "hermes-3=http://hermes-3:8642"
+        ),
+    )
+    monkeypatch.setenv("XPD_HERMES_SCHEDULER_NODE", "hermes-1")
+    monkeypatch.setattr(app_main.httpx, "AsyncClient", DegradedPoolClient)
+    monkeypatch.setattr(app_main, "agent_run_health", lambda: {"ok": True})
+    client = TestClient(app_main.app)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["hermes"]["ok"] is True
+    assert body["hermes"]["healthy_nodes"] == 2
+    assert body["hermes"]["total_nodes"] == 3
+    assert body["hermes"]["degraded"] is True
+    assert [node["ok"] for node in body["hermes"]["nodes"]] == [True, False, True]
 
 
 def test_health_falls_back_for_invalid_clarify_timeout(monkeypatch):

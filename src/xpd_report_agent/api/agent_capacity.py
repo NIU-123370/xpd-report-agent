@@ -9,21 +9,36 @@ from typing import AsyncIterator
 
 DEFAULT_AGENT_MAX_CONCURRENCY = 3
 MIN_AGENT_MAX_CONCURRENCY = 1
-MAX_AGENT_MAX_CONCURRENCY = 10
+MAX_AGENT_MAX_CONCURRENCY = 50
+MULTI_NODE_CONCURRENCY_PER_NODE = 7
+MULTI_NODE_DEFAULT_MAX_CONCURRENCY = 20
+
+
+def _configured_hermes_node_count() -> int:
+    configured = os.getenv("HERMES_GATEWAY_NODES", "").strip()
+    if not configured:
+        return 1
+    return max(1, len([entry for entry in configured.split(",") if entry.strip()]))
+
+
+def _default_agent_max_concurrency() -> int:
+    node_count = _configured_hermes_node_count()
+    if node_count <= 1:
+        return DEFAULT_AGENT_MAX_CONCURRENCY
+    return min(
+        MULTI_NODE_DEFAULT_MAX_CONCURRENCY,
+        node_count * MULTI_NODE_CONCURRENCY_PER_NODE,
+    )
 
 
 def agent_max_concurrency() -> int:
     """Return the configured process-wide Agent analysis concurrency."""
 
+    default = _default_agent_max_concurrency()
     try:
-        configured = int(
-            os.getenv(
-                "XPD_AGENT_MAX_CONCURRENCY",
-                str(DEFAULT_AGENT_MAX_CONCURRENCY),
-            )
-        )
+        configured = int(os.getenv("XPD_AGENT_MAX_CONCURRENCY", str(default)))
     except (TypeError, ValueError):
-        configured = DEFAULT_AGENT_MAX_CONCURRENCY
+        configured = default
     return max(
         MIN_AGENT_MAX_CONCURRENCY,
         min(MAX_AGENT_MAX_CONCURRENCY, configured),

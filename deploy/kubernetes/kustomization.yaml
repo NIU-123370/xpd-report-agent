@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: xpd-report-agent
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - rbac.yaml
+  - storage.yaml
+  - services.yaml
+  - workloads.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml

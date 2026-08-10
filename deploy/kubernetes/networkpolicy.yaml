@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hermes-ingress-from-fastapi-only
+  namespace: xpd-report-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hermes
+      app.kubernetes.io/part-of: xpd-report-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: xpd-report-agent
+              app.kubernetes.io/part-of: xpd-report-agent
+      ports:
+        - protocol: TCP
+          port: 8642
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fastapi-public-ingress
+  namespace: xpd-report-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: xpd-report-agent
+      app.kubernetes.io/part-of: xpd-report-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8000

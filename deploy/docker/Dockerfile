@@ -18,8 +18,9 @@ RUN sed -i "s@deb.debian.org@mirrors.aliyun.com@g" \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates passwd \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system xpd-agent \
-    && useradd --system --gid xpd-agent --home-dir "$HOME" --create-home xpd-agent
+    && groupadd --system --gid 999 xpd-agent \
+    && useradd --system --uid 999 --gid 999 \
+        --home-dir "$HOME" --create-home xpd-agent
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -40,7 +41,8 @@ ENV HERMES_AGENT_DIR=/opt/hermes-agent \
     HERMES_PY=/opt/hermes-agent/venv/bin/python
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git fonts-wqy-zenhei \
+    && apt-get install -y --no-install-recommends git fonts-wqy-zenhei util-linux \
+    && command -v flock >/dev/null \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=python311 /usr/local/bin/python3.11 /usr/local/bin/python3.11
@@ -114,7 +116,7 @@ RUN --mount=type=cache,target=/var/cache/uv \
     && mkdir -p "$HOME/.hermes/xpd-report-agent" /app/data/report-files /app/logs /app/.run \
     && chown -R xpd-agent:xpd-agent "$HOME" /app/data /app/logs /app/.run
 
-USER xpd-agent
+USER 999:999
 EXPOSE 8000
 ENTRYPOINT ["/app/deploy/docker/entrypoint.sh"]
 
@@ -131,6 +133,6 @@ RUN --mount=type=cache,target=/var/cache/uv \
     && mkdir -p "$HOME/.hermes" /app/data/report-files /app/logs /app/.run \
     && chown -R xpd-agent:xpd-agent "$HOME" /app/data /app/logs /app/.run
 
-USER xpd-agent
+USER 999:999
 EXPOSE 8642
 ENTRYPOINT ["/app/deploy/docker/entrypoint.sh"]

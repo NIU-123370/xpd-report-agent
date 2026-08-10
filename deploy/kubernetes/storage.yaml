@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-state
+  namespace: xpd-report-agent
+  annotations:
+    xpd-report-agent/storage-scope: single-node-only
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: REPLACE_ACK_RWO_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: report-files
+  namespace: xpd-report-agent
+  annotations:
+    xpd-report-agent/storage-scope: single-node-only
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: REPLACE_ACK_RWO_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 100Gi

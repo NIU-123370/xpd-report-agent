@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -25,6 +26,31 @@ API_SERVER_TOOLSETS = [
 
 IDENTITY_MODE_ENV = "XPD_IDENTITY_MODE"
 UNSAFE_USER_SESSION_SEARCH_ENV = "XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Durably replace *path* without exposing a partially written config."""
+
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -178,9 +204,9 @@ def configure_config(
     )
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(
+    _atomic_write_text(
+        config_path,
         yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
     )
 
     return {

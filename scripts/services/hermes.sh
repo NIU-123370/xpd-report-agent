@@ -51,7 +51,8 @@ export HERMES_GATEWAY_API_KEY="${HERMES_GATEWAY_API_KEY:-dev-secret}"
 export HERMES_GATEWAY_MODEL="${HERMES_GATEWAY_MODEL:-hermes-agent}"
 export HERMES_GATEWAY_ALLOW_ALL_USERS="${HERMES_GATEWAY_ALLOW_ALL_USERS:-true}"
 export HERMES_TIMEZONE="${HERMES_TIMEZONE:-Asia/Shanghai}"
-export HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HOME/.hermes/hermes-agent}"
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+export HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
 if [ -n "${HERMES_LLM_API_KEY:-}" ]; then
   export ALIBABA_CODING_PLAN_API_KEY="${ALIBABA_CODING_PLAN_API_KEY:-$HERMES_LLM_API_KEY}"
   export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:-$HERMES_LLM_API_KEY}"
@@ -86,6 +87,15 @@ export XPD_HERMES_CRON_PATCH="${XPD_HERMES_CRON_PATCH:-false}"
 export XPD_HERMES_USER_MEMORY_PATCH="${XPD_HERMES_USER_MEMORY_PATCH:-true}"
 export XPD_CRON_MAX_PARALLEL_JOBS="${XPD_CRON_MAX_PARALLEL_JOBS:-1}"
 export XPD_SCHEDULES_ENABLED="${XPD_SCHEDULES_ENABLED:-false}"
+export XPD_HERMES_NODE_ID="${XPD_HERMES_NODE_ID:-${HOSTNAME:-hermes}}"
+export XPD_HERMES_SCHEDULER_NODE="${XPD_HERMES_SCHEDULER_NODE:-}"
+if [ -n "$XPD_HERMES_SCHEDULER_NODE" ] \
+  && [ "$XPD_HERMES_NODE_ID" != "$XPD_HERMES_SCHEDULER_NODE" ]; then
+  # StatefulSet replicas share one environment. Only the stable ordinal-0
+  # leader may run Cron; all other replicas are query workers.
+  export XPD_HERMES_CRON_PATCH=false
+  export XPD_SCHEDULES_ENABLED=false
+fi
 export XPD_FILE_STORAGE_PATH="${XPD_FILE_STORAGE_PATH:-$ROOT/data/report-files}"
 export XPD_FILE_MAX_ARTIFACTS_PER_SESSION="${XPD_FILE_MAX_ARTIFACTS_PER_SESSION:-50}"
 export XPD_FILE_MAX_BYTES_PER_ARTIFACT="${XPD_FILE_MAX_BYTES_PER_ARTIFACT:-10485760}"
@@ -142,9 +152,9 @@ verify_hermes_runtime() {
 }
 
 sync_project_assets() {
-  mkdir -p "$HOME/.hermes/plugins/db-query" "$HOME/.hermes/skills/db-multitable-query"
-  cp -R src/xpd_report_agent/hermes_plugin/db_query/. "$HOME/.hermes/plugins/db-query/"
-  cp skills/db-multitable-query/SKILL.md "$HOME/.hermes/skills/db-multitable-query/SKILL.md"
+  mkdir -p "$HERMES_HOME/plugins/db-query" "$HERMES_HOME/skills/db-multitable-query"
+  cp -R src/xpd_report_agent/hermes_plugin/db_query/. "$HERMES_HOME/plugins/db-query/"
+  cp skills/db-multitable-query/SKILL.md "$HERMES_HOME/skills/db-multitable-query/SKILL.md"
 }
 
 configure_hermes_runtime() {
@@ -159,15 +169,42 @@ configure_hermes_runtime() {
       XPD_HERMES_REPORT_FILE_PATCH=false \
       XPD_HERMES_CRON_PATCH=false \
       XPD_HERMES_USER_MEMORY_PATCH=false \
-      "$PROJECT_PYTHON" scripts/configure_hermes.py --require-model-key
+      "$PROJECT_PYTHON" scripts/configure_hermes.py \
+        --config "$HERMES_HOME/config.yaml" \
+        --require-model-key
   else
     XPD_HERMES_REASONING_STREAM_PATCH=false \
       XPD_HERMES_CLARIFY_PATCH=false \
       XPD_HERMES_REPORT_FILE_PATCH=false \
       XPD_HERMES_CRON_PATCH=false \
       XPD_HERMES_USER_MEMORY_PATCH=false \
-      "$PROJECT_PYTHON" scripts/configure_hermes.py
+      "$PROJECT_PYTHON" scripts/configure_hermes.py \
+        --config "$HERMES_HOME/config.yaml"
   fi
+}
+
+configure_shared_hermes_home() {
+  local enable_plugin="${1:-false}"
+  sync_project_assets
+  configure_hermes_runtime
+  if [ "$enable_plugin" = "true" ]; then
+    local hermes_bin="${HERMES_BIN:-$HERMES_AGENT_DIR/venv/bin/hermes}"
+    "$hermes_bin" plugins enable db-query
+  fi
+}
+
+with_hermes_home_lock() {
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "flock is required to configure the shared HERMES_HOME safely." >&2
+    exit 1
+  fi
+
+  mkdir -p "$HERMES_HOME"
+  (
+    exec 9>"$HERMES_HOME/.xpd-bootstrap.lock"
+    flock -x 9
+    "$@"
+  )
 }
 
 prepare_hermes() {
@@ -214,9 +251,7 @@ prepare_hermes() {
   rm -f "$upstream_constraints"
   trap - EXIT
 
-  sync_project_assets
-  configure_hermes_runtime
-  "$HERMES_BIN" plugins enable db-query
+  with_hermes_home_lock configure_shared_hermes_home true
 }
 
 run_hermes() {
@@ -226,8 +261,7 @@ run_hermes() {
     verify_hermes_runtime
     # Code and Skill updates are local assets and must not require a dependency
     # bootstrap or network access before every restart.
-    sync_project_assets
-    configure_hermes_runtime
+    with_hermes_home_lock configure_shared_hermes_home false
   fi
   HERMES_BIN="${HERMES_BIN:-$HERMES_AGENT_DIR/venv/bin/hermes}"
   if [ ! -x "$HERMES_BIN" ]; then

@@ -12,33 +12,58 @@ x-xpd-common: &xpd-common
       max-size: "20m"
       max-file: "5"
 
+x-hermes-environment: &hermes-environment
+  XPD_CONTAINER_ROLE: hermes
+  HERMES_HOME: /var/lib/xpd-report-agent/.hermes
+  HERMES_GATEWAY_HOST: 0.0.0.0
+  HERMES_GATEWAY_PORT: "8642"
+  XPD_FILE_STORAGE_PATH: /app/data/report-files
+  XPD_CRON_SCRIPT_DIR: /var/lib/xpd-report-agent/.hermes/scripts
+  XPD_CRON_CALLBACK_ORIGIN: http://xpd-report-agent:8000
+
+x-hermes-common: &hermes-common
+  <<: *xpd-common
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+    target: hermes
+    additional_contexts:
+      hermes_seed: ./hermes-seed
+  image: xpd-report-agent-hermes:dev
+  expose:
+    - "8642"
+  healthcheck:
+    test: ["CMD", "/app/.venv/bin/python", "-c", "import os, urllib.request; request = urllib.request.Request('http://127.0.0.1:8642/v1/health', headers={'Authorization': 'Bearer ' + os.environ['HERMES_GATEWAY_API_KEY']}); urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=5).close()"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 120s
+
 services:
-  hermes:
-    <<: *xpd-common
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile
-      target: hermes
-      additional_contexts:
-        hermes_seed: ./hermes-seed
-    image: xpd-report-agent-hermes:dev
-    container_name: xpd-report-agent-hermes
+  hermes-1:
+    <<: *hermes-common
+    container_name: xpd-report-agent-hermes-1
     environment:
-      XPD_CONTAINER_ROLE: hermes
-      HERMES_HOME: /var/lib/xpd-report-agent/.hermes
-      HERMES_GATEWAY_HOST: 0.0.0.0
-      HERMES_GATEWAY_PORT: "8642"
-      XPD_FILE_STORAGE_PATH: /app/data/report-files
-      XPD_CRON_SCRIPT_DIR: /var/lib/xpd-report-agent/.hermes/scripts
-      XPD_CRON_CALLBACK_ORIGIN: http://xpd-report-agent:8000
-    expose:
-      - "8642"
-    healthcheck:
-      test: ["CMD", "/app/.venv/bin/python", "-c", "import os, urllib.request; request = urllib.request.Request('http://127.0.0.1:8642/v1/health', headers={'Authorization': 'Bearer ' + os.environ['HERMES_GATEWAY_API_KEY']}); urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=5).close()"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
+      <<: *hermes-environment
+      XPD_HERMES_NODE_ID: hermes-1
+
+  hermes-2:
+    <<: *hermes-common
+    container_name: xpd-report-agent-hermes-2
+    environment:
+      <<: *hermes-environment
+      XPD_HERMES_NODE_ID: hermes-2
+      XPD_HERMES_CRON_PATCH: "false"
+      XPD_SCHEDULES_ENABLED: "false"
+
+  hermes-3:
+    <<: *hermes-common
+    container_name: xpd-report-agent-hermes-3
+    environment:
+      <<: *hermes-environment
+      XPD_HERMES_NODE_ID: hermes-3
+      XPD_HERMES_CRON_PATCH: "false"
+      XPD_SCHEDULES_ENABLED: "false"
 
   xpd-report-agent:
     <<: *xpd-common
@@ -53,14 +78,20 @@ services:
       FASTAPI_HOST: 0.0.0.0
       FASTAPI_PORT: "8000"
       HERMES_HOME: /var/lib/xpd-report-agent/.hermes
-      HERMES_GATEWAY_HOST: hermes
+      HERMES_GATEWAY_HOST: hermes-1
       HERMES_GATEWAY_PORT: "8642"
+      HERMES_GATEWAY_NODES: hermes-1=http://hermes-1:8642,hermes-2=http://hermes-2:8642,hermes-3=http://hermes-3:8642
+      XPD_HERMES_SCHEDULER_NODE: hermes-1
       XPD_FILE_STORAGE_PATH: /app/data/report-files
       XPD_CRON_SCRIPT_DIR: /var/lib/xpd-report-agent/.hermes/scripts
       XPD_CRON_CALLBACK_ORIGIN: http://xpd-report-agent:8000
     depends_on:
-      hermes:
-        condition: service_healthy
+      hermes-1:
+        condition: service_started
+      hermes-2:
+        condition: service_started
+      hermes-3:
+        condition: service_started
     ports:
       - "8000:8000"
     healthcheck:

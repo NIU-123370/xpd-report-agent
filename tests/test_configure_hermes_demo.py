@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
 import yaml
 
+from xpd_report_agent.runtime import hermes_config as hermes_config_module
 from xpd_report_agent.runtime.hermes_config import (
     API_SERVER_TOOLSETS,
     configure_config,
@@ -130,3 +134,52 @@ def test_configure_config_requires_model_key(tmp_path):
         assert "HERMES_LLM_API_KEY" in str(exc)
     else:
         raise AssertionError("Expected missing model api_key to fail.")
+
+
+def test_configure_config_uses_unique_atomic_temporary_files(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    replacements: list[tuple[Path, Path]] = []
+    fsync_calls: list[int] = []
+    real_replace = hermes_config_module.os.replace
+    real_fsync = hermes_config_module.os.fsync
+
+    def recording_replace(source, target):
+        replacements.append((Path(source), Path(target)))
+        real_replace(source, target)
+
+    def recording_fsync(file_descriptor):
+        fsync_calls.append(file_descriptor)
+        real_fsync(file_descriptor)
+
+    monkeypatch.setattr(hermes_config_module.os, "replace", recording_replace)
+    monkeypatch.setattr(hermes_config_module.os, "fsync", recording_fsync)
+
+    configure_config(config_path, model_config={})
+    configure_config(config_path, model_config={})
+
+    temporary_paths = [source for source, _target in replacements]
+    assert len(set(temporary_paths)) == 2
+    assert all(path.parent == config_path.parent for path in temporary_paths)
+    assert all(path.name.startswith(".config.yaml.") for path in temporary_paths)
+    assert all(path.suffix == ".tmp" for path in temporary_paths)
+    assert all(target == config_path for _source, target in replacements)
+    assert all(not path.exists() for path in temporary_paths)
+    assert len(fsync_calls) == 4
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["plugins"]
+
+
+def test_configure_config_removes_temporary_file_when_replace_fails(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    original = "model:\n  api_key: existing\n"
+    config_path.write_text(original, encoding="utf-8")
+
+    def fail_replace(_source, _target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(hermes_config_module.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        configure_config(config_path, model_config={})
+
+    assert config_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".config.yaml.*.tmp")) == []

@@ -21,13 +21,23 @@ def test_dockerfile_separates_hermes_runtime_from_persistent_state():
     assert "HERMES_AGENT_DIR=/opt/hermes-agent" in dockerfile
     assert "HERMES_BIN=/opt/hermes-agent/venv/bin/hermes" in dockerfile
     assert 'mkdir -p "$HOME/.hermes"' in dockerfile
-    assert '$HOME/.hermes/hermes-agent' not in dockerfile
+    assert "$HOME/.hermes/hermes-agent" not in dockerfile
 
     fastapi_stage = dockerfile.split("FROM project-deps AS fastapi", 1)[1].split(
         "FROM hermes-runtime AS hermes", 1
     )[0]
     assert "/opt/hermes-agent" not in fastapi_stage
     assert "XPD_CONTAINER_ROLE=fastapi" in fastapi_stage
+
+
+def test_hermes_image_installs_and_verifies_flock():
+    dockerfile = _read(DOCKER_DIR / "Dockerfile")
+    hermes_runtime_stage = dockerfile.split("FROM project-deps AS hermes-runtime", 1)[1].split(
+        "FROM project-deps AS fastapi", 1
+    )[0]
+
+    assert "util-linux" in hermes_runtime_stage
+    assert "command -v flock >/dev/null" in hermes_runtime_stage
 
 
 def test_dockerfile_keeps_expensive_dependencies_in_a_stable_layer():
@@ -51,41 +61,81 @@ def test_dockerfile_keeps_expensive_dependencies_in_a_stable_layer():
     assert 'git config --system --add safe.directory "$HERMES_AGENT_DIR"' in dockerfile
 
 
-def test_compose_runs_fastapi_and_hermes_as_separate_services():
+def test_compose_runs_one_fastapi_and_three_fixed_hermes_services():
     compose = yaml.safe_load(_read(DOCKER_DIR / "compose.yaml"))
     services = compose["services"]
-    hermes = services["hermes"]
+    hermes_services = [services[f"hermes-{index}"] for index in range(1, 4)]
     fastapi = services["xpd-report-agent"]
 
-    assert set(services) == {"hermes", "xpd-report-agent"}
-    assert hermes["build"]["target"] == "hermes"
-    assert fastapi["build"]["target"] == "fastapi"
-    assert hermes["build"]["additional_contexts"] == {
-        "hermes_seed": "./hermes-seed"
+    assert set(services) == {
+        "hermes-1",
+        "hermes-2",
+        "hermes-3",
+        "xpd-report-agent",
     }
+    assert all(service["build"]["target"] == "hermes" for service in hermes_services)
+    assert fastapi["build"]["target"] == "fastapi"
+    for service in hermes_services:
+        assert service["build"]["additional_contexts"] == {"hermes_seed": "./hermes-seed"}
     assert "additional_contexts" not in fastapi["build"]
-    assert hermes["image"] != fastapi["image"]
+    assert {service["image"] for service in hermes_services} == {"xpd-report-agent-hermes:dev"}
+    assert all(service["image"] != fastapi["image"] for service in hermes_services)
     assert fastapi["container_name"] == "xpd-report-agent"
-    assert hermes["container_name"] == "xpd-report-agent-hermes"
-    assert hermes["environment"]["XPD_CONTAINER_ROLE"] == "hermes"
+    assert [service["container_name"] for service in hermes_services] == [
+        "xpd-report-agent-hermes-1",
+        "xpd-report-agent-hermes-2",
+        "xpd-report-agent-hermes-3",
+    ]
+    assert all(
+        service["environment"]["XPD_CONTAINER_ROLE"] == "hermes" for service in hermes_services
+    )
+    assert [service["environment"]["XPD_HERMES_NODE_ID"] for service in hermes_services] == [
+        "hermes-1",
+        "hermes-2",
+        "hermes-3",
+    ]
     assert fastapi["environment"]["XPD_CONTAINER_ROLE"] == "fastapi"
 
 
-def test_compose_keeps_hermes_internal_and_waits_for_its_health():
+def test_compose_keeps_all_hermes_nodes_internal_and_starts_fastapi_with_them():
     compose = yaml.safe_load(_read(DOCKER_DIR / "compose.yaml"))
-    hermes = compose["services"]["hermes"]
+    hermes_services = {
+        name: compose["services"][name] for name in ("hermes-1", "hermes-2", "hermes-3")
+    }
     fastapi = compose["services"]["xpd-report-agent"]
 
-    assert hermes["environment"]["HERMES_GATEWAY_HOST"] == "0.0.0.0"
-    assert fastapi["environment"]["HERMES_GATEWAY_HOST"] == "hermes"
+    assert all(
+        service["environment"]["HERMES_GATEWAY_HOST"] == "0.0.0.0"
+        for service in hermes_services.values()
+    )
+    assert fastapi["environment"]["HERMES_GATEWAY_HOST"] == "hermes-1"
+    assert fastapi["environment"]["HERMES_GATEWAY_NODES"] == (
+        "hermes-1=http://hermes-1:8642,hermes-2=http://hermes-2:8642,hermes-3=http://hermes-3:8642"
+    )
+    assert fastapi["environment"]["XPD_HERMES_SCHEDULER_NODE"] == "hermes-1"
     assert fastapi["depends_on"] == {
-        "hermes": {"condition": "service_healthy"}
+        name: {"condition": "service_started"} for name in hermes_services
     }
-    assert hermes["expose"] == ["8642"]
-    assert "ports" not in hermes
+    assert all(service["expose"] == ["8642"] for service in hermes_services.values())
+    assert all("ports" not in service for service in hermes_services.values())
     assert fastapi["ports"] == ["8000:8000"]
-    assert "ProxyHandler({})" in hermes["healthcheck"]["test"][-1]
+    assert all(
+        "ProxyHandler({})" in service["healthcheck"]["test"][-1]
+        for service in hermes_services.values()
+    )
     assert "ProxyHandler({})" in fastapi["healthcheck"]["test"][-1]
+
+
+def test_compose_assigns_cron_to_hermes_1_only():
+    services = yaml.safe_load(_read(DOCKER_DIR / "compose.yaml"))["services"]
+
+    # hermes-1 inherits both switches from the protected env file. Production
+    # defaults keep them false; operators may explicitly enable the leader.
+    assert "XPD_HERMES_CRON_PATCH" not in services["hermes-1"]["environment"]
+    assert "XPD_SCHEDULES_ENABLED" not in services["hermes-1"]["environment"]
+    for name in ("hermes-2", "hermes-3"):
+        assert services[name]["environment"]["XPD_HERMES_CRON_PATCH"] == "false"
+        assert services[name]["environment"]["XPD_SCHEDULES_ENABLED"] == "false"
 
 
 def test_compose_shares_state_and_report_files_between_services():
@@ -102,12 +152,8 @@ def test_compose_shares_state_and_report_files_between_services():
             "driver": "json-file",
             "options": {"max-size": "20m", "max-file": "5"},
         }
-        assert service["environment"]["XPD_FILE_STORAGE_PATH"] == (
-            "/app/data/report-files"
-        )
-        assert service["environment"]["HERMES_HOME"] == (
-            "/var/lib/xpd-report-agent/.hermes"
-        )
+        assert service["environment"]["XPD_FILE_STORAGE_PATH"] == ("/app/data/report-files")
+        assert service["environment"]["HERMES_HOME"] == ("/var/lib/xpd-report-agent/.hermes")
         assert service["environment"]["XPD_CRON_SCRIPT_DIR"] == (
             "/var/lib/xpd-report-agent/.hermes/scripts"
         )
@@ -115,19 +161,14 @@ def test_compose_shares_state_and_report_files_between_services():
             "http://xpd-report-agent:8000"
         )
 
-    assert compose["volumes"]["hermes-state"]["name"] == (
-        "xpd-report-agent-hermes-state"
-    )
+    assert compose["volumes"]["hermes-state"]["name"] == ("xpd-report-agent-hermes-state")
     assert compose["volumes"]["report-files"] is None
 
 
 def test_entrypoint_runs_exactly_one_role_after_preflight():
     entrypoint = _read(DOCKER_DIR / "entrypoint.sh")
 
-    preflight = (
-        "/app/.venv/bin/python -m "
-        "xpd_report_agent.runtime.deployment_preflight --quiet"
-    )
+    preflight = "/app/.venv/bin/python -m xpd_report_agent.runtime.deployment_preflight --quiet"
     assert preflight in entrypoint
     assert entrypoint.index(preflight) < entrypoint.index("hermes.sh run")
     assert entrypoint.index(preflight) < entrypoint.index("fastapi.sh run")
@@ -163,6 +204,9 @@ def test_docker_environment_template_contains_production_model_and_identity_conf
         "XPD_SERVICE_AUTH_ENABLED=true",
         "XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED=false",
         "FASTAPI_RELOAD=false",
+        "XPD_AGENT_MAX_CONCURRENCY=20",
+        "XPD_SCHEDULES_ENABLED=false",
+        "XPD_HERMES_CRON_PATCH=false",
     ):
         assert expected in template
 
@@ -171,11 +215,12 @@ def test_docker_environment_template_contains_production_model_and_identity_conf
         "FASTAPI_PORT=",
         "HERMES_GATEWAY_HOST=",
         "HERMES_GATEWAY_PORT=",
+        "HERMES_GATEWAY_NODES=",
+        "XPD_HERMES_SCHEDULER_NODE=",
+        "XPD_HERMES_NODE_ID=",
         "XPD_CRON_CALLBACK_ORIGIN=",
     ):
-        assert not any(
-            line.startswith(compose_managed) for line in template.splitlines()
-        )
+        assert not any(line.startswith(compose_managed) for line in template.splitlines())
 
 
 def test_systemd_healthcheck_probes_wildcard_bind_addresses_via_loopback():

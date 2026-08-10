@@ -10,6 +10,7 @@ from xpd_report_agent.api.agent_capacity import (
 
 
 def test_agent_max_concurrency_defaults_and_stays_in_range(monkeypatch):
+    monkeypatch.delenv("HERMES_GATEWAY_NODES", raising=False)
     monkeypatch.delenv("XPD_AGENT_MAX_CONCURRENCY", raising=False)
     assert agent_max_concurrency() == 3
 
@@ -17,10 +18,45 @@ def test_agent_max_concurrency_defaults_and_stays_in_range(monkeypatch):
     assert agent_max_concurrency() == 3
     monkeypatch.setenv("XPD_AGENT_MAX_CONCURRENCY", "0")
     assert agent_max_concurrency() == 1
-    monkeypatch.setenv("XPD_AGENT_MAX_CONCURRENCY", "11")
-    assert agent_max_concurrency() == 10
+    monkeypatch.setenv("XPD_AGENT_MAX_CONCURRENCY", "51")
+    assert agent_max_concurrency() == 50
+    monkeypatch.setenv("XPD_AGENT_MAX_CONCURRENCY", "20")
+    assert agent_max_concurrency() == 20
     monkeypatch.setenv("XPD_AGENT_MAX_CONCURRENCY", "4")
     assert agent_max_concurrency() == 4
+
+
+def test_agent_max_concurrency_derives_multi_node_default(monkeypatch):
+    monkeypatch.delenv("XPD_AGENT_MAX_CONCURRENCY", raising=False)
+
+    monkeypatch.setenv(
+        "HERMES_GATEWAY_NODES",
+        "hermes-1=http://hermes-1:8642,hermes-2=http://hermes-2:8642",
+    )
+    assert agent_max_concurrency() == 14
+
+    monkeypatch.setenv(
+        "HERMES_GATEWAY_NODES",
+        (
+            "hermes-1=http://hermes-1:8642,"
+            "hermes-2=http://hermes-2:8642,"
+            "hermes-3=http://hermes-3:8642"
+        ),
+    )
+    assert agent_max_concurrency() == 20
+
+    monkeypatch.setenv("XPD_AGENT_MAX_CONCURRENCY", "invalid")
+    assert agent_max_concurrency() == 20
+
+
+def test_single_node_pool_keeps_legacy_default(monkeypatch):
+    monkeypatch.delenv("XPD_AGENT_MAX_CONCURRENCY", raising=False)
+    monkeypatch.setenv(
+        "HERMES_GATEWAY_NODES",
+        "hermes-1=http://hermes-1:8642",
+    )
+
+    assert agent_max_concurrency() == 3
 
 
 def test_agent_capacity_queues_and_reports_health(monkeypatch):

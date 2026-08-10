@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import io
 import json
 import math
@@ -12,6 +13,7 @@ import time
 import unicodedata
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -165,6 +167,27 @@ CHINESE_COLUMN_LABELS = {
 }
 
 _export_lock = threading.RLock()
+
+
+@contextmanager
+def _artifact_storage_lock(storage_root: Path):
+    """Serialize shared-volume quota, cleanup, and artifact writes across processes."""
+
+    storage_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = storage_root / ".xpd-report-storage.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    with _export_lock:
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
 
 EXPORT_REPORT_FILE_SCHEMA = {
@@ -2847,8 +2870,8 @@ def _write_artifact(exports_dir: Path, filename: str, content: bytes) -> tuple[s
     if len(content) > max_file_bytes:
         raise ValueError(f"Report artifact exceeds the {max_file_bytes}-byte limit.")
 
-    with _export_lock:
-        storage_root = exports_dir.parent.parent
+    storage_root = exports_dir.parent.parent
+    with _artifact_storage_lock(storage_root):
         _cleanup_expired_artifacts(storage_root, now=time.time())
         stored = _stored_artifact_files(storage_root)
         existing = [path for session_id, path in stored if session_id == exports_dir.parent.name]

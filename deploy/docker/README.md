@@ -1,18 +1,25 @@
-# Docker 部署指南（阿里云 ECS / Linux）
+# Docker Compose 单机备用部署指南（阿里云 ECS / Linux）
 
-本文用于把 `xpd-report-agent` 部署为中台可调用的 AI 微服务。部署采用两个独立容器：
+生产环境已改用“一条流水线 + ACK 动态 Hermes 实例池”，请优先阅读
+[`deploy/kubernetes/README.md`](../kubernetes/README.md)。本文保留的固定三个 Hermes
+拓扑只用于单台 ECS 回退或本地验证，不具备 HPA 动态扩缩能力。
+
+本文用于把 `xpd-report-agent` 部署为中台可调用的 AI 微服务。部署采用一个 FastAPI
+容器和三个固定 Hermes 实例容器：
 
 ```text
 中台 -> xpd-report-agent（FastAPI，宿主机 8000）
-                -> hermes（Gateway，Compose 内网 8642）
-                        -> db-query -> RDS 只读查询
-                        -> report-file -> Excel/PDF 等报告并上传 OSS
+                |-> hermes-1（Gateway，Compose 内网 8642，Cron leader）
+                |-> hermes-2（Gateway，Compose 内网 8642）
+                `-> hermes-3（Gateway，Compose 内网 8642）
+                          -> db-query -> RDS 只读查询
+                          -> report-file -> Excel/PDF 等报告并上传 OSS
 
-两个容器共享 hermes-state 和 report-files 卷
+四个容器共享同一个 hermes-state 和 report-files 本地卷
 ```
 
-Hermes 的 `8642` 不映射到宿主机，只允许 FastAPI 通过 Compose 服务网络访问。数据库和 OSS
-不部署在容器内，分别连接阿里云 RDS 和 OSS。
+三个 Hermes 都使用自己网络命名空间内的 `8642`，不映射到宿主机；只有 FastAPI
+对宿主机发布 `8000`。数据库和 OSS 不部署在容器内，分别连接阿里云 RDS 和 OSS。
 
 ## 1. 部署前检查
 
@@ -22,8 +29,10 @@ Hermes 的 `8642` 不映射到宿主机，只允许 FastAPI 通过 Compose 服�
 - RDS 使用 MySQL 5.7.8 或更高版本，推荐 MySQL 8.0。
 - 数据库账号对目标库和业务表至少有 `SELECT` 权限，不要使用 root 账号。
 - ECS 安全组只向中台来源开放 `8000`，不要将 `8642` 暴露到公网。
-- 当前本地 JSON/SQLite 状态模型只支持 `1 个 FastAPI + 1 个 Hermes`，不要使用
-  `docker compose up --scale` 横向扩容；多实例前必须先迁移到支持并发的一致共享存储。
+- 当前拓扑固定为 `1 个 FastAPI + 3 个 Hermes`，不要使用
+  `docker compose up --scale`。
+- `hermes-state` 和 `report-files` 依赖单台 Linux 主机的 Docker local volume 与 POSIX 文件锁；
+  不支持 NFS、NAS 共享目录、多台 ECS 或 Docker Swarm/Kubernetes 跨节点部署。
 
 确认版本：
 
@@ -72,12 +81,19 @@ chmod 600 xpd-report-agent.env
   `XPD_DB_PASSWORD`；`XPD_MYSQL_QUERY_TIMEOUT_MS` 可设置单条 Agent 查询的服务端执行上限。
 - 中台鉴权：`XPD_SERVICE_API_KEY`。
 - 会话签名：`XPD_SESSION_SIGNING_SECRET`，生产环境必须长期固定且与服务密钥不同。
+- 并发上限：`XPD_AGENT_MAX_CONCURRENCY=20` 是三节点池的初始值，应根据压测、模型限流、
+  RDS 连接数和服务器内存向下调整。
 - OSS：报告文件所需的 endpoint、bucket、prefix 和访问凭证。
 
-两个容器暂时共用这份生产配置，Compose 会按角色分别覆盖监听地址和连接地址：Hermes 监听
-`0.0.0.0:8642`，FastAPI 连接 `hermes:8642`。不要在环境文件中重新添加
-`HERMES_GATEWAY_HOST`、`FASTAPI_HOST` 或内部端口。启用定时任务时，Compose 还会固定使用内部
-回调地址 `http://xpd-report-agent:8000`。
+四个容器共用这份生产配置。Compose 会覆盖服务发现参数：三个 Hermes 都监听
+`0.0.0.0:8642`，FastAPI 使用 `HERMES_GATEWAY_NODES` 连接
+`hermes-1`、`hermes-2` 和 `hermes-3`，并用 `XPD_HERMES_SCHEDULER_NODE=hermes-1`
+固定调度节点。Compose 还会向每个 Hermes 注入唯一的 `XPD_HERMES_NODE_ID`，用于日志和运维审计。
+不要在共享环境文件中添加或覆盖节点池、节点 ID、主机名、监听端口和内部回调地址。
+
+定时报告默认关闭。若显式启用，`hermes-1` 从环境文件读取 Cron 开关并作为唯一
+Cron leader；Compose 会强制关闭 `hermes-2` 和 `hermes-3` 的定时任务及 Cron 补丁，
+防止同一任务重复触发。回调地址固定为 `http://xpd-report-agent:8000`。
 
 `HERMES_GATEWAY_API_KEY`、`XPD_SERVICE_API_KEY`、`XPD_SESSION_SIGNING_SECRET` 必须是
 三个不同的高熵密钥，每个至少 32 个字符。可以分别执行三次下列命令生成：
@@ -118,8 +134,9 @@ timeout 5 bash -c "</dev/tcp/$RDS_HOST/${RDS_PORT:-3306}" \
 ## 5. 构建镜像
 
 Dockerfile 使用两个构建目标：`fastapi` 只包含项目的 Python 3.12 运行环境，`hermes` 额外包含
-固定版本的 Python 3.11 Hermes Runtime、插件依赖和中文字体。两者共享公共依赖层；首次构建仍需
-下载 Hermes Runtime 和依赖，时间明显长于后续构建。
+固定版本的 Python 3.11 Hermes Runtime、插件依赖和中文字体。三个 Hermes 服务共用同一个
+`xpd-report-agent-hermes:dev` 镜像，不是三份镜像。两个构建目标共享公共依赖层；首次构建仍需
+下载 Hermes Runtime 和依赖，后续构建会复用 BuildKit 缓存。
 
 前台构建：
 
@@ -152,7 +169,8 @@ docker run --rm --entrypoint sh xpd-report-agent-hermes:dev \
 ```
 
 Hermes 固定运行时仅存在于 `xpd-report-agent-hermes:dev` 的 `/opt/hermes-agent`；FastAPI 镜像
-不包含该运行时。可变的会话状态仍保存在共享的 `$HOME/.hermes` 卷，因此重建镜像不会丢失历史。
+不包含该运行时。可变的会话状态仍保存在四个容器共享的 `$HOME/.hermes` 本地卷，
+因此重建镜像不会丢失历史。
 
 构建完成后，可在启动前单独检查配置：
 
@@ -165,7 +183,7 @@ docker compose run --rm --no-deps \
 ### 首次从单容器部署升级
 
 旧的 `xpd-report-agent` 容器同时运行 FastAPI 和 Hermes。第一次切换时，绝不能在旧容器仍运行
-Hermes 的同时启动新的 Hermes 容器，否则两个进程会并发写同一个 SQLite/JSON 状态卷。
+Hermes 的同时启动新的三个 Hermes 容器，否则新旧进程会并发写同一个 SQLite/JSON 状态卷。
 
 拉取新代码前，先保存旧 Compose 定义并保留正在运行的旧镜像：
 
@@ -203,14 +221,14 @@ test -n "$(find "$XPD_SPLIT_BACKUP_DIR/hermes-state" -mindepth 1 -print -quit)" 
 ```
 
 只有输出 `active_tasks=0` 且备份成功时才能继续。保持原部署目录和 Compose project 名不变，新的
-两个服务会继续使用原 `hermes-state` 与 `report-files` 卷：
+四个服务会继续使用原 `hermes-state` 与 `report-files` 本地卷：
 
 ```bash
 docker compose up -d --force-recreate
 docker compose ps
 ```
 
-如果切换失败，先停止双容器，再恢复保留的单容器镜像和 Compose 定义：
+如果切换失败，先停止四容器拓扑，再恢复保留的单容器镜像和 Compose 定义：
 
 ```bash
 docker compose down
@@ -223,23 +241,82 @@ docker compose \
 
 备份目录中可能包含会话、记忆和配置密钥，必须保持 `0700` 权限。纯新部署不执行本段。
 
+### 从旧的 `1 FastAPI + 1 Hermes` 双容器升级
+
+如果服务器已经使用旧版双容器 Compose，旧的 `xpd-report-agent-hermes` 不会因服务名改成
+`hermes-1` 而自动停止。必须在活动任务为零后显式停止它，否则旧 Hermes 会与新节点同时写
+`xpd-report-agent-hermes-state` 卷。
+
+拉取新代码前备份旧 Compose，并保留两份旧镜像：
+
+```bash
+cd /opt/xpd-report-agent/deploy/docker
+cp compose.yaml /opt/xpd-report-agent-compose-one-hermes.yaml
+docker image tag "$(docker inspect -f '{{.Image}}' xpd-report-agent)" \
+  xpd-report-agent-fastapi:rollback-before-pool
+docker image tag "$(docker inspect -f '{{.Image}}' xpd-report-agent-hermes)" \
+  xpd-report-agent-hermes:rollback-before-pool
+```
+
+新镜像构建完成后，先通过 `/health` 确认 `active_tasks=0`，再停止旧的两个容器并备份卷内数据：
+
+```bash
+docker stop --time 60 xpd-report-agent xpd-report-agent-hermes
+
+umask 077
+XPD_POOL_BACKUP_DIR="/opt/xpd-before-hermes-pool-$(date +%Y%m%d%H%M%S)"
+install -d -m 700 "$XPD_POOL_BACKUP_DIR/hermes-state"
+install -d -m 700 "$XPD_POOL_BACKUP_DIR/report-files"
+docker cp xpd-report-agent-hermes:/var/lib/xpd-report-agent/.hermes/. \
+  "$XPD_POOL_BACKUP_DIR/hermes-state/"
+docker cp xpd-report-agent-hermes:/app/data/report-files/. \
+  "$XPD_POOL_BACKUP_DIR/report-files/"
+```
+
+保持原部署目录、Compose project 名和卷名不变，启动新拓扑并移除已停止的旧
+`hermes` orphan 容器：
+
+```bash
+docker compose up -d --force-recreate --remove-orphans
+docker compose ps
+```
+
+升级失败时，先停止新拓扑，把保留镜像重新标记为旧 Compose 使用的镜像名，再恢复
+双容器：
+
+```bash
+docker compose down
+docker image tag xpd-report-agent-fastapi:rollback-before-pool \
+  xpd-report-agent-fastapi:dev
+docker image tag xpd-report-agent-hermes:rollback-before-pool \
+  xpd-report-agent-hermes:dev
+docker compose \
+  --project-directory /opt/xpd-report-agent/deploy/docker \
+  -f /opt/xpd-report-agent-compose-one-hermes.yaml \
+  up -d --force-recreate --no-build
+```
+
+不要执行 `docker compose down -v`。
+
 ## 6. 启动服务
 
 ```bash
 docker compose up -d
 docker compose ps
-docker compose logs --tail=100 hermes xpd-report-agent
+docker compose logs --tail=100 hermes-1 hermes-2 hermes-3 xpd-report-agent
 ```
 
-Hermes 先启动并通过健康检查，FastAPI 随后启动。初期显示 `health: starting` 属于正常现象；只有
-`hermes` 和 `xpd-report-agent` 两项都变为 `healthy`，才算部署完成：
+三个 Hermes 容器先启动，FastAPI 在它们进入 `started` 后启动，不会因某一个 Hermes
+暂时不健康而无法重新创建。FastAPI 运行时会自行探测节点池；初期显示 `health: starting`
+属于正常现象。至少一个 Hermes 健康时 `/ready` 可以就绪，但完整部署验收仍建议确认
+`hermes-1`、`hermes-2`、`hermes-3` 和 `xpd-report-agent` 四项都变为 `healthy`：
 
 ```text
 Up ... (healthy)
 ```
 
-两个容器 `healthy` 是部署的必要条件，但不等于模型推理和 OSS 业务链路已经验收；还必须
-完成第 8 节的真实 Agent 查询和文件下载测试。
+四个容器全部 `healthy` 是完整部署的验收标准，但不等于模型推理和 OSS 业务链路已经
+验收；还必须完成第 8 节的真实 Agent 查询和文件下载测试。
 
 ## 7. 就绪验收
 
@@ -263,8 +340,10 @@ echo
 }
 ```
 
-`runtime=true` 表示 FastAPI 已通过容器内网连接 Hermes，`mysql=true` 表示应用已实际连接 RDS，
-而不只是两个容器进程存活。`/health` 是运维诊断接口，中台业务方只需要使用 `/ready`。
+`runtime=true` 表示 FastAPI 已通过容器内网连接至少一个 Hermes 节点，`mysql=true` 表示应用已实际
+连接 RDS，而不只是容器进程存活。三个 Hermes 中的一个暂时不健康时，FastAPI 会停止向它
+分配新 owner；所有 Hermes 都不健康时 `/ready` 返回 HTTP `503`。`/health` 是运维诊断接口，
+中台业务方只需要使用 `/ready`。
 
 ## 8. 真实业务接口测试
 
@@ -366,6 +445,28 @@ docker compose ps
 `git reset --hard`。`docker compose restart` 只会重启当前容器，不会加载新代码或新镜像；
 代码或镜像更新必须使用 `docker compose up -d --force-recreate`。
 
+如果只修复 FastAPI，可以只构建和替换 FastAPI 容器，三个 Hermes 不会被重建或重启：
+
+```bash
+docker compose build --progress=plain xpd-report-agent
+docker compose up -d --no-deps --force-recreate xpd-report-agent
+curl -fsS http://127.0.0.1:8000/ready
+```
+
+如果只修改 Hermes 运行时、插件或 Skill，只构建一次共享 Hermes 镜像，然后在确认没有运行中
+任务后依次替换三个实例，Cron leader `hermes-1` 最后替换：
+
+```bash
+docker compose build --progress=plain hermes-1
+docker compose up -d --no-deps --force-recreate hermes-3
+docker compose up -d --no-deps --force-recreate hermes-2
+docker compose up -d --no-deps --force-recreate hermes-1
+docker compose ps
+```
+
+三个服务的 `image` 都是 `xpd-report-agent-hermes:dev`，因此上述命令不会产生三份镜像。
+若 FastAPI 与 Hermes 之间的内部协议不兼容，不要分开发布，应使用前述全量流程。
+
 发布后依次执行第 7 节的就绪检查和第 8 节的真实业务验收。在它们全部通过前，
 不要删除回滚镜像和状态备份。
 
@@ -396,14 +497,14 @@ curl -fsS http://127.0.0.1:8000/ready
 
 ```bash
 docker compose ps
-docker compose logs -f --tail=200 hermes xpd-report-agent
+docker compose logs -f --tail=200 hermes-1 hermes-2 hermes-3 xpd-report-agent
 docker compose restart
 ```
 
 只查看某个容器：
 
 ```bash
-docker compose logs -f --tail=200 hermes
+docker compose logs -f --tail=200 hermes-1
 docker compose logs -f --tail=200 xpd-report-agent
 ```
 
@@ -414,9 +515,11 @@ docker compose logs --since=10m \
   | grep -E 'ERROR|Traceback|AuthError|RuntimeError'
 ```
 
-Hermes 会话、记忆和任务由 `xpd-report-agent-hermes-state` 命名卷保存；Compose 的
-`report-files` 卷由两个容器共同使用，并将报告上传 OSS。`docker compose down` 不会删除命名卷；不要在生产环境
-执行 `docker compose down -v`。应定期备份状态卷，并实际验证 OSS 上传和下载。
+Hermes 会话、记忆、任务和 FastAPI 节点粘性路由都由 `xpd-report-agent-hermes-state`
+命名卷保存；Compose 的 `report-files` 卷由四个容器共同使用，并将报告上传 OSS。
+`docker compose down` 不会删除命名卷；不要在生产环境执行 `docker compose down -v`。
+应定期备份状态卷，并实际验证 OSS 上传和下载。这两个共享卷只能使用当前单机 Docker
+local volume，不能将目录换成 NFS/NAS 后把 Hermes 分布到多台主机。
 
 ## 11. 常见问题
 
@@ -454,18 +557,19 @@ docker compose logs --tail=200
 
 ### FastAPI 无法连接 Hermes
 
-先确认两个服务都在同一个 Compose project 内，并检查 Hermes 健康与内部 DNS：
+先确认四个服务都在同一个 Compose project 内，并检查三个 Hermes 的健康状态与内部 DNS：
 
 ```bash
 docker compose ps
-docker compose logs --tail=200 hermes
+docker compose logs --tail=200 hermes-1 hermes-2 hermes-3
 docker compose exec xpd-report-agent \
   /app/.venv/bin/python -c \
-  "import socket; print(socket.gethostbyname('hermes'))"
+  "import socket; print([socket.gethostbyname(name) for name in ('hermes-1', 'hermes-2', 'hermes-3')])"
 ```
 
-不要把共享环境文件中的 `HERMES_GATEWAY_HOST` 改回 `127.0.0.1`。服务级配置应保持：Hermes
-监听 `0.0.0.0`，FastAPI 连接 `hermes`。
+不要在共享环境文件中添加 `HERMES_GATEWAY_HOST`、`HERMES_GATEWAY_NODES` 或
+`XPD_HERMES_SCHEDULER_NODE`。服务级配置应保持：Hermes 监听 `0.0.0.0`，FastAPI 按 Compose
+中的节点 ID 连接 `hermes-1`、`hermes-2` 和 `hermes-3`。
 
 ### 拆分前创建的定时任务回调失败
 
