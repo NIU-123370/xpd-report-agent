@@ -40,6 +40,7 @@ def test_dockerfile_keeps_expensive_dependencies_in_a_stable_layer():
     assert "from=hermes_seed" in dockerfile
     assert "sha256sum -c hermes-agent.tar.gz.sha256" in dockerfile
     assert "rev-parse --verify HEAD^{commit}" in dockerfile
+    assert 'git config --system --add safe.directory "$HERMES_AGENT_DIR"' in dockerfile
 
 
 def test_compose_persists_state_and_allows_graceful_shutdown():

@@ -88,6 +88,9 @@ RUN --mount=type=cache,target=/var/cache/uv \
       test -f "$HERMES_AGENT_DIR/pyproject.toml"; \
       test -x "$HERMES_BIN"'
 
+# The immutable runtime is installed by root and inspected by xpd-agent.
+RUN git config --system --add safe.directory "$HERMES_AGENT_DIR"
+
 COPY . /app
 
 RUN --mount=type=cache,target=/var/cache/uv \
