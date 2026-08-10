@@ -1,32 +1,74 @@
+x-xpd-common: &xpd-common
+  restart: unless-stopped
+  stop_grace_period: 60s
+  env_file:
+    - xpd-report-agent.env
+  volumes:
+    - hermes-state:/var/lib/xpd-report-agent/.hermes
+    - report-files:/app/data/report-files
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
 services:
-  xpd-report-agent:
+  hermes:
+    <<: *xpd-common
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+      target: hermes
       additional_contexts:
         hermes_seed: ./hermes-seed
-    image: xpd-report-agent:dev
-    container_name: xpd-report-agent
-    restart: unless-stopped
-    stop_grace_period: 60s
-    env_file:
-      - xpd-report-agent.env
-    ports:
-      - "8000:8000"
-    volumes:
-      - hermes-state:/var/lib/xpd-report-agent/.hermes
-      - report-files:/app/data/report-files
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    image: xpd-report-agent-hermes:dev
+    container_name: xpd-report-agent-hermes
+    environment:
+      XPD_CONTAINER_ROLE: hermes
+      HERMES_HOME: /var/lib/xpd-report-agent/.hermes
+      HERMES_GATEWAY_HOST: 0.0.0.0
+      HERMES_GATEWAY_PORT: "8642"
+      XPD_FILE_STORAGE_PATH: /app/data/report-files
+      XPD_CRON_SCRIPT_DIR: /var/lib/xpd-report-agent/.hermes/scripts
+      XPD_CRON_CALLBACK_ORIGIN: http://xpd-report-agent:8000
+    expose:
+      - "8642"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8000/ready', timeout=5).close()"]
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import os, urllib.request; request = urllib.request.Request('http://127.0.0.1:8642/v1/health', headers={'Authorization': 'Bearer ' + os.environ['HERMES_GATEWAY_API_KEY']}); urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=5).close()"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 120s
+
+  xpd-report-agent:
+    <<: *xpd-common
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: fastapi
+    image: xpd-report-agent-fastapi:dev
+    container_name: xpd-report-agent
+    environment:
+      XPD_CONTAINER_ROLE: fastapi
+      FASTAPI_HOST: 0.0.0.0
+      FASTAPI_PORT: "8000"
+      HERMES_HOME: /var/lib/xpd-report-agent/.hermes
+      HERMES_GATEWAY_HOST: hermes
+      HERMES_GATEWAY_PORT: "8642"
+      XPD_FILE_STORAGE_PATH: /app/data/report-files
+      XPD_CRON_SCRIPT_DIR: /var/lib/xpd-report-agent/.hermes/scripts
+      XPD_CRON_CALLBACK_ORIGIN: http://xpd-report-agent:8000
+    depends_on:
+      hermes:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8000/ready', timeout=5).close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 volumes:
   hermes-state:

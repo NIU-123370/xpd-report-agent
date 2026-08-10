@@ -16,10 +16,18 @@ def _read(path: Path) -> str:
 def test_dockerfile_separates_hermes_runtime_from_persistent_state():
     dockerfile = _read(DOCKER_DIR / "Dockerfile")
 
+    assert "FROM project-deps AS fastapi" in dockerfile
+    assert "FROM hermes-runtime AS hermes" in dockerfile
     assert "HERMES_AGENT_DIR=/opt/hermes-agent" in dockerfile
     assert "HERMES_BIN=/opt/hermes-agent/venv/bin/hermes" in dockerfile
     assert 'mkdir -p "$HOME/.hermes"' in dockerfile
     assert '$HOME/.hermes/hermes-agent' not in dockerfile
+
+    fastapi_stage = dockerfile.split("FROM project-deps AS fastapi", 1)[1].split(
+        "FROM hermes-runtime AS hermes", 1
+    )[0]
+    assert "/opt/hermes-agent" not in fastapi_stage
+    assert "XPD_CONTAINER_ROLE=fastapi" in fastapi_stage
 
 
 def test_dockerfile_keeps_expensive_dependencies_in_a_stable_layer():
@@ -36,34 +44,84 @@ def test_dockerfile_keeps_expensive_dependencies_in_a_stable_layer():
     assert "--constraints" in dockerfile
     assert "git -c http.version=HTTP/1.1" in dockerfile
     assert "for attempt in 1 2 3" in dockerfile
-    assert "ENV UV_HTTP_TIMEOUT=300" in dockerfile
+    assert "UV_HTTP_TIMEOUT=300" in dockerfile
     assert "from=hermes_seed" in dockerfile
     assert "sha256sum -c hermes-agent.tar.gz.sha256" in dockerfile
     assert "rev-parse --verify HEAD^{commit}" in dockerfile
     assert 'git config --system --add safe.directory "$HERMES_AGENT_DIR"' in dockerfile
 
 
-def test_compose_persists_state_and_allows_graceful_shutdown():
+def test_compose_runs_fastapi_and_hermes_as_separate_services():
     compose = yaml.safe_load(_read(DOCKER_DIR / "compose.yaml"))
-    service = compose["services"]["xpd-report-agent"]
+    services = compose["services"]
+    hermes = services["hermes"]
+    fastapi = services["xpd-report-agent"]
 
-    assert service["build"]["additional_contexts"] == {
+    assert set(services) == {"hermes", "xpd-report-agent"}
+    assert hermes["build"]["target"] == "hermes"
+    assert fastapi["build"]["target"] == "fastapi"
+    assert hermes["build"]["additional_contexts"] == {
         "hermes_seed": "./hermes-seed"
     }
-    assert service["stop_grace_period"] == "60s"
-    assert "hermes-state:/var/lib/xpd-report-agent/.hermes" in service["volumes"]
-    assert "report-files:/app/data/report-files" in service["volumes"]
-    assert service["logging"] == {
-        "driver": "json-file",
-        "options": {"max-size": "20m", "max-file": "5"},
+    assert "additional_contexts" not in fastapi["build"]
+    assert hermes["image"] != fastapi["image"]
+    assert fastapi["container_name"] == "xpd-report-agent"
+    assert hermes["container_name"] == "xpd-report-agent-hermes"
+    assert hermes["environment"]["XPD_CONTAINER_ROLE"] == "hermes"
+    assert fastapi["environment"]["XPD_CONTAINER_ROLE"] == "fastapi"
+
+
+def test_compose_keeps_hermes_internal_and_waits_for_its_health():
+    compose = yaml.safe_load(_read(DOCKER_DIR / "compose.yaml"))
+    hermes = compose["services"]["hermes"]
+    fastapi = compose["services"]["xpd-report-agent"]
+
+    assert hermes["environment"]["HERMES_GATEWAY_HOST"] == "0.0.0.0"
+    assert fastapi["environment"]["HERMES_GATEWAY_HOST"] == "hermes"
+    assert fastapi["depends_on"] == {
+        "hermes": {"condition": "service_healthy"}
     }
-    assert "ProxyHandler({})" in service["healthcheck"]["test"][-1]
+    assert hermes["expose"] == ["8642"]
+    assert "ports" not in hermes
+    assert fastapi["ports"] == ["8000:8000"]
+    assert "ProxyHandler({})" in hermes["healthcheck"]["test"][-1]
+    assert "ProxyHandler({})" in fastapi["healthcheck"]["test"][-1]
+
+
+def test_compose_shares_state_and_report_files_between_services():
+    compose = yaml.safe_load(_read(DOCKER_DIR / "compose.yaml"))
+    required_volumes = {
+        "hermes-state:/var/lib/xpd-report-agent/.hermes",
+        "report-files:/app/data/report-files",
+    }
+
+    for service in compose["services"].values():
+        assert service["stop_grace_period"] == "60s"
+        assert required_volumes <= set(service["volumes"])
+        assert service["logging"] == {
+            "driver": "json-file",
+            "options": {"max-size": "20m", "max-file": "5"},
+        }
+        assert service["environment"]["XPD_FILE_STORAGE_PATH"] == (
+            "/app/data/report-files"
+        )
+        assert service["environment"]["HERMES_HOME"] == (
+            "/var/lib/xpd-report-agent/.hermes"
+        )
+        assert service["environment"]["XPD_CRON_SCRIPT_DIR"] == (
+            "/var/lib/xpd-report-agent/.hermes/scripts"
+        )
+        assert service["environment"]["XPD_CRON_CALLBACK_ORIGIN"] == (
+            "http://xpd-report-agent:8000"
+        )
+
     assert compose["volumes"]["hermes-state"]["name"] == (
         "xpd-report-agent-hermes-state"
     )
+    assert compose["volumes"]["report-files"] is None
 
 
-def test_entrypoint_fails_preflight_before_starting_services():
+def test_entrypoint_runs_exactly_one_role_after_preflight():
     entrypoint = _read(DOCKER_DIR / "entrypoint.sh")
 
     preflight = (
@@ -72,9 +130,12 @@ def test_entrypoint_fails_preflight_before_starting_services():
     )
     assert preflight in entrypoint
     assert entrypoint.index(preflight) < entrypoint.index("hermes.sh run")
-    assert "ProxyHandler({})" in entrypoint
-    assert 'configured_host in {"", "0.0.0.0"}' in entrypoint
-    assert "Hermes Gateway exited before becoming healthy" in entrypoint
+    assert entrypoint.index(preflight) < entrypoint.index("fastapi.sh run")
+    assert 'case "${XPD_CONTAINER_ROLE:-}" in' in entrypoint
+    assert "exec /app/scripts/services/hermes.sh run" in entrypoint
+    assert "exec /app/scripts/services/fastapi.sh run" in entrypoint
+    assert "wait -n" not in entrypoint
+    assert "hermes.sh run &" not in entrypoint
 
 
 def test_docker_context_excludes_secret_environment_files():
@@ -104,6 +165,17 @@ def test_docker_environment_template_contains_production_model_and_identity_conf
         "FASTAPI_RELOAD=false",
     ):
         assert expected in template
+
+    for compose_managed in (
+        "FASTAPI_HOST=",
+        "FASTAPI_PORT=",
+        "HERMES_GATEWAY_HOST=",
+        "HERMES_GATEWAY_PORT=",
+        "XPD_CRON_CALLBACK_ORIGIN=",
+    ):
+        assert not any(
+            line.startswith(compose_managed) for line in template.splitlines()
+        )
 
 
 def test_systemd_healthcheck_probes_wildcard_bind_addresses_via_loopback():

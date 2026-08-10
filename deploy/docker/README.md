@@ -1,16 +1,18 @@
 # Docker 部署指南（阿里云 ECS / Linux）
 
-本文用于把 `xpd-report-agent` 部署为中台可调用的 AI 微服务。部署采用单容器模式：
+本文用于把 `xpd-report-agent` 部署为中台可调用的 AI 微服务。部署采用两个独立容器：
 
 ```text
-Docker 容器 xpd-report-agent
-├── FastAPI            0.0.0.0:8000（中台调用）
-├── Hermes Gateway     127.0.0.1:8642（仅容器内部）
-├── db-query           RDS 只读查询
-└── report-file        Excel/PDF 等报告并上传 OSS
+中台 -> xpd-report-agent（FastAPI，宿主机 8000）
+                -> hermes（Gateway，Compose 内网 8642）
+                        -> db-query -> RDS 只读查询
+                        -> report-file -> Excel/PDF 等报告并上传 OSS
+
+两个容器共享 hermes-state 和 report-files 卷
 ```
 
-数据库和 OSS 不部署在容器内，分别连接阿里云 RDS 和 OSS。
+Hermes 的 `8642` 不映射到宿主机，只允许 FastAPI 通过 Compose 服务网络访问。数据库和 OSS
+不部署在容器内，分别连接阿里云 RDS 和 OSS。
 
 ## 1. 部署前检查
 
@@ -20,6 +22,8 @@ Docker 容器 xpd-report-agent
 - RDS 使用 MySQL 5.7.8 或更高版本，推荐 MySQL 8.0。
 - 数据库账号对目标库和业务表至少有 `SELECT` 权限，不要使用 root 账号。
 - ECS 安全组只向中台来源开放 `8000`，不要将 `8642` 暴露到公网。
+- 当前本地 JSON/SQLite 状态模型只支持 `1 个 FastAPI + 1 个 Hermes`，不要使用
+  `docker compose up --scale` 横向扩容；多实例前必须先迁移到支持并发的一致共享存储。
 
 确认版本：
 
@@ -70,6 +74,11 @@ chmod 600 xpd-report-agent.env
 - 会话签名：`XPD_SESSION_SIGNING_SECRET`，生产环境必须长期固定且与服务密钥不同。
 - OSS：报告文件所需的 endpoint、bucket、prefix 和访问凭证。
 
+两个容器暂时共用这份生产配置，Compose 会按角色分别覆盖监听地址和连接地址：Hermes 监听
+`0.0.0.0:8642`，FastAPI 连接 `hermes:8642`。不要在环境文件中重新添加
+`HERMES_GATEWAY_HOST`、`FASTAPI_HOST` 或内部端口。启用定时任务时，Compose 还会固定使用内部
+回调地址 `http://xpd-report-agent:8000`。
+
 `HERMES_GATEWAY_API_KEY`、`XPD_SERVICE_API_KEY`、`XPD_SESSION_SIGNING_SECRET` 必须是
 三个不同的高熵密钥，每个至少 32 个字符。可以分别执行三次下列命令生成：
 
@@ -108,8 +117,9 @@ timeout 5 bash -c "</dev/tcp/$RDS_HOST/${RDS_PORT:-3306}" \
 
 ## 5. 构建镜像
 
-Dockerfile 已使用适合阿里云网络的公共 ECR Python 基础镜像、阿里云 Debian 镜像和 Python
-包镜像。首次构建仍需下载固定版本的 Hermes Runtime 和依赖，时间明显长于后续构建。
+Dockerfile 使用两个构建目标：`fastapi` 只包含项目的 Python 3.12 运行环境，`hermes` 额外包含
+固定版本的 Python 3.11 Hermes Runtime、插件依赖和中文字体。两者共享公共依赖层；首次构建仍需
+下载 Hermes Runtime 和依赖，时间明显长于后续构建。
 
 前台构建：
 
@@ -125,22 +135,24 @@ nohup docker compose build --progress=plain \
 tail -f /opt/xpd-report-agent-build.log
 ```
 
-按 `Ctrl+C` 只会退出日志查看，不会终止后台构建。成功结尾应包含：
+按 `Ctrl+C` 只会退出日志查看，不会终止后台构建。成功后应能看到两个本地镜像：
 
-```text
-Image xpd-report-agent:dev Built
+```bash
+docker image inspect \
+  xpd-report-agent-fastapi:dev \
+  xpd-report-agent-hermes:dev >/dev/null
 ```
 
 验证镜像中的 Hermes：
 
 ```bash
-docker run --rm --entrypoint sh xpd-report-agent:dev \
+docker run --rm --entrypoint sh xpd-report-agent-hermes:dev \
   -c '/opt/hermes-agent/venv/bin/hermes --version && \
       uv pip check --python /opt/hermes-agent/venv/bin/python'
 ```
 
-镜像内的 Hermes 固定运行时位于 `/opt/hermes-agent`，不再放进持久化的
-`$HOME/.hermes`。这样重建镜像时不会被旧数据卷遮住新运行时。
+Hermes 固定运行时仅存在于 `xpd-report-agent-hermes:dev` 的 `/opt/hermes-agent`；FastAPI 镜像
+不包含该运行时。可变的会话状态仍保存在共享的 `$HOME/.hermes` 卷，因此重建镜像不会丢失历史。
 
 构建完成后，可在启动前单独检查配置：
 
@@ -150,75 +162,83 @@ docker compose run --rm --no-deps \
   -m xpd_report_agent.runtime.deployment_preflight
 ```
 
-### 首次从旧镜像升级
+### 首次从单容器部署升级
 
-旧镜像把 Hermes 运行时和会话状态混在容器可写层的
-`/var/lib/xpd-report-agent/.hermes` 中。首次升级到新状态卷前，如果要保留已有会话、
-记忆和任务，必须在新镜像构建完成后、重建容器之前停服备份。不要在 Hermes
-仍在写 SQLite/JSON 状态时直接打包。
+旧的 `xpd-report-agent` 容器同时运行 FastAPI 和 Hermes。第一次切换时，绝不能在旧容器仍运行
+Hermes 的同时启动新的 Hermes 容器，否则两个进程会并发写同一个 SQLite/JSON 状态卷。
+
+拉取新代码前，先保存旧 Compose 定义并保留正在运行的旧镜像：
 
 ```bash
-umask 077
-XPD_STATE_BACKUP_DIR="/opt/xpd-hermes-state-$(date +%Y%m%d%H%M%S)"
-install -d -m 700 "$XPD_STATE_BACKUP_DIR"
-
-# 即使 xpd-report-agent:dev 已被新构建覆盖，也从当前容器保留旧镜像。
+cd /opt/xpd-report-agent/deploy/docker
+cp compose.yaml /opt/xpd-report-agent-compose-single.yaml
 docker image tag "$(docker inspect -f '{{.Image}}' xpd-report-agent)" \
-  xpd-report-agent:rollback-before-state-volume
-echo 'xpd-report-agent:rollback-before-state-volume' \
-  > /opt/xpd-report-agent-last-rollback-image
+  xpd-report-agent:rollback-before-split
+```
 
+可以在旧服务运行期间拉取代码并构建两个新镜像。构建完成后，等待所有 Agent 任务结束，再停服做
+一致性备份：
+
+```bash
 curl -fsS http://127.0.0.1:8000/health | python3 -c '
 import json, sys
 active = json.load(sys.stdin)["agent_runs"]["active_tasks"]
 print(f"active_tasks={active}")
 raise SystemExit(0 if active == 0 else 1)
 '
+
+umask 077
+XPD_SPLIT_BACKUP_DIR="/opt/xpd-before-split-$(date +%Y%m%d%H%M%S)"
+install -d -m 700 "$XPD_SPLIT_BACKUP_DIR/hermes-state"
+install -d -m 700 "$XPD_SPLIT_BACKUP_DIR/report-files"
+
 docker stop --time 60 xpd-report-agent
 docker cp xpd-report-agent:/var/lib/xpd-report-agent/.hermes/. \
-  "$XPD_STATE_BACKUP_DIR/"
-test -n "$(find "$XPD_STATE_BACKUP_DIR" -mindepth 1 -print -quit)" \
-  && echo "状态备份完成：$XPD_STATE_BACKUP_DIR" \
-  || { echo '状态备份为空，已恢复旧服务，请停止发布' >&2; \
+  "$XPD_SPLIT_BACKUP_DIR/hermes-state/"
+docker cp xpd-report-agent:/app/data/report-files/. \
+  "$XPD_SPLIT_BACKUP_DIR/report-files/"
+test -n "$(find "$XPD_SPLIT_BACKUP_DIR/hermes-state" -mindepth 1 -print -quit)" \
+  || { echo 'Hermes 状态备份为空，已恢复旧服务，请停止发布' >&2; \
        docker start xpd-report-agent; false; }
 ```
 
-只有命令输出 `active_tasks=0` 和“状态备份完成”时才能继续。任一检查失败都应立即停止
-发布，不要在运行中任务尚未归零时强制备份。
-
-将这份一致性备份恢复到固定名称的状态卷，然后直接启动新容器：
+只有输出 `active_tasks=0` 且备份成功时才能继续。保持原部署目录和 Compose project 名不变，新的
+两个服务会继续使用原 `hermes-state` 与 `report-files` 卷：
 
 ```bash
-docker volume create xpd-report-agent-hermes-state
-docker run --rm --user root --entrypoint sh \
-  -v xpd-report-agent-hermes-state:/target \
-  -v "$XPD_STATE_BACKUP_DIR:/source:ro" \
-  xpd-report-agent:dev \
-  -c 'cp -a /source/. /target/ && \
-      chown -R xpd-agent:xpd-agent /target'
 docker compose up -d --force-recreate
+docker compose ps
 ```
 
-这份首次迁移备份也包含旧 Hermes 目录，主要用于首次发布回滚；新镜像始终使用
-`/opt/hermes-agent`，不会执行卷中的旧运行时。备份目录中包含配置和密钥，必须保持
-`0700` 权限。如果备份或恢复失败，先执行 `docker start xpd-report-agent` 恢复旧服务，不要继续
-重建容器。纯新部署不需要执行本段。
+如果切换失败，先停止双容器，再恢复保留的单容器镜像和 Compose 定义：
+
+```bash
+docker compose down
+docker image tag xpd-report-agent:rollback-before-split xpd-report-agent:dev
+docker compose \
+  --project-directory /opt/xpd-report-agent/deploy/docker \
+  -f /opt/xpd-report-agent-compose-single.yaml \
+  up -d --force-recreate --no-build
+```
+
+备份目录中可能包含会话、记忆和配置密钥，必须保持 `0700` 权限。纯新部署不执行本段。
 
 ## 6. 启动服务
 
 ```bash
 docker compose up -d
 docker compose ps
-docker compose logs --tail=100
+docker compose logs --tail=100 hermes xpd-report-agent
 ```
 
-启动初期显示 `health: starting` 属于正常现象。只有状态变为 `healthy`，才算部署完成：
+Hermes 先启动并通过健康检查，FastAPI 随后启动。初期显示 `health: starting` 属于正常现象；只有
+`hermes` 和 `xpd-report-agent` 两项都变为 `healthy`，才算部署完成：
 
 ```text
 Up ... (healthy)
 ```
 
-`healthy` 是部署的必要条件，但不等于模型推理和 OSS 业务链路已经验收；还必须
+两个容器 `healthy` 是部署的必要条件，但不等于模型推理和 OSS 业务链路已经验收；还必须
 完成第 8 节的真实 Agent 查询和文件下载测试。
 
 ## 7. 就绪验收
@@ -243,8 +263,8 @@ echo
 }
 ```
 
-`runtime=true` 表示 Agent 运行时可用，`mysql=true` 表示应用已实际连接 RDS，而不只是容器进程
-存活。`/health` 是运维诊断接口，中台业务方只需要使用 `/ready`。
+`runtime=true` 表示 FastAPI 已通过容器内网连接 Hermes，`mysql=true` 表示应用已实际连接 RDS，
+而不只是两个容器进程存活。`/health` 是运维诊断接口，中台业务方只需要使用 `/ready`。
 
 ## 8. 真实业务接口测试
 
@@ -327,9 +347,12 @@ git fetch origin master
 git merge --ff-only origin/master
 
 cd deploy/docker
-XPD_ROLLBACK_TAG="xpd-report-agent:rollback-$(date +%Y%m%d%H%M%S)"
-docker image tag xpd-report-agent:dev "$XPD_ROLLBACK_TAG"
-echo "$XPD_ROLLBACK_TAG" > /opt/xpd-report-agent-last-rollback-image
+docker image tag \
+  xpd-report-agent-fastapi:dev \
+  xpd-report-agent-fastapi:rollback-last
+docker image tag \
+  xpd-report-agent-hermes:dev \
+  xpd-report-agent-hermes:rollback-last
 
 docker compose build --progress=plain
 docker compose run --rm --no-deps \
@@ -348,28 +371,40 @@ docker compose ps
 
 ### 回滚镜像
 
-如果新版启动失败或真实业务验收不通过，使用发布前保留的镜像立即回滚：
+如果新版启动失败或真实业务验收不通过，使用发布前保留的两份镜像一起回滚：
 
 ```bash
 cd /opt/xpd-report-agent/deploy/docker
-XPD_ROLLBACK_TAG="$(cat /opt/xpd-report-agent-last-rollback-image)"
-docker image inspect "$XPD_ROLLBACK_TAG" >/dev/null
-docker image tag "$XPD_ROLLBACK_TAG" xpd-report-agent:dev
+docker image inspect \
+  xpd-report-agent-fastapi:rollback-last \
+  xpd-report-agent-hermes:rollback-last >/dev/null
+docker image tag \
+  xpd-report-agent-fastapi:rollback-last \
+  xpd-report-agent-fastapi:dev
+docker image tag \
+  xpd-report-agent-hermes:rollback-last \
+  xpd-report-agent-hermes:dev
 docker compose up -d --force-recreate --no-build
 docker compose ps
 curl -fsS http://127.0.0.1:8000/ready
 ```
 
-首次引入 `hermes-state` 卷时，回滚依赖第 5 节保留的完整状态备份；不要跳过首次迁移。
-镜像回滚只恢复运行服务，服务器 Git 工作树仍保留新版代码；确认原因后，通过新的
-Codeup 修复提交再次发布，不在生产机上直接改代码。
+首次从单容器拆分时使用第 5 节的专用回滚流程。日常的双镜像回滚只恢复运行服务，服务器 Git
+工作树仍保留新版代码；确认原因后，通过新的 Codeup 修复提交再次发布，不在生产机上直接改代码。
 
 ### 日常命令
 
 ```bash
 docker compose ps
-docker compose logs -f --tail=200
+docker compose logs -f --tail=200 hermes xpd-report-agent
 docker compose restart
+```
+
+只查看某个容器：
+
+```bash
+docker compose logs -f --tail=200 hermes
+docker compose logs -f --tail=200 xpd-report-agent
 ```
 
 查看最近错误：
@@ -379,8 +414,8 @@ docker compose logs --since=10m \
   | grep -E 'ERROR|Traceback|AuthError|RuntimeError'
 ```
 
-Hermes 会话、记忆和任务由 `xpd-report-agent-hermes-state` 命名卷保存，报告文件由
-`report-files` 卷保存并上传 OSS。`docker compose down` 不会删除命名卷；不要在生产环境
+Hermes 会话、记忆和任务由 `xpd-report-agent-hermes-state` 命名卷保存；Compose 的
+`report-files` 卷由两个容器共同使用，并将报告上传 OSS。`docker compose down` 不会删除命名卷；不要在生产环境
 执行 `docker compose down -v`。应定期备份状态卷，并实际验证 OSS 上传和下载。
 
 ## 11. 常见问题
@@ -416,6 +451,26 @@ tail -f /opt/xpd-report-agent-build.log
 ```bash
 docker compose logs --tail=200
 ```
+
+### FastAPI 无法连接 Hermes
+
+先确认两个服务都在同一个 Compose project 内，并检查 Hermes 健康与内部 DNS：
+
+```bash
+docker compose ps
+docker compose logs --tail=200 hermes
+docker compose exec xpd-report-agent \
+  /app/.venv/bin/python -c \
+  "import socket; print(socket.gethostbyname('hermes'))"
+```
+
+不要把共享环境文件中的 `HERMES_GATEWAY_HOST` 改回 `127.0.0.1`。服务级配置应保持：Hermes
+监听 `0.0.0.0`，FastAPI 连接 `hermes`。
+
+### 拆分前创建的定时任务回调失败
+
+定时任务脚本会固化创建时的回调地址。旧脚本如果仍指向 `127.0.0.1:8000`，拆容器后不会自动
+更新；请删除并重新创建对应定时任务，使脚本使用 `http://xpd-report-agent:8000`。
 
 ### SQLite WAL 警告
 
