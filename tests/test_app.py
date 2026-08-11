@@ -389,6 +389,8 @@ def test_chat_stream_proxies_sse(monkeypatch):
 
     assert response.status_code == 200
     assert response.headers["Deprecation"] == "true"
+    assert response.headers["Cache-Control"] == "no-cache, no-transform"
+    assert response.headers["X-Accel-Buffering"] == "no"
     assert "Legacy stateless chat" in response.headers["Warning"]
     assert "结论" in response.text
     assert "流式" in response.text
@@ -410,3 +412,14 @@ def test_streaming_tool_progress_is_only_rendered_in_analysis_panel():
 
     assert "appendAssistantProgress(assistantView, progressText);" in source
     assert "assistantView.contentEl.textContent = progressText" not in source
+
+
+def test_streaming_ui_renders_immediate_progress_and_run_deltas():
+    source = (app_main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'Accept: "text/event-stream"' in source
+    assert 'appendAssistantProgress(assistantView, "任务已提交，正在等待分析资源…");' in source
+    assert 'event === "progress"' in source
+    assert 'event === "answer.delta"' in source
+    assert 'if (typeof data?.content === "string") {' in source
+    assert "content = data.content;" in source

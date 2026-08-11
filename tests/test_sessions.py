@@ -402,6 +402,53 @@ def test_sse_relay_waits_for_complete_frame_then_emits_artifact_and_falls_back(
     assert relayed.index(fallback_id) > relayed.index("event: assistant.delta")
 
 
+def test_session_stream_disables_proxy_buffering(monkeypatch):
+    session_id = "xpd_" + "a" * 20 + "_stream_headers"
+
+    async def get_session(_session_id, _scope):
+        return {"id": _session_id, "ended_at": None}
+
+    async def prepare_session_turn(*_args, **_kwargs):
+        return None
+
+    async def resolve_node(*_args, **_kwargs):
+        return type(
+            "Node",
+            (),
+            {"node_id": "hermes-1", "origin": "http://hermes-1:8642"},
+        )()
+
+    monkeypatch.setattr(sessions_api, "_get_session", get_session)
+    monkeypatch.setattr(sessions_api, "_prepare_session_turn", prepare_session_turn)
+    monkeypatch.setattr(sessions_api, "resolve_hermes_node", resolve_node)
+    monkeypatch.setattr(sessions_api, "_artifact_ids", lambda _session_id: set())
+    monkeypatch.setattr(sessions_api, "_claim_chat_session", lambda _session_id: True)
+
+    request = type(
+        "Request",
+        (),
+        {"state": type("State", (), {"request_id": "request-stream-headers"})()},
+    )()
+
+    async def create_and_read_first_event():
+        response = await sessions_api.session_chat_stream(
+            session_id,
+            sessions_api.SessionChatRequest(message="分析昨天成交额", stream=True),
+            request,
+            "a" * 20,
+        )
+        first_event = await anext(response.body_iterator)
+        await response.body_iterator.aclose()
+        return response, first_event
+
+    response, first_event = asyncio.run(create_and_read_first_event())
+
+    assert response.headers["cache-control"] == "no-cache, no-transform"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert "event: progress" in first_event
+    assert "任务已提交，正在等待分析资源" in first_event
+
+
 def test_session_owner_mismatch_is_hidden_before_upstream_call(monkeypatch):
     client = make_client(monkeypatch)
 

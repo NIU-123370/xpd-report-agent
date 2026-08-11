@@ -129,6 +129,10 @@ POST /api/chat/stream
 POST /api/sessions/{session_id}/chat
 ```
 
+内部 Session SSE 与废弃的 `/api/chat/stream` 均返回
+`Cache-Control: no-cache, no-transform` 和 `X-Accel-Buffering: no`，用于降低代理缓存、压缩或聚合响应造成的首字延迟。
+这两个响应头是可观察接口契约，但不能替代调用链中各层代理的流式配置。
+
 ## 8. 内部测试重点
 
 - 验证缺失或错误的 Service Bearer 统一返回 `401 SERVICE_AUTH_FAILED`；
@@ -138,6 +142,8 @@ POST /api/sessions/{session_id}/chat
 - 验证创建任务和澄清回答的幂等重放与冲突行为。
 - 验证五种 run 状态及服务重启后的任务恢复。
 - 验证 SSE 约 15 秒心跳、六类完整事件、`Last-Event-ID` 断线续传和缓存丢失后的权威终态。
+- 验证内部 Session SSE、稳定 Run SSE 和废弃 SSE 的响应包含
+  `Cache-Control: no-cache, no-transform` 与 `X-Accel-Buffering: no`。
 - 验证同一会话串行执行，不交错提交多个未完成任务。
 - 验证 MySQL 只读查询、空结果、零分母、小样本和数据不足提示。
 - 验证商家版 Excel 的工作表契约：简单查询为“经营摘要、数据明细、口径与提示”；
