@@ -335,7 +335,7 @@ questions:
       when: 无法从上下文判断导出用途和分析深度
       question: 这份 Excel 需要哪种内容？
       choices: [简单查询结果, 对比分析, 诊断分析]
-    expected_output: [导出文件, 数据口径, 查询审计]
+    expected_output: [导出文件, 数据口径, 商家可读提示]
     answer:
       template: "已按 {analysis_type} 生成 Excel，包含 {sheet_names}；数据范围为 {period}，共 {row_count} 行。"
       evidence: [已确认分析类型, 文件生成状态, 行数, 截断状态, 查询口径]
@@ -350,12 +350,12 @@ questions:
     metrics: [退款金额, 金额退款率]
     dimensions: [商品, 场次, 自然日]
     clarification: null
-    expected_output: [经营摘要, 趋势与对比, 驱动分析, 数据明细, 数据口径与质量, 查询审计]
+    expected_output: [经营摘要, 趋势与对比, 异常与建议, 数据明细, 口径与提示]
     answer:
-      template: "已生成退款诊断 Excel；摘要展示退款变化、主要驱动和建议，明细与查询审计位于后续工作表。"
+      template: "已生成退款诊断 Excel；摘要展示退款变化，异常与建议、数据明细和口径提示位于后续工作表。"
       evidence: [退款指标, 对比结果, 驱动证据, 数据质量, 文件状态]
-      guardrails: [缺少证据的建议不写入摘要, SQL仅放查询审计]
-      fallback: "若结果为空，仍可导出口径与查询审计，但必须显著标注无结果。"
+      guardrails: [缺少证据的建议不写入摘要, SQL不得进入商家文件]
+      fallback: "若结果为空，仍可导出口径与提示，但必须显著标注无结果。"
 
   - id: mq_020
     category: 口径
@@ -481,7 +481,7 @@ questions:
       choices: [当前筛选结果, 当前商家全部可用数据]
     expected_output: [导出范围, 行数, 截断状态, 文件结果]
     answer:
-      template: "导出范围为 {scope}，共 {row_count} 行，{truncated_text}。文件中的口径和查询审计记录了完整筛选条件。"
+      template: "导出范围为 {scope}，共 {row_count} 行，{truncated_text}。文件中的口径与提示记录了商家需要了解的筛选条件。"
       evidence: [筛选条件, 行数, 最大行数, 截断状态, 文件状态]
       guardrails: [截断结果不得称为全部, 空结果文件必须标注原因, 防止Excel公式注入]
       fallback: "超过限制时建议缩小周期、按月拆分或先导出汇总。"

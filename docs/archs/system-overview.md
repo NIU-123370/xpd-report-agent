@@ -66,7 +66,7 @@ Session SSE、本地同步兼容接口和中台 Run 复用同一套 turn 路径�
   JSON 保留结构化元数据与查询明细。生成器内部验证 UTF-8/JSON/ZIP/XML/PDF 结构，不把整份报表
   重新灌入模型上下文。
 - 文件生成并通过格式校验后上传到 `starpartner-biz/public/dev/agent-report-files/`。
-  对象按北京时间使用 `YYYYMMDD/uid-traceid-秒级Unix时间戳-artifact_id.扩展名`。本地只保存
+  对象按北京时间使用 `YYYYMMDD/uid-traceid-秒级Unix时间戳.扩展名`。本地只保存
   非敏感对象元数据，API 每次读取时重新签发短期下载 URL，不持久化长期有效的公开链接。
 - Hermes 原生 `file` toolset 仅保留 `read_file`，且 session-id 内嵌 scope 必须与
   `X-Hermes-Session-Key` 一致；只可读取当前会话导出目录下符合系统命名的文件。

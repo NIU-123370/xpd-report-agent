@@ -84,7 +84,7 @@ PDF 导出会将中文字体子集嵌入文件，避免服务器和下载端出�
 
 报表默认上传到 `starpartner-biz/public/dev/agent-report-files/`。OSS 账号需要该前缀的
 上传和读取权限，并建议配置对象生命周期；接口返回有限时效的签名下载 URL。
-对象按北京时间使用 `YYYYMMDD/uid-traceid-秒级Unix时间戳-artifact_id.扩展名`。
+对象按北京时间使用 `YYYYMMDD/uid-traceid-秒级Unix时间戳.扩展名`。
 
 `user_id` 模式下默认不暴露 Hermes 原生 `session_search`，因为它尚未按 owner scope 过滤。
 `XPD_UNSAFE_USER_SESSION_SEARCH_ENABLED=true` 只是单用户兼容开关，不应在多用户中台部署中开启。

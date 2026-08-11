@@ -130,7 +130,7 @@ def test_xlsx_export_is_polished_without_formulas_or_sql_footer(tmp_path, monkey
         ElementTree.fromstring(detail)
 
     workbook = load_workbook(path, data_only=False)
-    assert workbook.sheetnames == ["经营摘要", "数据明细", "数据口径与质量", "查询审计"]
+    assert workbook.sheetnames == ["经营摘要", "数据明细", "口径与提示"]
     summary_sheet = workbook["经营摘要"]
     detail_sheet = workbook["数据明细"]
     assert "A1:P1" in {str(cell_range) for cell_range in summary_sheet.merged_cells.ranges}
@@ -149,17 +149,18 @@ def test_xlsx_export_is_polished_without_formulas_or_sql_footer(tmp_path, monkey
     assert detail_sheet.freeze_panes == "D2"
     assert detail_sheet.auto_filter.ref == "A1:D3"
     assert "RawQueryResult" in detail_sheet.tables
-    assert detail_sheet["A1"].comment.text == "原始字段：item_id"
+    assert detail_sheet["A1"].comment is None
     assert detail_sheet.page_setup.orientation == "landscape"
     assert [detail_sheet.cell(1, column).value for column in range(1, 5)] == [
-        "商品ID",
         "成交金额",
         "风险字段",
         "备注",
+        "商品ID",
     ]
-    assert detail_sheet["B2"].number_format.startswith("¥")
-    assert detail_sheet["C2"].value.startswith("'")
-    assert detail_sheet["C3"].value.startswith("'")
+    assert detail_sheet["A2"].number_format.startswith("¥")
+    assert detail_sheet["B2"].value.startswith("'")
+    assert detail_sheet["B3"].value.startswith("'")
+    assert detail_sheet["D2"].number_format == "@"
     assert all(
         cell.data_type != "f"
         for worksheet in workbook.worksheets
@@ -169,28 +170,148 @@ def test_xlsx_export_is_polished_without_formulas_or_sql_footer(tmp_path, monkey
     workbook.close()
 
 
+def test_xlsx_merchant_view_hides_internal_audit_and_technical_fields():
+    content = report_export._xlsx_bytes(
+        title="商家版安全检查",
+        summary="退货率需要重点关注。",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT SUM(refund_amt) FROM tb_live_goods_daily_stats",
+        columns=["item_title", "refund_amt", "pay_amt"],
+        rows=[{"item_title": "商品A", "refund_amt": 20, "pay_amt": 100}],
+        truncated=False,
+        analysis_type="diagnostic",
+        analysis={
+            "metric_definitions": [
+                {
+                    "name": "金额退货率",
+                    "formula": "SUM(refund_amt)/NULLIF(SUM(pay_amt), 0)",
+                    "numerator": "refund_amt",
+                    "denominator": "pay_amt",
+                }
+            ],
+            "data_scope": {
+                "period_start": "2026-08-01",
+                "period_end": "2026-08-07",
+                "source_tables": ["tb_live_goods_daily_stats"],
+                "dimensions": ["item_id"],
+                "filters": ["stat_date >= CURRENT_DATE - INTERVAL 7 DAY"],
+            },
+            "data_quality": {
+                "query_count": 2,
+                "returned_row_count": 1,
+                "validation_passed": True,
+                "freshness": {"field": "stat_date", "latest": "2026-08-07"},
+                "null_counts": {"refund_amt": 1},
+                "dimensions": {"required": ["item_id"], "missing": ["live_session_id"]},
+            },
+        },
+    )
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    assert workbook.sheetnames == ["经营摘要", "数据明细", "口径与提示"]
+    visible_text = "\n".join(
+        str(cell.value)
+        for worksheet in workbook.worksheets
+        for row in worksheet.iter_rows()
+        for cell in row
+        if cell.value not in (None, "")
+    )
+    assert "查询审计" not in visible_text
+    assert "SELECT" not in visible_text
+    assert "SUM(" not in visible_text
+    assert "tb_live_goods" not in visible_text
+    assert "stat_date" not in visible_text
+    assert "refund_amt" not in visible_text
+    assert "pay_amt" not in visible_text
+    assert "查询次数" not in visible_text
+    assert "返回行数" not in visible_text
+    assert "校验是否通过" not in visible_text
+    assert "退款金额 ÷ 成交金额" in visible_text
+    assert all(
+        cell.comment is None
+        for worksheet in workbook.worksheets
+        for row in worksheet.iter_rows()
+        for cell in row
+    )
+    workbook.close()
+
+
+def test_xlsx_detail_maps_real_refund_aliases_and_places_id_last():
+    columns = [
+        "item_id",
+        "item_title",
+        "refund_qty",
+        "pay_qty",
+        "refund_rate",
+        "refund_amt",
+        "pay_amt",
+    ]
+    content = report_export._xlsx_bytes(
+        title="退货率明细",
+        summary="",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT refund data",
+        columns=columns,
+        rows=[
+            {
+                "item_id": "10001",
+                "item_title": "商品A",
+                "refund_qty": 2,
+                "pay_qty": 10,
+                "refund_rate": 0.2,
+                "refund_amt": 20,
+                "pay_amt": 100,
+            }
+        ],
+        truncated=False,
+        analysis_type="simple",
+    )
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    detail = workbook["数据明细"]
+    assert [detail.cell(1, column).value for column in range(1, 8)] == [
+        "商品标题",
+        "退款商品件数",
+        "成交商品件数",
+        "退货率",
+        "退款金额",
+        "成交金额",
+        "商品ID",
+    ]
+    assert detail["D2"].number_format.startswith("0.00%")
+    assert detail["G2"].number_format == "@"
+    assert not any(
+        str(detail.cell(1, column).value).startswith("其他数据字段")
+        for column in range(1, 8)
+    )
+    workbook.close()
+
+
 @pytest.mark.parametrize(
     ("analysis_type", "expected_sheets"),
     [
-        ("simple", ["经营摘要", "数据明细", "数据口径与质量", "查询审计"]),
+        ("simple", ["经营摘要", "数据明细", "口径与提示"]),
         (
             "comparison",
-            ["经营摘要", "趋势与对比", "数据明细", "数据口径与质量", "查询审计"],
+            ["经营摘要", "趋势与对比", "数据明细", "口径与提示"],
         ),
         (
             "diagnostic",
             [
                 "经营摘要",
                 "趋势与对比",
-                "驱动分析",
+                "异常与建议",
                 "数据明细",
-                "数据口径与质量",
-                "查询审计",
+                "口径与提示",
             ],
         ),
     ],
 )
-def test_xlsx_analysis_type_controls_auditable_sheet_structure(analysis_type, expected_sheets):
+def test_xlsx_analysis_type_controls_merchant_sheet_structure(analysis_type, expected_sheets):
     analysis = {
         "metrics": [
             {
@@ -215,8 +336,8 @@ def test_xlsx_analysis_type_controls_auditable_sheet_structure(analysis_type, ex
             }
         ],
         "trends": [
-            {"period": "2026-08-01", "metric": "成交金额", "value": 50000, "unit": "元"},
             {"period": "2026-08-02", "metric": "成交金额", "value": 70000, "unit": "元"},
+            {"period": "2026-08-01", "metric": "成交金额", "value": 50000, "unit": "元"},
         ],
         "drivers": [
             {
@@ -271,37 +392,171 @@ def test_xlsx_analysis_type_controls_auditable_sheet_structure(analysis_type, ex
     assert workbook["经营摘要"]["A6"].font.color.rgb.endswith("1F4E78")
     assert workbook["经营摘要"]["A11"].font.name == "KaiTi"
     assert workbook["经营摘要"]["A11"].font.size == 11
-    assert workbook["查询审计"].cell(12, 1).value == "已执行 SQL"
-    assert "SUM(pay_amt)" in workbook["查询审计"].cell(13, 1).value
-    assert workbook["数据口径与质量"].max_row >= 10
-    quality_sheet = workbook["数据口径与质量"]
-    quality_rows = {
-        quality_sheet.cell(row, 1).value: row
-        for row in range(1, quality_sheet.max_row + 1)
+    assert "查询审计" not in workbook.sheetnames
+    quality_sheet = workbook["口径与提示"]
+    visible_quality_values = {
+        cell.value
+        for row in quality_sheet.iter_rows()
+        for cell in row
+        if cell.value not in (None, "")
     }
-    assert quality_sheet.cell(quality_rows["查询次数"], 2).alignment.horizontal == "left"
-    assert quality_sheet.cell(quality_rows["返回行数"], 2).alignment.horizontal == "left"
-    audit_sheet = workbook["查询审计"]
-    audit_returned_row = next(
-        row
-        for row in range(1, audit_sheet.max_row + 1)
-        if audit_sheet.cell(row, 1).value == "返回行数"
-    )
-    assert audit_sheet.cell(audit_returned_row, 2).alignment.horizontal == "left"
+    assert "查询次数" not in visible_quality_values
+    assert "返回行数" not in visible_quality_values
+    assert "校验是否通过" not in visible_quality_values
+    assert not any("SUM(" in str(value) for value in visible_quality_values)
+    assert not any("tb_live_goods" in str(value) for value in visible_quality_values)
     if analysis_type in {"comparison", "diagnostic"}:
-        assert len(workbook["趋势与对比"]._charts) == 1
-        assert workbook["趋势与对比"]["H3"].value == "有利/不利"
-        assert workbook["趋势与对比"]["H4"].value == "有利"
-        assert workbook["趋势与对比"]["H4"].fill.fgColor.rgb.endswith("E2F0D9")
+        trend_sheet = workbook["趋势与对比"]
+        assert len(trend_sheet._charts) == 1
+        assert trend_sheet["G3"].value == "结果判断"
+        assert trend_sheet["G4"].value == "有利"
+        assert trend_sheet["G4"].fill.fgColor.rgb.endswith("E2F0D9")
+        trend_header_row = next(
+            row
+            for row in range(1, trend_sheet.max_row + 1)
+            if trend_sheet.cell(row, 1).value == "周期"
+        )
+        assert trend_sheet.cell(trend_header_row, 10).value is None
+        assert trend_sheet._charts[0].series[0].tx is None
+        assert [
+            trend_sheet.cell(row, 9).value
+            for row in range(trend_header_row + 1, trend_header_row + 3)
+        ] == ["2026-08-01", "2026-08-02"]
+        last_trend_row = max(
+            row
+            for row in range(trend_header_row + 1, trend_sheet.max_row + 1)
+            if trend_sheet.cell(row, 1).value is not None
+        )
+        assert trend_sheet._charts[0].anchor._from.row >= last_trend_row + 1
     if analysis_type == "diagnostic":
-        assert len(workbook["驱动分析"]._charts) == 1
-        assert "主要贡献因素" in str(workbook["驱动分析"]._charts[0].title)
+        issue_sheet = workbook["异常与建议"]
+        assert [issue_sheet.cell(3, column).value for column in range(1, 4)] == [
+            "异常/影响因素",
+            "相关指标",
+            "关键数据",
+        ]
+        assert "优先补充商品A库存" in {
+            cell.value for row in issue_sheet.iter_rows() for cell in row
+        }
+    assert all(
+        cell.alignment.horizontal == "left"
+        for worksheet in workbook.worksheets
+        for row in worksheet.iter_rows()
+        for cell in row
+        if cell.value is not None
+    )
     assert all(
         cell.data_type != "f"
         for worksheet in workbook.worksheets
         for row in worksheet.iter_rows()
         for cell in row
     )
+    workbook.close()
+
+
+def test_xlsx_driver_chart_keeps_filtered_values_aligned_with_labels():
+    content = report_export._xlsx_bytes(
+        title="驱动图对齐测试",
+        summary="",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT 1",
+        columns=[],
+        rows=[],
+        truncated=False,
+        analysis_type="diagnostic",
+        analysis={
+            "drivers": [
+                {"member": "因素A", "contribution_rate": "未量化", "evidence": "待补数据"},
+                {"member": "因素B", "contribution_rate": None, "evidence": "待补数据"},
+                {"member": "因素C", "contribution_rate": 0.25, "evidence": "贡献25%"},
+                {"member": "因素D", "contribution_rate": 0.10, "evidence": "贡献10%"},
+            ]
+        },
+    )
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    driver_sheet = workbook["异常与建议"]
+    chart = driver_sheet._charts[0]
+    series = chart.series[0]
+    assert series.val.numRef.f == "'异常与建议'!$L$4:$L$5"
+    assert series.cat.numRef.f == "'异常与建议'!$K$4:$K$5"
+    assert [driver_sheet.cell(row, 11).value for row in range(4, 6)] == [
+        "因素C",
+        "因素D",
+    ]
+    assert [driver_sheet.cell(row, 12).value for row in range(4, 6)] == [25, 10]
+    assert driver_sheet.column_dimensions["K"].hidden is True
+    assert driver_sheet.column_dimensions["L"].hidden is True
+    assert chart.visible_cells_only is False
+    recommendation_header_row = next(
+        row
+        for row in range(1, driver_sheet.max_row + 1)
+        if driver_sheet.cell(row, 1).value == "优先级"
+    )
+    assert chart.anchor._from.col == 0
+    assert chart.anchor._from.row >= recommendation_header_row + 1
+    assert "$C$" in driver_sheet.print_area
+    visible_values = {
+        cell.value
+        for row in driver_sheet.iter_rows(min_col=1, max_col=3)
+        for cell in row
+        if cell.value not in (None, "")
+    }
+    assert not {"见证据", "未量化", "待验证"} & visible_values
+    workbook.close()
+
+
+def test_xlsx_comparison_only_chart_is_below_all_visible_tables():
+    content = report_export._xlsx_bytes(
+        title="纯对比图定位测试",
+        summary="成交金额较基准期增长。",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT 1",
+        columns=[],
+        rows=[],
+        truncated=False,
+        analysis_type="comparison",
+        analysis={
+            "comparisons": [
+                {
+                    "metric": "成交金额",
+                    "unit": "元",
+                    "current_value": 120,
+                    "baseline_value": 100,
+                    "absolute_change": 20,
+                    "relative_change": 0.2,
+                    "baseline_label": "上一周期",
+                    "favorability": "有利",
+                },
+                {
+                    "metric": "订单数",
+                    "unit": "笔",
+                    "current_value": 12,
+                    "baseline_value": 10,
+                    "absolute_change": 2,
+                    "relative_change": 0.2,
+                    "baseline_label": "上一周期",
+                    "favorability": "有利",
+                },
+            ]
+        },
+    )
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    trend_sheet = workbook["趋势与对比"]
+    assert len(trend_sheet._charts) == 1
+    chart = trend_sheet._charts[0]
+    last_visible_data_row = max(
+        row
+        for row in range(1, trend_sheet.max_row + 1)
+        if any(trend_sheet.cell(row, column).value not in (None, "") for column in range(1, 8))
+    )
+    assert chart.anchor._from.col == 0
+    assert chart.anchor._from.row >= last_visible_data_row + 1
     workbook.close()
 
 
@@ -406,11 +661,11 @@ def test_xlsx_normalizes_legacy_analysis_without_empty_cells_or_english_labels()
     trend_header = next(
         row for row in range(1, trend_sheet.max_row + 1) if trend_sheet.cell(row, 1).value == "周期"
     )
-    comparison_rows = list(trend_sheet.iter_rows(min_row=4, max_row=trend_header - 3, max_col=8))
+    comparison_rows = list(trend_sheet.iter_rows(min_row=4, max_row=trend_header - 3, max_col=7))
     assert len(comparison_rows) == 2
     assert {row[0].value for row in comparison_rows} == {
-        "整体｜退货件数",
-        "整体｜件数退货率",
+        "整体｜退货件数（件）",
+        "整体｜件数退货率（%）",
     }
     assert all(cell.value not in (None, "") for row in comparison_rows for cell in row)
 
@@ -421,27 +676,24 @@ def test_xlsx_normalizes_legacy_analysis_without_empty_cells_or_english_labels()
     assert any(row[2].value == 0 for row in trend_rows)
     assert all(cell.value not in (None, "") for row in trend_rows for cell in row)
 
-    driver_sheet = workbook["驱动分析"]
-    assert driver_sheet["A4"].value == "高于件数退货率6.8个百分点"
-    assert driver_sheet["G4"].value == "高客单商品拉高金额退货率"
-    assert driver_sheet["H4"].value == "金额退货率19.73%"
-    assert all(driver_sheet.cell(4, column).value not in (None, "") for column in range(1, 10))
+    driver_sheet = workbook["异常与建议"]
+    assert driver_sheet["A4"].value == "高客单商品拉高金额退货率"
+    assert driver_sheet["B4"].value == "相关经营指标"
+    assert "金额退货率19.73%" in driver_sheet["C4"].value
+    assert all(driver_sheet.cell(4, column).value not in (None, "") for column in range(1, 4))
 
-    quality_sheet = workbook["数据口径与质量"]
+    quality_sheet = workbook["口径与提示"]
     definition_header = next(
         row
         for row in range(1, quality_sheet.max_row + 1)
-        if quality_sheet.cell(row, 1).value == "指标名称"
+        if quality_sheet.cell(row, 1).value == "指标"
     )
     assert quality_sheet.cell(definition_header + 1, 1).value == "件数退货率"
-    assert all(
-        quality_sheet.cell(definition_header + 1, column).value not in (None, "")
-        for column in range(1, 8)
-    )
+    assert quality_sheet.cell(definition_header + 1, 2).value == "退款商品件数 ÷ 成交商品件数"
     visible_labels = {
         quality_sheet.cell(row, 1).value for row in range(1, quality_sheet.max_row + 1)
     }
-    assert {"请求统计周期", "实际覆盖周期", "直播场次数", "数据粒度", "数据时效"} <= visible_labels
+    assert {"统计周期", "实际覆盖周期", "直播场次数", "数据粒度"} <= visible_labels
     assert (
         not {
             "requested_period",
@@ -452,9 +704,8 @@ def test_xlsx_normalizes_legacy_analysis_without_empty_cells_or_english_labels()
         }
         & visible_labels
     )
-    assert "通过" in {
-        quality_sheet.cell(row, 2).value for row in range(1, quality_sheet.max_row + 1)
-    }
+    assert "数据表" not in visible_labels
+    assert "查询次数" not in visible_labels
 
     detail_headers = [workbook["数据明细"].cell(1, column).value for column in range(1, 4)]
     assert detail_headers == ["直播开始日期", "件数退货率", "金额退货率"]
@@ -524,26 +775,30 @@ def test_xlsx_export_preserves_precision_ids_timezone_and_long_text(tmp_path, mo
     path = tmp_path / SESSION_A / "exports" / payload["path"]
     workbook = load_workbook(path, data_only=False)
     detail = workbook["数据明细"]
-    assert [detail.cell(1, index).value for index in range(1, 10)][0:2] == [
-        "商品ID",
+    assert [detail.cell(1, index).value for index in range(1, 10)] == [
         "成交金额（GMV）",
+        "高精度小数",
+        "大整数值",
+        "直播场次数",
+        "总直播时长（小时）",
+        "平均峰值在线人数",
+        "发生时间",
+        "商品标题",
+        "商品ID",
     ]
-    assert detail["E1"].value == "直播场次数"
-    assert detail["F1"].value == "总直播时长（小时）"
-    assert detail["G1"].value == "平均峰值在线人数"
-    assert detail["A2"].value == "12345678901234567890"
-    assert detail["A2"].number_format == "@"
-    assert detail["B2"].value == 105735.4
-    assert detail["B2"].number_format.startswith("¥")
-    assert detail["C2"].value == "999999999999999.99"
+    assert detail["A2"].value == 105735.4
+    assert detail["A2"].number_format.startswith("¥")
+    assert detail["B2"].value == "999999999999999.99"
+    assert detail["B2"].number_format == "@"
+    assert detail["C2"].value == "12345678901234567890"
     assert detail["C2"].number_format == "@"
-    assert detail["D2"].value == "12345678901234567890"
-    assert detail["D2"].number_format == "@"
-    assert detail["E2"].number_format.startswith("#,##0")
-    assert detail["F2"].number_format.startswith("#,##0.00")
-    assert detail["G2"].number_format.startswith("#,##0")
-    assert detail["H2"].value == datetime(2026, 8, 5, 18, 0)
-    assert "\\x01" in detail["I2"].value
+    assert detail["D2"].number_format.startswith("#,##0")
+    assert detail["E2"].number_format.startswith("#,##0.00")
+    assert detail["F2"].number_format.startswith("#,##0")
+    assert detail["G2"].value == datetime(2026, 8, 5, 18, 0)
+    assert "\\x01" in detail["H2"].value
+    assert detail["I2"].value == "12345678901234567890"
+    assert detail["I2"].number_format == "@"
     assert detail.row_dimensions[2].height > 24
     workbook.close()
 
@@ -755,11 +1010,12 @@ def test_report_artifact_uploads_to_oss_and_returns_fresh_signed_url(tmp_path, m
     expected_prefix = client.upload[0].key
     assert re.fullmatch(
         r"public/dev/agent-report-files/\d{8}/"
-        r"seller-007-trace-abc-\d{10}-art_c{32}\.csv",
+        r"seller-007-trace-abc-\d{10}\.csv",
         expected_prefix,
     )
     assert client.upload[0].bucket == "starpartner-biz"
     assert client.upload[0].key == expected_prefix
+    assert client.upload[0].forbid_overwrite is True
     assert uploaded["storage"] == "oss"
     assert uploaded["oss_uri"] == f"oss://starpartner-biz/{expected_prefix}"
     assert uploaded["download_url"].endswith("?v=1")
@@ -796,11 +1052,11 @@ def test_report_oss_object_key_uses_beijing_day_and_second_timestamp(tmp_path, m
 
     assert key == (
         "public/dev/agent-report-files/20260806/"
-        f"uid-1001-trace-9001-1785945662-art_{'d' * 32}.xlsx"
+        "uid-1001-trace-9001-1785945662.xlsx"
     )
 
 
-def test_report_oss_object_key_distinguishes_artifacts_created_same_second(
+def test_report_oss_object_key_follows_strict_uid_trace_timestamp_filename(
     tmp_path,
     monkeypatch,
 ):
@@ -841,9 +1097,12 @@ def test_report_oss_object_key_distinguishes_artifacts_created_same_second(
         now=timestamp,
     )
 
-    assert first_key != second_key
-    assert first_key.endswith(f"-{first_artifact_id}.xlsx")
-    assert second_key.endswith(f"-{second_artifact_id}.xlsx")
+    expected = (
+        "public/dev/agent-report-files/20260806/"
+        "uid-1001-trace-9001-1785945662.xlsx"
+    )
+    assert first_key == expected
+    assert second_key == expected
 
 
 def test_report_oss_object_key_rejects_invalid_artifact_id(tmp_path, monkeypatch):

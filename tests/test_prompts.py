@@ -21,8 +21,10 @@ def test_wrapper_prompt_owns_global_contract_and_delegates_database_workflow():
     assert "章节内的多个要点使用“- ”短条目" in SYSTEM_PROMPT
     assert "一、核心结论 + 二、关键指标对比" in SYSTEM_PROMPT
     assert "一、核心结论 + 二、异常定位" in SYSTEM_PROMPT
-    assert "用户可见的最终答案中不得输出 SQL" in SYSTEM_PROMPT
-    assert "导出文件的“查询审计”工作表" in SYSTEM_PROMPT
+    assert "用户可见的最终答案和商家导出文件中不得输出 SQL" in SYSTEM_PROMPT
+    assert "SQL、数据表名、原始字段名、查询次数等内部审计信息" in SYSTEM_PROMPT
+    assert "异常与建议" in SYSTEM_PROMPT
+    assert "口径与提示" in SYSTEM_PROMPT
     assert "简单查询、对比分析、诊断分析" in SYSTEM_PROMPT
     assert "确认前不得查询或导出" in SYSTEM_PROMPT
     assert CHINESE_REASONING_REMINDER in SYSTEM_PROMPT

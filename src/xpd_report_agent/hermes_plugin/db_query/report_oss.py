@@ -304,9 +304,7 @@ def _object_key(
         timestamp = timestamp.astimezone(timezone)
     day_directory = timestamp.strftime("%Y%m%d")
     unix_timestamp_seconds = int(timestamp.timestamp())
-    object_filename = (
-        f"{uid}-{trace_id}-{unix_timestamp_seconds}-{artifact_id}{extension}"
-    )
+    object_filename = f"{uid}-{trace_id}-{unix_timestamp_seconds}{extension}"
     return "/".join((config.prefix, day_directory, object_filename))
 
 

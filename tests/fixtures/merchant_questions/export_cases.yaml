@@ -9,4 +9,4 @@ cases:
     input: 把刚才的退款诊断导成 Excel。
     must_clarify: false
     expected_analysis_type: diagnosis
-    expected_sheets: [经营摘要, 趋势与对比, 驱动分析, 数据明细, 数据口径与质量, 查询审计]
+    expected_sheets: [经营摘要, 趋势与对比, 异常与建议, 数据明细, 口径与提示]

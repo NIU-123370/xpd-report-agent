@@ -144,6 +144,8 @@ cython_debug/
 *.swo
 
 # xpd-report-agent local runtime state
+.codex-spreadsheet/
+.codex_tmp/
 configs/local.env
 configs/cloud.env
 deploy/docker/*.env

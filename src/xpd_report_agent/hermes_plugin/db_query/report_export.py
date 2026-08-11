@@ -14,6 +14,7 @@ import unicodedata
 import uuid
 import zipfile
 from contextlib import contextmanager
+from copy import copy
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -55,9 +56,12 @@ EXCEL_ILLEGAL_CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
 
 CHINESE_COLUMN_LABELS = {
     "caliber": "统计口径",
+    "grain": "统计粒度",
+    "period_label": "统计时间",
     "start_date": "直播开始日期",
     "start_time": "开始时间",
     "end_time": "结束时间",
+    "event_time": "发生时间",
     "session_cnt": "直播场次数",
     "live_cnt": "直播场次数",
     "duration_min": "直播时长（分钟）",
@@ -67,6 +71,7 @@ CHINESE_COLUMN_LABELS = {
     "item_title": "商品标题",
     "item_title_hash": "商品标题哈希",
     "live_session_id": "直播场次ID",
+    "session_title": "直播标题",
     "live_title": "直播标题",
     "live_start_time": "直播开始时间",
     "live_end_time": "直播结束时间",
@@ -109,6 +114,7 @@ CHINESE_COLUMN_LABELS = {
     "gmv": "成交金额（GMV）",
     "pay_byr_cnt": "支付买家数",
     "pay_itm_qty": "支付商品件数",
+    "pay_qty": "成交商品件数",
     "pay_conversion_rate": "支付转化率",
     "pay_ord_cnt": "支付订单数",
     "customer_unit_price": "客单价",
@@ -118,14 +124,17 @@ CHINESE_COLUMN_LABELS = {
     "refund_amt": "退款金额",
     "refund_byr_cnt": "退款买家数",
     "refund_itm_qty": "退款商品件数",
+    "refund_qty": "退款商品件数",
     "refund_ord_cnt": "退款订单数",
     "refund_byr_rate": "买家退款率",
     "return_goods_rate": "退货率",
     "refund_order_rate": "订单退款率",
-    "refund_rate": "金额退款率",
+    "refund_rate": "退货率",
     "refund_rate_pct": "金额退款率",
     "refund_qty_rate": "件数退货率",
     "refund_amt_rate": "金额退货率",
+    "qty_refund_rate_pct": "件数退货率",
+    "amt_refund_rate_pct": "金额退货率",
     "item_click_rate_pct": "商品点击率",
     "pay_conv_rate_pct": "支付转化率",
     "confirm_amt": "确认收货金额",
@@ -162,6 +171,8 @@ CHINESE_COLUMN_LABELS = {
     "rank": "排名",
     "ranking": "排名",
     "row_count": "数据行数",
+    "exact_decimal": "高精度小数",
+    "huge_count": "大整数值",
     "note": "备注",
     "=danger": "风险字段",
 }
@@ -230,15 +241,17 @@ EXPORT_REPORT_FILE_SCHEMA = {
                 "enum": ["simple", "comparison", "diagnostic"],
                 "description": (
                     "Required for XLSX. simple creates a compact query workbook; comparison "
-                    "adds trend/comparison analysis; diagnostic also adds driver analysis. "
+                    "adds trend/comparison analysis; diagnostic also adds merchant-facing "
+                    "anomaly, driver, and recommendation analysis. "
                     "If the user has not chosen and context is ambiguous, ask before exporting."
                 ),
             },
             "analysis": {
                 "type": "object",
                 "description": (
-                    "Evidence-backed analysis payload used to build XLSX summary, trend, driver, "
-                    "metric-definition, data-quality, and audit sheets. Never invent missing data."
+                    "Evidence-backed analysis payload used to build merchant-facing XLSX summary, "
+                    "trend, anomaly/recommendation, detail, and caliber sheets. Internal SQL and "
+                    "database audit fields are never included in the merchant workbook."
                 ),
                 "properties": {
                     "metrics": {
@@ -315,6 +328,24 @@ EXPORT_REPORT_FILE_SCHEMA = {
                                 "contribution_rate": {},
                             },
                             "required": ["statement", "evidence"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "anomalies": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "statement": {"type": "string"},
+                                "severity": {"type": ["string", "null"]},
+                                "metric_refs": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "observed_value": {},
+                                "baseline_value": {},
+                            },
+                            "required": ["statement"],
                             "additionalProperties": False,
                         },
                     },
@@ -723,20 +754,43 @@ def _normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
         drivers.append(
             {
                 **item,
-                "dimension": _analysis_record_value(item, "dimension") or impact or "综合因素",
+                "dimension": _analysis_record_value(item, "dimension") or impact,
                 "member": _analysis_record_value(item, "member", "name", "driver")
-                or statement
-                or "未命名因素",
-                "metric": _analysis_metric_label(metric) if metric else "未指定指标",
-                "current_value": _analysis_value_or(current_value, "见证据"),
-                "contribution_value": _analysis_value_or(contribution_value, "未量化"),
-                "contribution_rate": _analysis_value_or(contribution_rate, "未量化"),
-                "statement": statement or "依据数据识别的影响因素",
-                "evidence": evidence or "未提供证据说明",
-                "confidence": _analysis_value_or(confidence, "待验证"),
+                or statement,
+                "metric": _analysis_metric_label(metric) if metric else None,
+                "current_value": current_value,
+                "contribution_value": contribution_value,
+                "contribution_rate": contribution_rate,
+                "statement": statement,
+                "evidence": evidence,
+                "confidence": confidence,
             }
         )
     normalized["drivers"] = drivers[:MAX_LIST_ITEMS]
+
+    anomalies: list[dict[str, Any]] = []
+    anomaly_source = (
+        analysis.get("anomalies", []) if isinstance(analysis.get("anomalies"), list) else []
+    )
+    for item in anomaly_source:
+        if not isinstance(item, dict):
+            continue
+        statement = _analysis_record_value(item, "statement", "anomaly", "name")
+        if statement is None:
+            continue
+        metric_refs = item.get("metric_refs") if isinstance(item.get("metric_refs"), list) else []
+        anomalies.append(
+            {
+                **item,
+                "statement": statement,
+                "metric_refs": [
+                    _analysis_metric_label(value)
+                    for value in metric_refs
+                    if _clean_text(value, limit=120)
+                ],
+            }
+        )
+    normalized["anomalies"] = anomalies[:MAX_LIST_ITEMS]
 
     recommendations: list[dict[str, Any]] = []
     recommendation_source = (
@@ -792,6 +846,7 @@ def _clean_analysis(value: Any) -> dict[str, Any]:
         "comparisons",
         "trends",
         "drivers",
+        "anomalies",
         "recommendations",
         "metric_definitions",
         "data_scope",
@@ -907,6 +962,14 @@ def _display_columns(columns: list[str]) -> list[str]:
         count = counts[label]
         labels.append(label if count == 1 else f"{label}（{count}）")
     return labels
+
+
+def _merchant_detail_columns(columns: list[str]) -> list[str]:
+    """Keep the exact query fields while placing optional identifiers last."""
+
+    business_columns = [column for column in columns if not _is_identifier_column(column)]
+    identifier_columns = [column for column in columns if _is_identifier_column(column)]
+    return business_columns + identifier_columns
 
 
 def _csv_cell(value: Any) -> str:
@@ -1162,7 +1225,6 @@ def _xlsx_bytes(
     try:
         from openpyxl import Workbook
         from openpyxl.chart import BarChart, LineChart, Reference
-        from openpyxl.comments import Comment
         from openpyxl.formatting.rule import FormulaRule
         from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
         from openpyxl.utils import get_column_letter
@@ -1213,6 +1275,9 @@ def _xlsx_bytes(
     drivers = [item for item in analysis.get("drivers", []) if isinstance(item, dict)][
         :MAX_LIST_ITEMS
     ]
+    anomalies = [item for item in analysis.get("anomalies", []) if isinstance(item, dict)][
+        :MAX_LIST_ITEMS
+    ]
     recommendations = [
         item for item in analysis.get("recommendations", []) if isinstance(item, dict)
     ][:MAX_LIST_ITEMS]
@@ -1255,7 +1320,7 @@ def _xlsx_bytes(
             return "有利"
         if normalized in {"U", "UNFAVORABLE", "不利"}:
             return "不利"
-        return "未判定"
+        return "暂不判断"
 
     def flatten_mapping(value: dict[str, Any], prefix: str = "") -> list[tuple[str, Any]]:
         flattened: list[tuple[str, Any]] = []
@@ -1344,6 +1409,72 @@ def _xlsx_bytes(
             return key
         return "其他补充说明"
 
+    technical_expression_pattern = re.compile(
+        r"\b(?:SELECT|FROM|WHERE|JOIN|SUM|COUNT|AVG|MIN|MAX|NULLIF|CASE|WHEN|THEN)\b"
+        r"|[`]|\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b",
+        re.IGNORECASE,
+    )
+
+    def merchant_text(value: Any) -> str | None:
+        displayed = display_analysis_value(value)
+        if displayed in (None, ""):
+            return None
+        text = _cell_text(displayed).strip()
+        if not text or technical_expression_pattern.search(text):
+            return None
+        return text
+
+    def metric_label_with_unit(record: dict[str, Any]) -> str:
+        name = analysis_cell_value(record_value(record, "metric", "name"), "未命名指标")
+        unit = _cell_text(record_value(record, "unit")).strip()
+        if unit and f"（{unit}）" not in _cell_text(name):
+            return f"{name}（{unit}）"
+        return _cell_text(name)
+
+    def metric_definition_text(record: dict[str, Any]) -> str:
+        for key in ("description", "definition", "caliber"):
+            if text := merchant_text(record.get(key)):
+                return text
+        numerator = record_value(record, "numerator")
+        denominator = record_value(record, "denominator")
+        if numerator is not None and denominator is not None:
+            numerator_label = _column_label(_cell_text(numerator))
+            denominator_label = _column_label(_cell_text(denominator))
+            if not {
+                "其他数据字段",
+                "补充数据",
+            } & {numerator_label, denominator_label}:
+                return f"{numerator_label} ÷ {denominator_label}"
+        if text := merchant_text(record_value(record, "formula")):
+            return text
+        metric_name = _cell_text(record_value(record, "name", "metric"))
+        if "件数" in metric_name and "率" in metric_name:
+            return "退款商品件数 ÷ 成交商品件数"
+        if "金额" in metric_name and "率" in metric_name:
+            return "退款金额 ÷ 成交金额"
+        return "按本报告已确认的业务口径统计"
+
+    def joined_unique(parts: list[Any]) -> str | None:
+        values: list[str] = []
+        for part in parts:
+            text = _cell_text(part).strip() if part not in (None, "") else ""
+            if text and text not in values:
+                values.append(text)
+        return "；".join(values) if values else None
+
+    def meaningful_value(value: Any) -> Any:
+        if _cell_text(value).strip() in {
+            "",
+            "见证据",
+            "未量化",
+            "待验证",
+            "未提供",
+            "未提供结论",
+            "未提供证据",
+        }:
+            return None
+        return value
+
     def format_metric_display(value: Any, unit: Any, metric_name: Any = "") -> str:
         if value is None:
             return "—"
@@ -1360,6 +1491,16 @@ def _xlsx_bytes(
         if isinstance(value, (int, float, Decimal)):
             return f"{float(value):,.2f}".rstrip("0").rstrip(".") + unit_text
         return f"{_cell_text(value)}{unit_text}"
+
+    def apply_metric_number_format(cell: Any, metric_name: Any, unit: Any) -> None:
+        metric_text = _cell_text(metric_name)
+        unit_text = _cell_text(unit)
+        if "率" in metric_text or unit_text in {"%", "百分比", "百分点"}:
+            cell.number_format = "0.00%;[Red](0.00%);-"
+        elif unit_text in {"元", "人民币"} or "金额" in metric_text:
+            cell.number_format = "¥#,##0.00;[Red](¥#,##0.00);-"
+        elif unit_text in {"件", "单", "人", "次", "场"}:
+            cell.number_format = "#,##0;[Red](#,##0);-"
 
     def configure_sheet(worksheet: Any, *, tab_color: str = navy) -> None:
         worksheet.sheet_properties.tabColor = tab_color
@@ -1389,7 +1530,7 @@ def _xlsx_bytes(
             cell.font = header_font
             cell.fill = PatternFill("solid", fgColor=teal)
             cell.border = cell_border
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         worksheet.row_dimensions[start_row].height = 30
         for row_offset, record in enumerate(records, start=1):
             row_index = start_row + row_offset
@@ -1403,7 +1544,7 @@ def _xlsx_bytes(
                 cell.fill = PatternFill("solid", fgColor=banded if row_index % 2 else white)
                 cell.border = cell_border
                 cell.alignment = Alignment(
-                    horizontal="right" if isinstance(safe_value, (int, float)) else "left",
+                    horizontal="left",
                     vertical="top",
                     wrap_text=True,
                 )
@@ -1583,9 +1724,23 @@ def _xlsx_bytes(
                 end_row=card_row + 2,
                 end_column=end_column,
             )
+            comparison_item = next(
+                (
+                    item
+                    for item in comparisons
+                    if _cell_text(record_value(item, "metric", "name")) == _cell_text(name)
+                ),
+                {},
+            )
             baseline = record_value(metric, "baseline_value")
+            if baseline is None:
+                baseline = record_value(comparison_item, "baseline_value")
             absolute_change = record_value(metric, "absolute_change")
+            if absolute_change is None:
+                absolute_change = record_value(comparison_item, "absolute_change")
             relative_change = record_value(metric, "relative_change")
+            if relative_change is None:
+                relative_change = record_value(comparison_item, "relative_change")
             context_parts = []
             if baseline is not None:
                 context_parts.append(f"基准 {format_metric_display(baseline, unit, name)}")
@@ -1663,6 +1818,11 @@ def _xlsx_bytes(
             current_row += 1
         current_row += 1
 
+    anomaly_summaries = [
+        _cell_text(record_value(item, "statement", "anomaly", "name"))
+        for item in anomalies[:3]
+        if record_value(item, "statement", "anomaly", "name") is not None
+    ]
     driver_summaries = [
         _cell_text(record_value(item, "statement", "evidence", "member", "name"))
         for item in drivers[:3]
@@ -1674,7 +1834,11 @@ def _xlsx_bytes(
         if record_value(item, "action", "statement") is not None
     ]
     add_summary_section("核心结论", [summary] if summary else [], bullets=False)
-    add_summary_section("主要驱动因素", driver_summaries or insights[:3], bullets=True)
+    add_summary_section(
+        "主要异常与影响因素",
+        (anomaly_summaries + driver_summaries)[:3] or insights[:3],
+        bullets=True,
+    )
     add_summary_section("建议动作", recommendation_summaries, bullets=True)
     add_summary_section(
         "数据质量警告", [_cell_text(item) for item in quality_warnings] + notes, bullets=True
@@ -1688,19 +1852,18 @@ def _xlsx_bytes(
     summary_sheet.oddFooter.right.size = 8
     summary_sheet.oddFooter.right.color = muted
 
-    if analysis_type in {"comparison", "diagnostic"}:
+    if analysis_type in {"comparison", "diagnostic"} and (comparisons or trends):
         trend_sheet = workbook.create_sheet("趋势与对比")
         configure_sheet(trend_sheet)
-        add_sheet_title(trend_sheet, "趋势与对比", 8)
+        add_sheet_title(trend_sheet, "趋势与对比", 7)
         comparison_rows = [
             [
-                analysis_cell_value(record_value(item, "metric", "name"), "未命名指标"),
+                metric_label_with_unit(item),
                 analysis_cell_value(record_value(item, "current_value", "value")),
-                analysis_cell_value(record_value(item, "baseline_value"), "未提供基准"),
-                analysis_cell_value(record_value(item, "absolute_change"), "无法计算"),
-                analysis_cell_value(record_value(item, "relative_change"), "无法计算"),
-                analysis_cell_value(record_value(item, "unit"), "无单位"),
-                analysis_cell_value(record_value(item, "baseline_label"), "未提供基准"),
+                analysis_cell_value(record_value(item, "baseline_value"), "暂无可比数据"),
+                analysis_cell_value(record_value(item, "absolute_change"), "不适用"),
+                analysis_cell_value(record_value(item, "relative_change"), "不适用"),
+                analysis_cell_value(record_value(item, "baseline_label"), "暂无可比周期"),
                 favorability_label(record_value(item, "favorability", "favorable_unfavorable")),
             ]
             for item in comparisons
@@ -1714,26 +1877,26 @@ def _xlsx_bytes(
                 "基准值",
                 "绝对变化",
                 "变化率",
-                "单位",
-                "基准说明",
-                "有利/不利",
+                "基准周期",
+                "结果判断",
             ],
             records=comparison_rows,
-            widths=[24, 16, 16, 16, 14, 12, 24, 12],
+            widths=[28, 16, 16, 16, 14, 24, 14],
             percent_columns={5},
         )
         for row_offset, item in enumerate(comparisons, start=1):
             metric_name = _cell_text(record_value(item, "metric", "name"))
             unit = _cell_text(record_value(item, "unit"))
-            if "率" in metric_name or unit in {"%", "百分比", "百分点"}:
-                for column_index in (2, 3, 4):
-                    trend_sheet.cell(3 + row_offset, column_index).number_format = "0.00%"
+            for column_index in (2, 3, 4):
+                value_cell = trend_sheet.cell(3 + row_offset, column_index)
+                if isinstance(value_cell.value, (int, float)):
+                    apply_metric_number_format(value_cell, metric_name, unit)
             comparison_row = 3 + row_offset
             if any(
                 keyword in metric_name.upper()
                 for keyword in ("毛利", "CM I", "CM II", "EBITDA", "经营利润", "净利润")
             ):
-                for column_index in range(1, 9):
+                for column_index in range(1, 8):
                     cell = trend_sheet.cell(comparison_row, column_index)
                     cell.fill = PatternFill("solid", fgColor=blue_fill)
                     cell.border = subtotal_border
@@ -1744,13 +1907,13 @@ def _xlsx_bytes(
                 )
             favorability = _cell_text(record_value(item, "favorability", "favorable_unfavorable"))
             if favorability.upper() in {"F", "FAVORABLE", "有利"}:
-                trend_sheet.cell(comparison_row, 8).fill = PatternFill("solid", fgColor=pass_fill)
-                trend_sheet.cell(comparison_row, 8).font = Font(
+                trend_sheet.cell(comparison_row, 7).fill = PatternFill("solid", fgColor=pass_fill)
+                trend_sheet.cell(comparison_row, 7).font = Font(
                     name=font_name, size=10, bold=True, color=pass_text
                 )
             elif favorability.upper() in {"U", "UNFAVORABLE", "不利"}:
-                trend_sheet.cell(comparison_row, 8).fill = PatternFill("solid", fgColor=fail_fill)
-                trend_sheet.cell(comparison_row, 8).font = Font(
+                trend_sheet.cell(comparison_row, 7).fill = PatternFill("solid", fgColor=fail_fill)
+                trend_sheet.cell(comparison_row, 7).font = Font(
                     name=font_name, size=10, bold=True, color=fail_text
                 )
         if not comparison_rows:
@@ -1760,11 +1923,11 @@ def _xlsx_bytes(
         trend_rows = [
             [
                 analysis_cell_value(record_value(item, "period", "date", "label"), "未提供周期"),
-                analysis_cell_value(record_value(item, "metric", "name"), "未命名指标"),
+                metric_label_with_unit(item),
                 analysis_cell_value(record_value(item, "current_value", "value")),
-                analysis_cell_value(record_value(item, "baseline_value"), "未提供基准"),
-                analysis_cell_value(record_value(item, "absolute_change"), "无法计算"),
-                analysis_cell_value(record_value(item, "relative_change"), "无法计算"),
+                analysis_cell_value(record_value(item, "baseline_value"), "暂无可比数据"),
+                analysis_cell_value(record_value(item, "absolute_change"), "不适用"),
+                analysis_cell_value(record_value(item, "relative_change"), "不适用"),
                 analysis_cell_value(record_value(item, "anomaly", "note"), "无异常说明"),
             ]
             for item in trends
@@ -1780,13 +1943,24 @@ def _xlsx_bytes(
         for row_offset, item in enumerate(trends, start=1):
             metric_name = _cell_text(record_value(item, "metric", "name"))
             unit = _cell_text(record_value(item, "unit"))
-            if "率" in metric_name or unit in {"%", "百分比", "百分点"}:
-                for column_index in (3, 4, 5):
-                    trend_sheet.cell(trend_start + row_offset, column_index).number_format = "0.00%"
+            for column_index in (3, 4, 5):
+                value_cell = trend_sheet.cell(trend_start + row_offset, column_index)
+                if isinstance(value_cell.value, (int, float)):
+                    apply_metric_number_format(value_cell, metric_name, unit)
         if not trend_rows:
             trend_sheet.cell(trend_start + 1, 1, "未提供可靠的趋势数据")
         trend_sheet.freeze_panes = "A4"
         trend_sheet.auto_filter.ref = f"A{trend_start}:G{max(trend_start, trend_end)}"
+
+        # Every comparison chart belongs below the complete visible data area.
+        # Keep this anchor independent from helper ranges and from whether the
+        # trend table contains data or only its explicit no-data message.
+        visible_data_end = max(
+            comparison_end,
+            trend_end,
+            trend_start + 1 if not trend_rows else trend_end,
+        )
+        chart_anchor_row = visible_data_end + 2
 
         if trend_rows:
             first_metric = trend_rows[0][1]
@@ -1795,34 +1969,74 @@ def _xlsx_bytes(
                 for row in trend_rows
                 if row[1] == first_metric and isinstance(row[2], (int, float))
             ][:20]
+            period_ordinals: list[int] = []
+            for row in chart_rows:
+                period_match = re.search(
+                    r"(\d{4})\D?(\d{1,2})\D?(\d{1,2})",
+                    _cell_text(row[0]).strip(),
+                )
+                if period_match is None:
+                    period_ordinals = []
+                    break
+                try:
+                    period_ordinals.append(
+                        date(*(int(part) for part in period_match.groups())).toordinal()
+                    )
+                except ValueError:
+                    period_ordinals = []
+                    break
+            if len(period_ordinals) == len(chart_rows):
+                chart_rows = [
+                    row
+                    for _, row in sorted(
+                        zip(period_ordinals, chart_rows, strict=True),
+                        key=lambda item: item[0],
+                    )
+                ]
             if len(chart_rows) >= 2:
                 chart_start = trend_start
                 helper_column = 9
-                trend_sheet.cell(chart_start, helper_column, "周期")
-                trend_sheet.cell(
-                    chart_start, helper_column + 1, _cell_text(first_metric) or "指标值"
-                )
+                chart_unit = _cell_text(record_value(trends[0], "unit"))
+                chart_is_rate = "率" in _cell_text(first_metric) or chart_unit in {
+                    "%",
+                    "百分比",
+                    "百分点",
+                }
                 trend_sheet.column_dimensions[get_column_letter(helper_column)].width = 16
                 trend_sheet.column_dimensions[get_column_letter(helper_column + 1)].width = 18
                 for index, row in enumerate(chart_rows, start=1):
                     trend_sheet.cell(chart_start + index, helper_column, row[0])
-                    trend_sheet.cell(chart_start + index, helper_column + 1, row[2])
+                    chart_value = row[2]
+                    if chart_is_rate and isinstance(chart_value, (int, float)):
+                        chart_value = float(chart_value) * 100
+                    value_cell = trend_sheet.cell(
+                        chart_start + index,
+                        helper_column + 1,
+                        chart_value,
+                    )
+                    if chart_is_rate:
+                        value_cell.number_format = '0.0"%"'
+                trend_sheet.column_dimensions[get_column_letter(helper_column)].hidden = True
+                trend_sheet.column_dimensions[get_column_letter(helper_column + 1)].hidden = True
                 line_chart = LineChart()
                 line_chart.title = f"{_cell_text(first_metric)}趋势"
                 line_chart.height = 8
                 line_chart.width = 15
                 line_chart.legend = None
+                line_chart.visible_cells_only = False
                 line_chart.y_axis.majorGridlines = None
-                line_chart.y_axis.title = _cell_text(record_value(trends[0], "unit"))
+                line_chart.y_axis.title = chart_unit
+                if chart_is_rate:
+                    line_chart.y_axis.numFmt = '0"%"'
                 line_chart.x_axis.title = "周期"
                 line_chart.add_data(
                     Reference(
                         trend_sheet,
                         min_col=helper_column + 1,
-                        min_row=chart_start,
+                        min_row=chart_start + 1,
                         max_row=chart_start + len(chart_rows),
                     ),
-                    titles_from_data=True,
+                    titles_from_data=False,
                 )
                 line_chart.series[0].graphicalProperties.line.solidFill = core_blue
                 line_chart.series[0].graphicalProperties.line.width = 24000
@@ -1834,7 +2048,8 @@ def _xlsx_bytes(
                         max_row=chart_start + len(chart_rows),
                     )
                 )
-                trend_sheet.add_chart(line_chart, f"I{chart_start + len(chart_rows) + 2}")
+                # Anchor below every visible table row, not below filtered helper data.
+                trend_sheet.add_chart(line_chart, f"A{chart_anchor_row}")
         elif comparison_rows:
             chart = BarChart()
             chart.type = "col"
@@ -1854,80 +2069,184 @@ def _xlsx_bytes(
             chart.set_categories(
                 Reference(trend_sheet, min_col=1, min_row=4, max_row=3 + len(comparison_rows))
             )
-            trend_sheet.add_chart(chart, f"I{trend_start}")
+            # Comparison-only reports follow the same layout rule: charts start
+            # at column A below the tables, never beside them in columns I+.
+            trend_sheet.add_chart(chart, f"A{chart_anchor_row}")
 
-    if analysis_type == "diagnostic":
-        driver_sheet = workbook.create_sheet("驱动分析")
+    if analysis_type == "diagnostic" and (anomalies or drivers or recommendations):
+        driver_sheet = workbook.create_sheet("异常与建议")
         configure_sheet(driver_sheet)
-        add_sheet_title(driver_sheet, "驱动分析", 9)
-        driver_rows = [
-            [
-                analysis_cell_value(record_value(item, "dimension"), "综合因素"),
-                analysis_cell_value(record_value(item, "member", "name"), "未命名因素"),
-                analysis_cell_value(record_value(item, "metric"), "未指定指标"),
-                analysis_cell_value(record_value(item, "current_value", "value"), "见证据"),
-                analysis_cell_value(record_value(item, "contribution_value"), "未量化"),
-                analysis_cell_value(
-                    record_value(item, "contribution_rate", "contribution"), "未量化"
-                ),
-                analysis_cell_value(record_value(item, "statement"), "未提供结论"),
-                analysis_cell_value(record_value(item, "evidence"), "未提供证据"),
-                analysis_cell_value(record_value(item, "confidence"), "待验证"),
-            ]
-            for item in drivers
-        ]
-        driver_end = write_table(
+        add_sheet_title(driver_sheet, "异常与建议", 3)
+
+        issue_rows: list[list[Any]] = []
+        for item in anomalies:
+            statement = record_value(item, "statement", "anomaly", "name")
+            if statement is None:
+                continue
+            metric_refs = item.get("metric_refs") if isinstance(item.get("metric_refs"), list) else []
+            metric_text = joined_unique(
+                [_analysis_metric_label(value) for value in metric_refs]
+            ) or "相关经营指标"
+            observed = record_value(item, "observed_value", "current_value", "value")
+            baseline = record_value(item, "baseline_value")
+            severity = _xlsx_display_value(record_value(item, "severity"))
+            key_data = joined_unique(
+                [
+                    f"当前值：{_cell_text(observed)}" if observed is not None else None,
+                    f"基准值：{_cell_text(baseline)}" if baseline is not None else None,
+                    f"严重程度：{_cell_text(severity)}" if severity is not None else None,
+                ]
+            ) or "需结合业务情况进一步确认"
+            issue_rows.append([statement, metric_text, key_data])
+
+        chart_value_candidates: list[tuple[str, float]] = []
+        chart_rate_candidates: list[tuple[str, float]] = []
+        for item in drivers:
+            statement = record_value(item, "statement")
+            evidence = meaningful_value(record_value(item, "evidence"))
+            factor = record_value(item, "member", "name", "dimension") or statement
+            if factor is None:
+                continue
+            metric_refs = item.get("metric_refs") if isinstance(item.get("metric_refs"), list) else []
+            metric_text = record_value(item, "metric") or joined_unique(
+                [_analysis_metric_label(value) for value in metric_refs]
+            ) or "相关经营指标"
+            contribution_value = meaningful_value(record_value(item, "contribution_value"))
+            contribution_rate = meaningful_value(
+                record_value(item, "contribution_rate", "contribution")
+            )
+            current_value = meaningful_value(record_value(item, "current_value", "value"))
+            key_data = joined_unique(
+                [
+                    (
+                        f"贡献值：{format_metric_display(contribution_value, '', metric_text)}"
+                        if contribution_value is not None
+                        else None
+                    ),
+                    (
+                        f"贡献占比：{format_metric_display(contribution_rate, '%', '贡献占比')}"
+                        if contribution_rate is not None
+                        else None
+                    ),
+                    f"当前值：{_cell_text(current_value)}" if current_value is not None else None,
+                    evidence,
+                    statement if statement != factor else None,
+                ]
+            )
+            if key_data is None:
+                continue
+            issue_rows.append([factor, metric_text, key_data])
+            if isinstance(contribution_value, (int, float)):
+                chart_value_candidates.append((_cell_text(factor), float(contribution_value)))
+            if isinstance(contribution_rate, (int, float)):
+                chart_rate_candidates.append((_cell_text(factor), float(contribution_rate)))
+
+        issue_end = write_table(
             driver_sheet,
             start_row=3,
-            headers=[
-                "维度/影响范围",
-                "贡献项",
-                "指标",
-                "当前值",
-                "贡献量",
-                "贡献占比",
-                "结论",
-                "证据",
-                "置信度",
-            ],
-            records=driver_rows,
-            widths=[16, 24, 18, 15, 15, 14, 34, 34, 12],
-            percent_columns={6, 9},
+            headers=["异常/影响因素", "相关指标", "关键数据"],
+            records=issue_rows,
+            widths=[30, 24, 58],
         )
         driver_sheet.freeze_panes = "A4"
-        driver_sheet.auto_filter.ref = f"A3:I{max(3, driver_end)}"
-        if not driver_rows:
-            driver_sheet.cell(4, 1, "未提供可靠的驱动分析数据")
-        numeric_driver_column = (
-            5 if any(isinstance(row[4], (int, float)) for row in driver_rows) else 6
+        driver_sheet.auto_filter.ref = f"A3:C{max(3, issue_end)}"
+        if not issue_rows:
+            driver_sheet.cell(4, 1, "暂无有数据证据支持的异常或影响因素")
+
+        recommendation_start = issue_end + 3
+        recommendation_rows = [
+            [
+                analysis_cell_value(
+                    _xlsx_display_value(record_value(item, "priority")), "中"
+                ),
+                analysis_cell_value(record_value(item, "action", "statement"), "待补充建议"),
+                analysis_cell_value(
+                    record_value(item, "rationale", "evidence", "basis"),
+                    "依据本报告数据",
+                ),
+            ]
+            for item in recommendations
+            if record_value(item, "action", "statement") is not None
+        ]
+        recommendation_end = write_table(
+            driver_sheet,
+            start_row=recommendation_start,
+            headers=["优先级", "建议动作", "数据依据"],
+            records=recommendation_rows,
+            widths=[12, 42, 52],
         )
-        chartable_rows = [
-            (index, row)
-            for index, row in enumerate(driver_rows, start=4)
-            if isinstance(row[numeric_driver_column - 1], (int, float))
-        ][:10]
-        if chartable_rows:
+        if not recommendation_rows:
+            driver_sheet.cell(recommendation_start + 1, 1, "暂无有数据依据的建议动作")
+        driver_sheet.column_dimensions["A"].width = 30
+        driver_sheet.column_dimensions["B"].width = 32
+        driver_sheet.column_dimensions["C"].width = 58
+
+        chartable_rows = (
+            chart_value_candidates[:10]
+            if len(chart_value_candidates) >= 2
+            else chart_rate_candidates[:10]
+        )
+        chart_is_rate = len(chart_value_candidates) < 2 and len(chart_rate_candidates) >= 2
+        if len(chartable_rows) >= 2:
+            helper_label_column = 11
+            helper_value_column = 12
+            helper_header_row = 3
+            helper_first_row = helper_header_row + 1
+            for helper_offset, (label, value) in enumerate(chartable_rows, start=1):
+                driver_sheet.cell(
+                    helper_header_row + helper_offset,
+                    helper_label_column,
+                    label,
+                )
+                chart_value = value * 100 if chart_is_rate else value
+                value_cell = driver_sheet.cell(
+                    helper_header_row + helper_offset,
+                    helper_value_column,
+                    chart_value,
+                )
+                if chart_is_rate:
+                    value_cell.number_format = '0.0"%"'
+            driver_sheet.column_dimensions[
+                get_column_letter(helper_label_column)
+            ].hidden = True
+            driver_sheet.column_dimensions[
+                get_column_letter(helper_value_column)
+            ].hidden = True
             driver_chart = BarChart()
             driver_chart.type = "bar"
             driver_chart.title = "主要贡献因素"
             driver_chart.height = 8
             driver_chart.width = 15
             driver_chart.legend = None
+            driver_chart.visible_cells_only = False
             driver_chart.x_axis.majorGridlines = None
-            if numeric_driver_column == 6:
-                driver_chart.x_axis.numFmt = "0%"
-            min_row = chartable_rows[0][0]
-            max_row = chartable_rows[-1][0]
+            if chart_is_rate:
+                driver_chart.x_axis.numFmt = '0"%"'
             driver_chart.add_data(
-                Reference(driver_sheet, min_col=numeric_driver_column, min_row=3, max_row=max_row),
-                titles_from_data=True,
+                Reference(
+                    driver_sheet,
+                    min_col=helper_value_column,
+                    min_row=helper_first_row,
+                    max_row=helper_header_row + len(chartable_rows),
+                ),
+                titles_from_data=False,
             )
             driver_chart.series[0].graphicalProperties.solidFill = core_blue
             driver_chart.series[0].graphicalProperties.line.solidFill = core_blue
             driver_chart.set_categories(
-                Reference(driver_sheet, min_col=2, min_row=min_row, max_row=max_row)
+                Reference(
+                    driver_sheet,
+                    min_col=helper_label_column,
+                    min_row=helper_first_row,
+                    max_row=helper_header_row + len(chartable_rows),
+                )
             )
-            driver_sheet.add_chart(driver_chart, f"A{driver_end + 3}")
+            chart_anchor_row = max(recommendation_end, issue_end) + 3
+            driver_sheet.add_chart(driver_chart, f"A{chart_anchor_row}")
+            print_end_row = chart_anchor_row + 15
+        else:
+            print_end_row = max(recommendation_end, issue_end, 18)
+        driver_sheet.print_area = f"A1:C{print_end_row}"
 
     detail_sheet = workbook.create_sheet("数据明细")
     detail_sheet.sheet_properties.tabColor = teal
@@ -1949,9 +2268,10 @@ def _xlsx_bytes(
     )
 
     if columns:
-        display_columns = _display_columns(columns)
-        number_kinds = _column_number_kinds(columns)
-        column_widths = _column_widths(columns, rows)
+        detail_columns = _merchant_detail_columns(columns)
+        display_columns = _display_columns(detail_columns)
+        number_kinds = _column_number_kinds(detail_columns)
+        column_widths = _column_widths(detail_columns, rows)
         for column_index, label in enumerate(display_columns, start=1):
             cell = detail_sheet.cell(
                 row=1,
@@ -1962,11 +2282,10 @@ def _xlsx_bytes(
                 ),
             )
             cell.font = header_font
-            cell.comment = Comment(f"原始字段：{columns[column_index - 1]}", "直播经营报告助手")
             cell.fill = PatternFill("solid", fgColor=teal)
             cell.border = cell_border
             cell.alignment = Alignment(
-                horizontal="center",
+                horizontal="left",
                 vertical="center",
                 wrap_text=True,
             )
@@ -1982,7 +2301,7 @@ def _xlsx_bytes(
         for row_index, row in enumerate(rows, start=2):
             row_fill = PatternFill("solid", fgColor=banded if row_index % 2 else white)
             max_wrapped_lines = 1
-            for column_index, column in enumerate(columns, start=1):
+            for column_index, column in enumerate(detail_columns, start=1):
                 source_value = row.get(column)
                 display_value = _xlsx_display_value(source_value)
                 identifier_column = _is_identifier_column(column)
@@ -2002,33 +2321,26 @@ def _xlsx_bytes(
                 cell.border = cell_border
                 if isinstance(safe_value, datetime):
                     cell.number_format = "yyyy-mm-dd hh:mm:ss"
-                    horizontal = "center"
                 elif isinstance(safe_value, date):
                     cell.number_format = "yyyy-mm-dd"
-                    horizontal = "center"
                 elif (
                     kind
                     and isinstance(safe_value, (int, float))
                     and not isinstance(safe_value, bool)
                 ):
                     cell.number_format = number_formats[kind]
-                    horizontal = "right"
                 elif identifier_column:
                     cell.number_format = "@"
-                    horizontal = "left"
                 elif isinstance(source_value, (Decimal, int)) and isinstance(safe_value, str):
                     # Excel can only preserve 15 significant numeric digits. Keep
                     # higher-precision values as text instead of silently rounding.
                     cell.number_format = "@"
-                    horizontal = "right"
-                else:
-                    horizontal = "left"
                 cell.alignment = Alignment(
-                    horizontal=horizontal,
+                    horizontal="left",
                     vertical="center",
-                    wrap_text=horizontal == "left",
+                    wrap_text=True,
                 )
-                if horizontal == "left" and safe_value not in (None, ""):
+                if safe_value not in (None, ""):
                     max_wrapped_lines = max(
                         max_wrapped_lines,
                         _wrapped_line_count(
@@ -2040,9 +2352,9 @@ def _xlsx_bytes(
                 min(300, max(24, 16 * max_wrapped_lines + 8))
             )
 
-        last_column = get_column_letter(len(columns))
+        last_column = get_column_letter(len(detail_columns))
         last_row = max(1, len(rows) + 1)
-        detail_sheet.freeze_panes = "D2" if len(columns) >= 3 else "B2"
+        detail_sheet.freeze_panes = "D2" if len(detail_columns) >= 3 else "B2"
         detail_sheet.auto_filter.ref = f"A1:{last_column}{last_row}"
         if rows and len(set(display_columns)) == len(display_columns):
             raw_table = Table(displayName="RawQueryResult", ref=f"A1:{last_column}{last_row}")
@@ -2059,7 +2371,7 @@ def _xlsx_bytes(
             "警告": (warning_fill, warning_text),
             "失败": (fail_fill, fail_text),
         }
-        for column_index, column in enumerate(columns, start=1):
+        for column_index, column in enumerate(detail_columns, start=1):
             normalized = str(column).strip("`\"'").lower()
             if not any(token in normalized for token in ("status", "state", "severity")):
                 continue
@@ -2084,7 +2396,7 @@ def _xlsx_bytes(
         empty_cell.font = label_font
         empty_cell.fill = PatternFill("solid", fgColor=light_teal)
         empty_cell.border = cell_border
-        empty_cell.alignment = Alignment(horizontal="center", vertical="center")
+        empty_cell.alignment = Alignment(horizontal="left", vertical="center")
         detail_sheet.column_dimensions["A"].width = 24
         detail_sheet.row_dimensions[1].height = 30
 
@@ -2095,134 +2407,175 @@ def _xlsx_bytes(
     detail_sheet.oddFooter.right.size = 8
     detail_sheet.oddFooter.right.color = muted
 
-    quality_sheet = workbook.create_sheet("数据口径与质量")
+    quality_sheet = workbook.create_sheet("口径与提示")
     configure_sheet(quality_sheet)
-    add_sheet_title(quality_sheet, "数据口径与质量", 7)
-    scope_rows = [
-        [analysis_field_label(key), analysis_cell_value(value)]
-        for key, value in flatten_mapping(data_scope)
-    ]
+    add_sheet_title(quality_sheet, "口径与提示", 6)
+
+    period_coverage = (
+        data_quality.get("period_coverage")
+        if isinstance(data_quality.get("period_coverage"), dict)
+        else {}
+    )
+    scope_rows: list[list[Any]] = []
+
+    def add_scope_row(label: str, value: Any) -> None:
+        if value in (None, "", [], {}):
+            return
+        scope_rows.append([label, display_analysis_value(value)])
+
+    add_scope_row("统计周期", report_period if report_period != "未提供" else None)
+    observed_period = record_value(data_scope, "observed_period", "actual_period")
+    if observed_period and _cell_text(observed_period) != _cell_text(report_period):
+        add_scope_row("实际覆盖周期", observed_period)
+    add_scope_row("数据更新至", data_as_of if data_as_of != "未提供" else None)
+    add_scope_row("数据粒度", record_value(data_scope, "grain", "granularity"))
+    add_scope_row("直播场次数", record_value(data_scope, "session_count", "sessions"))
+    coverage_ratio = record_value(data_scope, "coverage_ratio")
+    if coverage_ratio is None:
+        coverage_ratio = record_value(period_coverage, "coverage_ratio")
+    add_scope_row("周期覆盖率", coverage_ratio)
+    add_scope_row("商品明细覆盖范围", data_scope.get("product_table_coverage"))
+    filter_values = data_scope.get("filters") if isinstance(data_scope.get("filters"), list) else []
+    readable_filters = [text for value in filter_values if (text := merchant_text(value))]
+    add_scope_row("关键筛选条件", readable_filters)
+    if not scope_rows:
+        scope_rows.append(["数据范围", "本次未提供可确认的数据范围"])
+
     scope_end = write_table(
         quality_sheet,
         start_row=3,
-        headers=["口径字段", "内容"],
+        headers=["数据范围", "内容"],
         records=scope_rows,
-        widths=[30, 72],
+        widths=[26, 70],
     )
-    if not scope_rows:
-        quality_sheet.cell(4, 1, "未提供结构化数据口径，请参考查询审计页。")
+    for row_offset, (label, _) in enumerate(scope_rows, start=1):
+        if label == "周期覆盖率":
+            value_cell = quality_sheet.cell(3 + row_offset, 2)
+            if isinstance(value_cell.value, (int, float)):
+                value_cell.number_format = "0.00%"
 
-    definition_start = scope_end + 3
     definition_rows = [
         [
             analysis_cell_value(record_value(item, "name"), "未命名指标"),
-            analysis_cell_value(record_value(item, "formula"), "未提供计算说明"),
-            analysis_cell_value(record_value(item, "unit")),
-            analysis_cell_value(record_value(item, "aggregation")),
-            analysis_cell_value(record_value(item, "numerator"), "不适用"),
-            analysis_cell_value(record_value(item, "denominator"), "不适用"),
-            analysis_cell_value(record_value(item, "grain")),
+            metric_definition_text(item),
         ]
         for item in metric_definitions
     ]
+    if not definition_rows:
+        definition_rows = [["本次查询口径", value] for value in assumptions if merchant_text(value)]
+    definition_start = scope_end + 3
     definition_end = write_table(
         quality_sheet,
         start_row=definition_start,
-        headers=["指标名称", "指标公式", "单位", "聚合方式", "分子", "分母", "数据粒度"],
+        headers=["指标", "计算口径"],
         records=definition_rows,
-        widths=[22, 38, 12, 16, 22, 22, 22],
+        widths=[26, 70],
     )
     if not definition_rows:
-        quality_sheet.cell(definition_start + 1, 1, "未提供结构化指标定义。")
-    quality_start = definition_end + 3
-    flattened_quality = flatten_mapping(data_quality)
-    quality_rows = [
-        [analysis_field_label(key), analysis_cell_value(value)] for key, value in flattened_quality
-    ]
-    quality_end = write_table(
-        quality_sheet,
-        start_row=quality_start,
-        headers=["质量检查项", "检查结果"],
-        records=quality_rows,
-        widths=[34, 68],
-    )
-    for offset, (key, _) in enumerate(flattened_quality, start=1):
-        value_cell = quality_sheet.cell(quality_start + offset, 2)
-        if key.endswith(("coverage_ratio", "rate", "ratio")):
-            value_cell.number_format = "0.00%"
-        if key in {"query_count", "returned_row_count"}:
-            value_cell.alignment = Alignment(
-                horizontal="left",
-                vertical="top",
-                wrap_text=True,
-            )
-    if not quality_rows:
-        quality_sheet.cell(quality_start + 1, 1, "未提供服务端数据质量结果。")
-    quality_sheet.freeze_panes = "A4"
-    quality_sheet.print_area = f"A1:G{max(quality_start + 1, quality_end)}"
+        quality_sheet.cell(definition_start + 1, 1, "本次没有需要额外说明的指标口径")
 
-    audit_sheet = workbook.create_sheet("查询审计")
-    configure_sheet(audit_sheet, tab_color=muted)
-    add_sheet_title(audit_sheet, "查询审计", 6)
-    source_tables = (
-        data_scope.get("source_tables") or data_scope.get("source_table") or data_scope.get("table")
+    prompt_rows: list[list[Any]] = []
+
+    def add_prompt_row(kind: str, value: Any) -> None:
+        if value in (None, "", [], {}):
+            return
+        prompt_rows.append([kind, display_analysis_value(value)])
+
+    freshness_details = (
+        data_quality.get("freshness") if isinstance(data_quality.get("freshness"), dict) else {}
     )
-    audit_rows = [
-        ["报告类型", analysis_label()],
-        ["生成时间", generated_at],
-        ["查询状态", "已通过服务端只读校验并执行"],
-        ["返回行数", len(rows)],
-        ["结果截断", "是" if truncated else "否"],
-        ["使用数据表", display_analysis_value(source_tables) if source_tables else "未提供"],
-    ]
-    audit_end = write_table(
-        audit_sheet,
-        start_row=3,
-        headers=["审计项", "内容"],
-        records=audit_rows,
-        widths=[24, 72],
-    )
-    for offset, (label, _) in enumerate(audit_rows, start=1):
-        if label == "返回行数":
-            audit_sheet.cell(3 + offset, 2).alignment = Alignment(
-                horizontal="left",
-                vertical="top",
-                wrap_text=True,
+    lag_days = record_value(freshness_details, "lag_days")
+    if isinstance(lag_days, (int, float)) and lag_days > 0:
+        add_prompt_row("数据时效", f"数据较当前日期延迟 {lag_days:g} 天")
+    if period_coverage.get("complete") is False:
+        covered_days = period_coverage.get("covered_days")
+        expected_days = period_coverage.get("expected_days")
+        coverage_text = (
+            f"实际覆盖 {covered_days} 天，应覆盖 {expected_days} 天"
+            if covered_days is not None and expected_days is not None
+            else "实际数据未完整覆盖请求周期"
+        )
+        add_prompt_row("周期完整性", coverage_text)
+    if truncated or data_quality.get("truncated") is True:
+        add_prompt_row("明细完整性", "导出明细达到行数上限，仅包含部分查询结果")
+    if data_quality.get("empty_result") is True:
+        add_prompt_row("数据结果", "本次查询没有返回可分析的数据")
+
+    null_counts = data_quality.get("null_counts")
+    if isinstance(null_counts, dict):
+        null_labels = [
+            _column_label(_cell_text(key))
+            for key, count in null_counts.items()
+            if isinstance(count, (int, float)) and count > 0
+        ]
+        if null_labels:
+            add_prompt_row("数据完整性", f"以下字段存在空值：{'、'.join(null_labels)}")
+    zero_denominators = data_quality.get("zero_denominators")
+    if isinstance(zero_denominators, dict):
+        zero_labels = [
+            _column_label(_cell_text(key))
+            for key, count in zero_denominators.items()
+            if isinstance(count, (int, float)) and count > 0
+        ]
+        if zero_labels:
+            add_prompt_row("指标可计算性", f"以下指标存在零分母：{'、'.join(zero_labels)}")
+    small_samples = data_quality.get("small_samples")
+    if isinstance(small_samples, dict):
+        sample_columns = small_samples.get("columns")
+        if isinstance(sample_columns, dict):
+            sample_labels = [
+                _column_label(_cell_text(key))
+                for key, count in sample_columns.items()
+                if isinstance(count, (int, float)) and count > 0
+            ]
+            if sample_labels:
+                threshold = small_samples.get("threshold")
+                threshold_text = f"（阈值 {threshold}）" if threshold is not None else ""
+                add_prompt_row(
+                    "小样本提示",
+                    f"以下维度样本较少{threshold_text}：{'、'.join(sample_labels)}",
+                )
+    missing_dimensions = data_quality.get("dimensions")
+    if isinstance(missing_dimensions, dict):
+        missing_values = missing_dimensions.get("missing")
+        if isinstance(missing_values, list) and missing_values:
+            add_prompt_row(
+                "分析限制",
+                "缺少以下业务维度："
+                + "、".join(_column_label(_cell_text(value)) for value in missing_values),
             )
-    sql_heading_row = audit_end + 3
-    audit_sheet.merge_cells(
-        start_row=sql_heading_row, start_column=1, end_row=sql_heading_row, end_column=6
+    for warning in quality_warnings:
+        if text := merchant_text(warning):
+            add_prompt_row("质量提示", text)
+    for note in data_quality.get("notes", []) if isinstance(data_quality.get("notes"), list) else []:
+        if text := merchant_text(note):
+            add_prompt_row("补充说明", text)
+    for note in notes:
+        if text := merchant_text(note):
+            add_prompt_row("补充说明", text)
+    if not prompt_rows:
+        prompt_rows.append(["数据状态", "未发现影响本次判断的明显数据问题"])
+
+    prompt_start = definition_end + 3
+    prompt_end = write_table(
+        quality_sheet,
+        start_row=prompt_start,
+        headers=["提示类型", "说明"],
+        records=prompt_rows,
+        widths=[26, 70],
     )
-    sql_heading = audit_sheet.cell(sql_heading_row, 1, "已执行 SQL")
-    sql_heading.font = section_font
-    sql_heading.fill = PatternFill("solid", fgColor=light_teal)
-    sql_heading.alignment = Alignment(vertical="center", indent=1)
-    audit_sheet.merge_cells(
-        start_row=sql_heading_row + 1,
-        start_column=1,
-        end_row=sql_heading_row + 1,
-        end_column=6,
-    )
-    sql_cell = audit_sheet.cell(
-        sql_heading_row + 1,
-        1,
-        _xlsx_safe_value(sql, context="Executed SQL"),
-    )
-    sql_cell.font = Font(name="Courier New", size=9, color=text_color)
-    sql_cell.fill = PatternFill("solid", fgColor=banded)
-    sql_cell.border = cell_border
-    sql_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-    audit_sheet.row_dimensions[sql_heading_row + 1].height = float(
-        min(300, max(60, 16 * _wrapped_line_count(sql, 110)))
-    )
-    audit_sheet.freeze_panes = "A4"
-    audit_sheet.print_area = f"A1:F{sql_heading_row + 1}"
+    quality_sheet.freeze_panes = "A4"
+    quality_sheet.print_area = f"A1:F{max(prompt_end, prompt_start + 1)}"
 
     # This controlled exporter intentionally emits no formulas, so LibreOffice
     # recalculation is unnecessary and formula injection remains impossible.
     for worksheet in workbook.worksheets:
         for workbook_row in worksheet.iter_rows():
             for cell in workbook_row:
+                if cell.value is not None and cell.alignment.horizontal != "left":
+                    alignment = copy(cell.alignment)
+                    alignment.horizontal = "left"
+                    cell.alignment = alignment
                 if getattr(cell, "data_type", None) == "f":
                     raise ValueError(
                         f"Generated XLSX contains a formula at {worksheet.title}!{cell.coordinate}."
@@ -2664,11 +3017,14 @@ def _validate_artifact_bytes(
     try:
         normalized_analysis_type = _clean_analysis_type(analysis_type)
         expected_sheets = ["经营摘要"]
-        if normalized_analysis_type in {"comparison", "diagnostic"}:
+        if (
+            normalized_analysis_type in {"comparison", "diagnostic"}
+            and "趋势与对比" in workbook.sheetnames
+        ):
             expected_sheets.append("趋势与对比")
-        if normalized_analysis_type == "diagnostic":
-            expected_sheets.append("驱动分析")
-        expected_sheets.extend(["数据明细", "数据口径与质量", "查询审计"])
+        if normalized_analysis_type == "diagnostic" and "异常与建议" in workbook.sheetnames:
+            expected_sheets.append("异常与建议")
+        expected_sheets.extend(["数据明细", "口径与提示"])
         if workbook.sheetnames != expected_sheets:
             raise ValueError("Generated XLSX has unexpected worksheets.")
         summary_sheet = workbook["经营摘要"]
@@ -2714,7 +3070,9 @@ def _validate_artifact_bytes(
         ) -> None:
             for row_index in range(start_row, end_row + 1):
                 first_value = worksheet.cell(row_index, 1).value
-                if isinstance(first_value, str) and first_value.startswith("未提供"):
+                if isinstance(first_value, str) and first_value.startswith(
+                    ("未提供", "暂无", "本次没有")
+                ):
                     continue
                 for column_index in range(1, end_column + 1):
                     cell = worksheet.cell(row_index, column_index)
@@ -2724,14 +3082,14 @@ def _validate_artifact_bytes(
                             f"{worksheet.title}!{cell.coordinate}."
                         )
 
-        if normalized_analysis_type in {"comparison", "diagnostic"}:
+        if "趋势与对比" in workbook.sheetnames:
             trend_sheet = workbook["趋势与对比"]
             trend_header_row = find_header_row(trend_sheet, "周期")
             require_complete_rows(
                 trend_sheet,
                 start_row=4,
                 end_row=trend_header_row - 3,
-                end_column=8,
+                end_column=7,
             )
             require_complete_rows(
                 trend_sheet,
@@ -2740,18 +3098,36 @@ def _validate_artifact_bytes(
                 end_column=7,
             )
 
-        if normalized_analysis_type == "diagnostic":
-            driver_sheet = workbook["驱动分析"]
+        if "异常与建议" in workbook.sheetnames:
+            driver_sheet = workbook["异常与建议"]
+            recommendation_header_row = find_header_row(driver_sheet, "优先级")
             require_complete_rows(
                 driver_sheet,
                 start_row=4,
-                end_row=driver_sheet.max_row,
-                end_column=9,
+                end_row=recommendation_header_row - 3,
+                end_column=3,
+            )
+            recommendation_end_row = max(
+                (
+                    row_index
+                    for row_index in range(recommendation_header_row + 1, driver_sheet.max_row + 1)
+                    if any(
+                        driver_sheet.cell(row_index, column_index).value not in (None, "")
+                        for column_index in range(1, 4)
+                    )
+                ),
+                default=recommendation_header_row + 1,
+            )
+            require_complete_rows(
+                driver_sheet,
+                start_row=recommendation_header_row + 1,
+                end_row=recommendation_end_row,
+                end_column=3,
             )
 
-        quality_sheet = workbook["数据口径与质量"]
-        definition_header_row = find_header_row(quality_sheet, "指标名称")
-        quality_header_row = find_header_row(quality_sheet, "质量检查项")
+        quality_sheet = workbook["口径与提示"]
+        definition_header_row = find_header_row(quality_sheet, "指标")
+        quality_header_row = find_header_row(quality_sheet, "提示类型")
         require_complete_rows(
             quality_sheet,
             start_row=4,
@@ -2762,7 +3138,7 @@ def _validate_artifact_bytes(
             quality_sheet,
             start_row=definition_header_row + 1,
             end_row=quality_header_row - 3,
-            end_column=7,
+            end_column=2,
         )
         require_complete_rows(
             quality_sheet,
@@ -2772,20 +3148,21 @@ def _validate_artifact_bytes(
         )
 
         if expected_columns:
+            merchant_columns = _merchant_detail_columns(expected_columns)
             expected_headers = [
                 _xlsx_safe_value(label, context=f"Column header {index}")
-                for index, label in enumerate(_display_columns(expected_columns), start=1)
+                for index, label in enumerate(_display_columns(merchant_columns), start=1)
             ]
             actual_headers = [
                 detail_sheet.cell(row=1, column=index).value
-                for index in range(1, len(expected_columns) + 1)
+                for index in range(1, len(merchant_columns) + 1)
             ]
             if actual_headers != expected_headers:
                 raise ValueError("Generated XLSX column headers do not match the query result.")
             if detail_sheet.max_row != len(expected_rows) + 1:
                 raise ValueError("Generated XLSX row count does not match the query result.")
             for row_index, source_row in enumerate(expected_rows, start=2):
-                for column_index, column in enumerate(expected_columns, start=1):
+                for column_index, column in enumerate(merchant_columns, start=1):
                     identifier_column = _is_identifier_column(column)
                     expected = _xlsx_safe_value(
                         _xlsx_display_value(source_row.get(column)),
