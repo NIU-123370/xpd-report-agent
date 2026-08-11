@@ -389,6 +389,7 @@ def test_xlsx_detail_maps_comparison_period_type_and_localizes_values():
     assert [detail.cell(row, 4).value for row in range(2, 4)] == ["current", "baseline"]
     assert report_export._column_label("period") == "其他数据字段"
     assert report_export._column_label("period_flag") == "其他数据字段"
+    assert report_export._column_label("直播时长_分钟") == "直播时长（分钟）"
     workbook.close()
 
 
@@ -468,6 +469,70 @@ def test_xlsx_preserves_complete_fourteen_day_multi_metric_trend():
         for row in range(trend_header + 1, trend_header + 1 + len(periods))
     ] == periods
     assert trend_sheet._charts[0].anchor._from.row >= trend_header + len(trends) + 1
+    workbook.close()
+
+
+def test_xlsx_analysis_rate_formats_accept_fraction_and_percent_number_values():
+    content = report_export._xlsx_bytes(
+        title="百分比格式回归",
+        summary="",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT rate comparison data",
+        columns=[],
+        rows=[],
+        truncated=False,
+        analysis_type="comparison",
+        analysis={
+            "comparisons": [
+                {
+                    "metric": "金额退款率",
+                    "current_value": 35.13,
+                    "baseline_value": 39.54,
+                    "absolute_change": -4.41,
+                    "relative_change": -0.1116,
+                    "unit": "%",
+                }
+            ],
+            "trends": [
+                {
+                    "period": "2026-07-19",
+                    "metric": "金额退款率",
+                    "current_value": 25.19,
+                    "unit": "%",
+                },
+                {
+                    "period": "2026-07-20",
+                    "metric": "金额退款率",
+                    "current_value": 0.5675,
+                    "unit": "%",
+                },
+            ],
+        },
+    )
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    trend_sheet = workbook["趋势与对比"]
+    assert [trend_sheet.cell(4, column).value for column in range(2, 6)] == [
+        35.13,
+        39.54,
+        -4.41,
+        -0.1116,
+    ]
+    assert all(
+        trend_sheet.cell(4, column).number_format.startswith('0.00"%"')
+        for column in (2, 3, 4)
+    )
+    assert trend_sheet.cell(4, 5).number_format.startswith("0.0%")
+
+    trend_header = next(
+        row
+        for row in range(1, trend_sheet.max_row + 1)
+        if trend_sheet.cell(row, 1).value == "周期"
+    )
+    assert trend_sheet.cell(trend_header + 1, 3).number_format.startswith('0.00"%"')
+    assert trend_sheet.cell(trend_header + 2, 3).number_format.startswith("0.00%")
     workbook.close()
 
 

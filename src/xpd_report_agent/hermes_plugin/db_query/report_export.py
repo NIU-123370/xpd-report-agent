@@ -56,6 +56,7 @@ EXCEL_MAX_EXACT_INTEGER = 999_999_999_999_999
 EXCEL_ILLEGAL_CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
 
 CHINESE_COLUMN_LABELS = {
+    "直播时长_分钟": "直播时长（分钟）",
     "caliber": "统计口径",
     "grain": "统计粒度",
     "period_label": "统计时间",
@@ -1009,6 +1010,8 @@ def _xlsx_detail_display_value(column: str, value: Any) -> Any:
 
 def _column_label(column: str) -> str:
     raw = str(column).strip()
+    if raw in CHINESE_COLUMN_LABELS:
+        return CHINESE_COLUMN_LABELS[raw]
     if re.search(r"[\u3400-\u9fff]", raw):
         return raw
     normalized = raw.strip("`\"'").lower()
@@ -1655,7 +1658,13 @@ def _xlsx_bytes(
         metric_text = _cell_text(metric_name)
         unit_text = _cell_text(unit)
         if "率" in metric_text or unit_text in {"%", "百分比", "百分点"}:
-            cell.number_format = "0.00%;[Red](0.00%);-"
+            if (
+                isinstance(cell.value, (int, float, Decimal))
+                and abs(float(cell.value)) > 1
+            ):
+                cell.number_format = '0.00"%";[Red](0.00"%");-'
+            else:
+                cell.number_format = "0.00%;[Red](0.00%);-"
         elif unit_text in {"元", "人民币"} or "金额" in metric_text:
             cell.number_format = "¥#,##0.00;[Red](¥#,##0.00);-"
         elif unit_text in {"件", "单", "人", "次", "场"}:
