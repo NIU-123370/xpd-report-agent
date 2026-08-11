@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 MIN_SECRET_LENGTH = 32
 
@@ -146,6 +147,42 @@ def deployment_preflight_issues(
     )
     if reload_enabled:
         issues.append("FASTAPI_RELOAD must be false for production deployment.")
+
+    if _value(environment, "XPD_CONTAINER_ROLE").casefold() == "hermes":
+        hermes_home = _required_non_placeholder(
+            environment,
+            label="HERMES_HOME",
+            names=("HERMES_HOME",),
+            issues=issues,
+        )
+        shared_home = _required_non_placeholder(
+            environment,
+            label="XPD_HERMES_SHARED_HOME",
+            names=("XPD_HERMES_SHARED_HOME",),
+            issues=issues,
+        )
+        _required_non_placeholder(
+            environment,
+            label="XPD_HERMES_NODE_ID",
+            names=("XPD_HERMES_NODE_ID",),
+            issues=issues,
+        )
+        memory_root = _required_non_placeholder(
+            environment,
+            label="XPD_MEMORY_ROOT",
+            names=("XPD_MEMORY_ROOT",),
+            issues=issues,
+        )
+        if hermes_home and shared_home:
+            instance_path = Path(hermes_home).expanduser().resolve(strict=False)
+            shared_path = Path(shared_home).expanduser().resolve(strict=False)
+            if instance_path == shared_path:
+                issues.append(
+                    "Each Hermes node must use an isolated HERMES_HOME; "
+                    "it must not equal XPD_HERMES_SHARED_HOME."
+                )
+        if memory_root and not Path(memory_root).expanduser().is_absolute():
+            issues.append("XPD_MEMORY_ROOT must be an absolute path.")
 
     for name in _MODEL_CONFIG_NAMES:
         _required_non_placeholder(

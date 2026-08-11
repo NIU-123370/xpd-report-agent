@@ -129,6 +129,10 @@ def test_compose_keeps_all_hermes_nodes_internal_and_starts_fastapi_with_them():
 def test_compose_assigns_cron_to_hermes_1_only():
     services = yaml.safe_load(_read(DOCKER_DIR / "compose.yaml"))["services"]
 
+    assert all(
+        services[name]["environment"]["XPD_HERMES_SCHEDULER_NODE"] == "hermes-1"
+        for name in ("hermes-1", "hermes-2", "hermes-3")
+    )
     # hermes-1 inherits both switches from the protected env file. Production
     # defaults keep them false; operators may explicitly enable the leader.
     assert "XPD_HERMES_CRON_PATCH" not in services["hermes-1"]["environment"]
@@ -138,14 +142,15 @@ def test_compose_assigns_cron_to_hermes_1_only():
         assert services[name]["environment"]["XPD_SCHEDULES_ENABLED"] == "false"
 
 
-def test_compose_shares_state_and_report_files_between_services():
+def test_compose_shares_memory_and_files_but_isolates_each_hermes_home():
     compose = yaml.safe_load(_read(DOCKER_DIR / "compose.yaml"))
+    services = compose["services"]
     required_volumes = {
         "hermes-state:/var/lib/xpd-report-agent/.hermes",
         "report-files:/app/data/report-files",
     }
 
-    for service in compose["services"].values():
+    for service in services.values():
         assert service["stop_grace_period"] == "60s"
         assert required_volumes <= set(service["volumes"])
         assert service["logging"] == {
@@ -153,13 +158,30 @@ def test_compose_shares_state_and_report_files_between_services():
             "options": {"max-size": "20m", "max-file": "5"},
         }
         assert service["environment"]["XPD_FILE_STORAGE_PATH"] == ("/app/data/report-files")
-        assert service["environment"]["HERMES_HOME"] == ("/var/lib/xpd-report-agent/.hermes")
+        assert service["environment"]["XPD_HERMES_SHARED_HOME"] == (
+            "/var/lib/xpd-report-agent/.hermes"
+        )
+        assert service["environment"]["XPD_MEMORY_ROOT"] == (
+            "/var/lib/xpd-report-agent/.hermes/memories"
+        )
         assert service["environment"]["XPD_CRON_SCRIPT_DIR"] == (
             "/var/lib/xpd-report-agent/.hermes/scripts"
         )
         assert service["environment"]["XPD_CRON_CALLBACK_ORIGIN"] == (
             "http://xpd-report-agent:8000"
         )
+
+    assert services["xpd-report-agent"]["environment"]["HERMES_HOME"] == (
+        "/var/lib/xpd-report-agent/.hermes"
+    )
+    assert {
+        services[name]["environment"]["HERMES_HOME"]
+        for name in ("hermes-1", "hermes-2", "hermes-3")
+    } == {
+        "/var/lib/xpd-report-agent/.hermes/instances/hermes-1",
+        "/var/lib/xpd-report-agent/.hermes/instances/hermes-2",
+        "/var/lib/xpd-report-agent/.hermes/instances/hermes-3",
+    }
 
     assert compose["volumes"]["hermes-state"]["name"] == ("xpd-report-agent-hermes-state")
     assert compose["volumes"]["report-files"] is None

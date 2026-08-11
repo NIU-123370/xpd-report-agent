@@ -198,9 +198,10 @@ class _Discovery:
         return self.nodes
 
 
-def test_resolved_pool_uses_kubernetes_discovery_and_enables_cas_rebinding(tmp_path):
+def test_resolved_pool_only_enables_cas_rebinding_when_explicitly_configured(tmp_path):
     env = {
         "XPD_HERMES_DISCOVERY_MODE": "kubernetes",
+        "XPD_HERMES_ROUTE_REBINDING_ENABLED": "true",
         "XPD_HERMES_ROUTE_STATE_PATH": str(tmp_path / "routes.json"),
     }
     discovery = _Discovery(
@@ -222,6 +223,30 @@ def test_resolved_pool_uses_kubernetes_discovery_and_enables_cas_rebinding(tmp_p
     assert pool.allow_route_rebinding is True
     assert rebound.node_id == "hermes-pod-2"
     assert pool.bound_node_for_session(SESSION_A).node_id == "hermes-pod-2"
+
+
+def test_resolved_pool_disables_rebinding_for_isolated_node_homes_by_default(tmp_path):
+    env = {
+        "XPD_HERMES_DISCOVERY_MODE": "kubernetes",
+        "XPD_HERMES_ROUTE_STATE_PATH": str(tmp_path / "routes.json"),
+    }
+    discovery = _Discovery(
+        (
+            HermesNode("hermes-0", "http://hermes-0.hermes:8642"),
+            HermesNode("hermes-1", "http://hermes-1.hermes:8642"),
+        )
+    )
+
+    pool = asyncio.run(resolved_hermes_pool(env, discovery=discovery))
+    pool.bind_scope(SCOPE_A, "hermes-0")
+
+    assert pool.allow_route_rebinding is False
+    with pytest.raises(HermesRouteUnavailableError):
+        pool.rebind_scope_if_matches(
+            SCOPE_A,
+            expected_node_id="hermes-0",
+            replacement_node_id="hermes-1",
+        )
 
 
 def test_kubernetes_pool_with_one_ready_node_still_persists_routes(tmp_path):

@@ -142,6 +142,7 @@ def test_hermes_statefulset_has_stable_identity_and_forced_single_node_topology(
         "metadata.name"
     )
     startup = container["args"][0]
+    assert 'export HERMES_HOME="${XPD_HERMES_SHARED_HOME}/instances/${POD_NAME}"' in startup
     assert '"$POD_NAME" = "$XPD_HERMES_SCHEDULER_NODE"' in startup
     assert "export XPD_HERMES_CRON_PATCH=false" in startup
     assert pod_spec["terminationGracePeriodSeconds"] == 420
@@ -160,6 +161,7 @@ def test_discovery_and_scheduler_configuration_uses_endpoint_slices_and_hermes_z
     assert config["XPD_K8S_HERMES_SERVICE"] == "hermes-headless"
     assert config["XPD_K8S_HERMES_PORT"] == "8642"
     assert config["XPD_HERMES_SCHEDULER_NODE"] == "hermes-0"
+    assert config["XPD_HERMES_ROUTE_REBINDING_ENABLED"] == "false"
     assert config["XPD_AGENT_MAX_CONCURRENCY"] == "20"
     assert headless["spec"]["clusterIP"] == "None"
     assert headless["spec"]["ports"][0]["port"] == 8642
@@ -207,7 +209,7 @@ def test_container_images_use_the_same_numeric_non_root_identity_as_ack():
     assert "USER xpd-agent" not in dockerfile
 
 
-def test_hpa_scales_hermes_from_two_to_ten_using_load_queue_and_cpu():
+def test_hpa_scales_hermes_up_but_never_discards_state_automatically():
     hpa = _document("hpa.yaml", "HorizontalPodAutoscaler", "hermes")["spec"]
 
     assert hpa["scaleTargetRef"] == {
@@ -217,7 +219,7 @@ def test_hpa_scales_hermes_from_two_to_ten_using_load_queue_and_cpu():
     }
     assert hpa["minReplicas"] == 2
     assert hpa["maxReplicas"] == 10
-    assert hpa["behavior"]["scaleDown"]["stabilizationWindowSeconds"] == 1800
+    assert hpa["behavior"]["scaleDown"] == {"selectPolicy": "Disabled"}
     assert {metric["type"] for metric in hpa["metrics"]} == {"External", "Resource"}
 
     external_metrics = {

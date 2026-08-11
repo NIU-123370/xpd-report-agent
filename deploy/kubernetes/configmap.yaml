@@ -7,14 +7,16 @@ data:
   FASTAPI_HOST: "0.0.0.0"
   FASTAPI_PORT: "8000"
   FASTAPI_RELOAD: "false"
-  HERMES_HOME: /var/lib/xpd-report-agent/.hermes
   HERMES_GATEWAY_HOST: "0.0.0.0"
   HERMES_GATEWAY_PORT: "8642"
   HERMES_BOOTSTRAP_ON_START: "false"
+  XPD_HERMES_SHARED_HOME: /var/lib/xpd-report-agent/.hermes
+  XPD_MEMORY_ROOT: /var/lib/xpd-report-agent/.hermes/memories
   XPD_FILE_STORAGE_PATH: /app/data/report-files
   XPD_CRON_SCRIPT_DIR: /var/lib/xpd-report-agent/.hermes/scripts
   XPD_CRON_CALLBACK_ORIGIN: http://xpd-report-agent:8000
   XPD_HERMES_DISCOVERY_MODE: kubernetes
+  XPD_HERMES_ROUTE_REBINDING_ENABLED: "false"
   XPD_K8S_HERMES_SERVICE: hermes-headless
   XPD_K8S_HERMES_PORT: "8642"
   XPD_HERMES_SCHEDULER_NODE: hermes-0

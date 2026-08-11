@@ -23,6 +23,9 @@ def hermes_home() -> Path:
 
 
 def memories_root() -> Path:
+    configured = os.getenv("XPD_MEMORY_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
     return hermes_home() / "memories"
 
 

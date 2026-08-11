@@ -444,6 +444,26 @@ def hermes_discovery_mode(env: Mapping[str, str] | None = None) -> str:
     )
 
 
+def automatic_route_rebinding_enabled(
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether a missing node may take over another node's sessions.
+
+    Hermes persists session history inside ``HERMES_HOME``. Deployments with
+    one isolated home per node must fail closed while that node is restarting;
+    silently rebinding would send the session to a node without its history.
+    The switch remains available for a future shared/external session backend.
+    """
+
+    environment = os.environ if env is None else env
+    return str(environment.get("XPD_HERMES_ROUTE_REBINDING_ENABLED", "false")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def hermes_pool_from_nodes(
     nodes: Sequence[HermesNode],
     env: Mapping[str, str] | None = None,
@@ -494,5 +514,5 @@ async def resolved_hermes_pool(
     return hermes_pool_from_nodes(
         nodes,
         environment,
-        allow_route_rebinding=True,
+        allow_route_rebinding=automatic_route_rebinding_enabled(environment),
     )

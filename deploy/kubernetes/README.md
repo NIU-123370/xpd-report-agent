@@ -1,10 +1,10 @@
 # ACK 动态 Hermes 实例池部署
 
-这套清单在阿里云容器服务 ACK 上部署一个 FastAPI Pod，以及由 HPA 在 2～10 个副本之间伸缩的 Hermes StatefulSet。FastAPI 的 8000 端口通过 ACK 私网 LoadBalancer 在 VPC 内开放；Hermes 的 8642 只有无头 Service，NetworkPolicy 仅允许 FastAPI Pod 访问。
+这套清单在阿里云容器服务 ACK 上部署一个 FastAPI Pod，以及由 HPA 从 2 个副本按需扩容、最多扩到 10 个副本的 Hermes StatefulSet。为保护每个 Hermes 的稳定实例状态，HPA 自动缩容已关闭。FastAPI 的 8000 端口通过 ACK 私网 LoadBalancer 在 VPC 内开放；Hermes 的 8642 只有无头 Service，NetworkPolicy 仅允许 FastAPI Pod 访问。
 
 ## 一、先理解边界
 
-Hermes 当前把会话、记忆和任务状态保存在 SQLite/本地文件，并依赖本机文件锁。为了保证这些数据在多个 Hermes 进程间一致，本清单让 FastAPI 和全部 Hermes Pod 共用两个 `ReadWriteOnce` 云盘 PVC，并把所有 Pod 固定到唯一一个带 `xpd-report-agent=true` 标签的节点。
+Hermes 当前把会话、记忆和任务状态保存在 SQLite/本地文件，并依赖本机文件锁。多个 Gateway 不能共用同一个 `HERMES_HOME`，否则 PID 和运行锁会冲突。本清单仍让 FastAPI 和全部 Hermes Pod 挂载同一个 `hermes-state` `ReadWriteOnce` 云盘 PVC，但目录职责不同：FastAPI 使用共享根目录，每个 Hermes Pod 使用 `instances/<POD_NAME>` 稳定子目录，所有角色仅通过共享根目录下的 `memories/` 读写长期记忆。`report-files` 使用第二个 RWO PVC。所有 Pod 固定到唯一一个带 `xpd-report-agent=true` 标签的节点。
 
 因此，这个方案提供的是“单节点内的动态并发扩容”，不是跨节点高可用：
 
@@ -18,11 +18,11 @@ Hermes 当前把会话、记忆和任务状态保存在 SQLite/本地文件，�
 ## 二、架构与调度
 
 - `xpd-report-agent` Deployment 固定 1 个副本，使用 EndpointSlice 发现可用 Hermes Pod。
-- `hermes` StatefulSet 使用稳定 Pod 名 `hermes-0`、`hermes-1`……，扩缩容不会改变已有 Pod 身份。
-- `hermes-0` 是定时任务 leader。最小副本数为 2，因此正常扩缩容不会删除它；leader 不可用期间定时任务暂停，不会切换到另一个节点重复执行。
+- `hermes` StatefulSet 使用稳定 Pod 名 `hermes-0`、`hermes-1`……；各 Pod 的 `HERMES_HOME` 分别为共享卷中的 `instances/hermes-0`、`instances/hermes-1`……，同名 Pod 重建后继续使用原实例目录。
+- `hermes-0` 是定时任务 leader。最小副本数为 2，HPA 只会扩容而不会自动删除已有 Pod；leader 不可用期间定时任务暂停，不会切换到另一个节点重复执行。
 - FastAPI ServiceAccount 只拥有当前命名空间内 EndpointSlice 的 `get/list/watch` 权限，无工作负载或 Secret 写权限。
 - HPA 以 `xpd_agent_demand=xpd_agent_active+xpd_agent_waiting` 为主要业务指标，按每个 Hermes 约 7 个任务计算副本数，并以 Hermes CPU 利用率为兜底。这样等待队列会参与容量计算，不使用会导致跳变的单独 `Value` 指标。
-- 缩容稳定窗口为 30 分钟，每 5 分钟最多缩 1 个 Pod。Pod 进入终止状态后会先停止被 EndpointSlice 发现，再保留 5 分钟排空窗口；超过窗口的超长请求仍可能中断，生产压测必须覆盖这一情况。
+- HPA 的 `scaleDown.selectPolicy` 为 `Disabled`，同时 `XPD_HERMES_ROUTE_REBINDING_ENABLED=false`：负载下降后保留已创建的 Hermes Pod 和稳定实例目录，不自动缩容，也不把已有节点粘性路由静默改绑到另一个独立状态目录。确需人工缩容时，必须先排空目标 Pod，并完成节点粘性路由和实例状态迁移；未完成迁移不得删除副本。
 - FastAPI 使用 `Recreate` 发布策略，确保任何时刻只有一个调度器；代价是 FastAPI 版本发布时会有短暂维护窗口。
 
 ## 三、ACK 前置条件
@@ -40,7 +40,7 @@ kubectl get apiservice | grep external.metrics
 kubectl get --raw '/apis/external.metrics.k8s.io/v1beta1/namespaces/xpd-report-agent/xpd_agent_demand'
 ```
 
-如果自定义指标暂时不可用，CPU 过载仍可触发扩容；为安全起见，HPA 可能拒绝缩容。不要把这当成正常的长期运行状态。
+如果自定义指标暂时不可用，CPU 过载仍可触发扩容。自动缩容无论指标是否正常都保持关闭，这是保护稳定实例状态的预期配置；应结合容量告警，由运维人员评估是否需要在排空和迁移后人工缩容。
 
 ## 四、首次初始化
 
@@ -94,11 +94,12 @@ export GIT_SHA="$CI_COMMIT_SHA"
 
 1. 备份旧 `HERMES_HOME` 的完整目录，包括 SQLite 的 `-wal`、`-shm` 文件和路由状态。
 2. 备份旧报表目录；若报表已全部上传 OSS，也要保留元数据和迁移清单。
-3. 对两个新 PVC 创建云盘快照，然后用一次性迁移 Pod 把数据恢复到对应挂载目录。
-4. 校验文件属主可被镜像中的非 root 用户读写，再启动工作负载。
-5. 首次切流后保留旧卷和快照，至少覆盖一个业务回滚窗口。
+3. 对两个新 PVC 创建云盘快照，然后用一次性迁移 Pod 把完整旧目录恢复到 `hermes-state` 共享根。
+4. 在所有 FastAPI/Hermes 进程仍保持停止时，将旧共享根中的 Hermes 会话、Cron 和其他实例状态复制到空的 `instances/hermes-0`。复制时必须排除 `instances/`、`xpd-report-agent/`、`memories/`、`scripts/`、Gateway PID/锁/状态、Cron PID、`processes.json`、`gateway-starts.log`、旧 `.env`、日志和 `state/gateway.heartbeat`；共享的 `memories/`、`scripts/` 与 FastAPI 状态继续保留在根目录。
+5. 校验文件属主可被镜像中的非 root 用户读写，并核对 SQLite 主文件及其 WAL/SHM，再启动工作负载。
+6. 首次切流后保留旧卷和快照，至少覆盖一个业务回滚窗口。
 
-禁止在旧服务仍运行时复制 SQLite，也不要只复制主 `.db` 文件而遗漏 WAL 文件。
+清单不会自动复制、移动或删除旧状态；这项离线迁移必须由一次性迁移 Pod 人工执行并验证。禁止在旧服务仍运行时复制 SQLite，也不要只复制主 `.db` 文件而遗漏 WAL 文件。旧会话和 Cron 状态归入 `hermes-0`，其他 Hermes Pod 从各自的新实例目录启动。
 
 ## 七、部署验证
 

@@ -22,15 +22,8 @@ spec:
           value: 100
           periodSeconds: 60
     scaleDown:
-      stabilizationWindowSeconds: 1800
-      selectPolicy: Min
-      policies:
-        - type: Pods
-          value: 1
-          periodSeconds: 300
-        - type: Percent
-          value: 25
-          periodSeconds: 300
+      # Hermes 副本持有稳定的实例目录；排空和状态迁移前禁止自动缩容。
+      selectPolicy: Disabled
   metrics:
     # 主指标：活跃任务与等待任务之和，按每个 Hermes 约 7 个计算副本数。
     - type: External

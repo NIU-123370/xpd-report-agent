@@ -2164,6 +2164,7 @@ async def list_sessions(
     raw = await _hermes_json(
         "GET",
         "/api/sessions?limit=1000&offset=0&source=api_server&include_children=true",
+        scope=scope,
         action="list sessions",
     )
     owned = [

@@ -38,6 +38,8 @@ spec:
           env:
             - name: XPD_CONTAINER_ROLE
               value: fastapi
+            - name: HERMES_HOME
+              value: /var/lib/xpd-report-agent/.hermes
             - name: XPD_K8S_NAMESPACE
               valueFrom:
                 fieldRef:
@@ -146,6 +148,7 @@ spec:
           command: ["/bin/sh", "-ec"]
           args:
             - |
+              export HERMES_HOME="${XPD_HERMES_SHARED_HOME}/instances/${POD_NAME}"
               if [ "$POD_NAME" = "$XPD_HERMES_SCHEDULER_NODE" ]; then
                 export XPD_HERMES_CRON_PATCH="$XPD_SCHEDULES_ENABLED"
               else

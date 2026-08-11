@@ -89,6 +89,41 @@ def test_fastapi_reload_is_rejected_in_production():
     assert "FASTAPI_RELOAD must be false for production deployment." in issues
 
 
+def test_hermes_node_requires_an_isolated_instance_home():
+    env = _valid_environment()
+    env.update(
+        {
+            "XPD_CONTAINER_ROLE": "hermes",
+            "XPD_HERMES_NODE_ID": "hermes-2",
+            "HERMES_HOME": "/data/hermes",
+            "XPD_HERMES_SHARED_HOME": "/data/hermes",
+            "XPD_MEMORY_ROOT": "/data/hermes/memories",
+        }
+    )
+
+    issues = deployment_preflight_issues(env)
+
+    assert (
+        "Each Hermes node must use an isolated HERMES_HOME; "
+        "it must not equal XPD_HERMES_SHARED_HOME."
+    ) in issues
+
+
+def test_hermes_node_accepts_isolated_home_with_shared_memory_root():
+    env = _valid_environment()
+    env.update(
+        {
+            "XPD_CONTAINER_ROLE": "hermes",
+            "XPD_HERMES_NODE_ID": "hermes-2",
+            "HERMES_HOME": "/data/hermes/instances/hermes-2",
+            "XPD_HERMES_SHARED_HOME": "/data/hermes",
+            "XPD_MEMORY_ROOT": "/data/hermes/memories",
+        }
+    )
+
+    assert deployment_preflight_issues(env) == ()
+
+
 @pytest.mark.parametrize(
     "name",
     [

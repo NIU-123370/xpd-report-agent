@@ -118,3 +118,27 @@ def test_user_memory_view_does_not_fall_back_to_local_or_another_user(
     assert data[2]["content"] == ""
     assert "A 的记忆" not in str(data)
     assert "查询前先确认日期口径" not in str(data)
+
+
+def test_shared_memory_root_is_independent_from_instance_hermes_home(
+    tmp_path, monkeypatch
+):
+    instance_home = tmp_path / "instances" / "hermes-2"
+    shared_memory = tmp_path / "shared" / "memories"
+    instance_home.mkdir(parents=True)
+    shared_memory.mkdir(parents=True)
+    (shared_memory / "MEMORY.md").write_text("共享记忆", encoding="utf-8")
+    (shared_memory / "USER.md").write_text("共享画像", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(instance_home))
+    monkeypatch.setenv("XPD_MEMORY_ROOT", str(shared_memory))
+    monkeypatch.setenv("HERMES_GATEWAY_API_KEY", "gateway-test-key")
+    monkeypatch.setenv("XPD_SESSION_SIGNING_SECRET", "session-signing-test-key")
+    client = TestClient(app_main.app)
+
+    response = client.get("/api/memories", headers=CLIENT_HEADERS)
+
+    assert response.status_code == 200
+    assert [item["content"] for item in response.json()["data"]] == [
+        "共享记忆",
+        "共享画像",
+    ]

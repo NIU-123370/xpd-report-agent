@@ -14,9 +14,11 @@ x-xpd-common: &xpd-common
 
 x-hermes-environment: &hermes-environment
   XPD_CONTAINER_ROLE: hermes
-  HERMES_HOME: /var/lib/xpd-report-agent/.hermes
+  XPD_HERMES_SHARED_HOME: /var/lib/xpd-report-agent/.hermes
+  XPD_MEMORY_ROOT: /var/lib/xpd-report-agent/.hermes/memories
   HERMES_GATEWAY_HOST: 0.0.0.0
   HERMES_GATEWAY_PORT: "8642"
+  XPD_HERMES_SCHEDULER_NODE: hermes-1
   XPD_FILE_STORAGE_PATH: /app/data/report-files
   XPD_CRON_SCRIPT_DIR: /var/lib/xpd-report-agent/.hermes/scripts
   XPD_CRON_CALLBACK_ORIGIN: http://xpd-report-agent:8000
@@ -45,6 +47,7 @@ services:
     container_name: xpd-report-agent-hermes-1
     environment:
       <<: *hermes-environment
+      HERMES_HOME: /var/lib/xpd-report-agent/.hermes/instances/hermes-1
       XPD_HERMES_NODE_ID: hermes-1
 
   hermes-2:
@@ -52,6 +55,7 @@ services:
     container_name: xpd-report-agent-hermes-2
     environment:
       <<: *hermes-environment
+      HERMES_HOME: /var/lib/xpd-report-agent/.hermes/instances/hermes-2
       XPD_HERMES_NODE_ID: hermes-2
       XPD_HERMES_CRON_PATCH: "false"
       XPD_SCHEDULES_ENABLED: "false"
@@ -61,6 +65,7 @@ services:
     container_name: xpd-report-agent-hermes-3
     environment:
       <<: *hermes-environment
+      HERMES_HOME: /var/lib/xpd-report-agent/.hermes/instances/hermes-3
       XPD_HERMES_NODE_ID: hermes-3
       XPD_HERMES_CRON_PATCH: "false"
       XPD_SCHEDULES_ENABLED: "false"
@@ -78,6 +83,8 @@ services:
       FASTAPI_HOST: 0.0.0.0
       FASTAPI_PORT: "8000"
       HERMES_HOME: /var/lib/xpd-report-agent/.hermes
+      XPD_HERMES_SHARED_HOME: /var/lib/xpd-report-agent/.hermes
+      XPD_MEMORY_ROOT: /var/lib/xpd-report-agent/.hermes/memories
       HERMES_GATEWAY_HOST: hermes-1
       HERMES_GATEWAY_PORT: "8642"
       HERMES_GATEWAY_NODES: hermes-1=http://hermes-1:8642,hermes-2=http://hermes-2:8642,hermes-3=http://hermes-3:8642

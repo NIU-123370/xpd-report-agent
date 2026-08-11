@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import os
 
+# This must run before the API Server patches below import Hermes gateway
+# modules, because gateway.run imports the Cron resolver by value.
+from xpd_report_agent.runtime.hermes_cron_scheduler import (
+    install_patch as install_cron_scheduler_patch,
+)
+
+install_cron_scheduler_patch()
+
 if os.getenv("XPD_HERMES_REASONING_STREAM_PATCH", "").strip().lower() in {
     "1",
     "true",

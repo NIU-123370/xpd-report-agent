@@ -15,7 +15,9 @@
                           -> db-query -> RDS 只读查询
                           -> report-file -> Excel/PDF 等报告并上传 OSS
 
-四个容器共享同一个 hermes-state 和 report-files 本地卷
+四个容器挂载同一个 hermes-state 和 report-files 本地卷；FastAPI 使用 hermes-state
+根目录，三个 Hermes 分别使用 instances/hermes-1、instances/hermes-2 和
+instances/hermes-3 稳定子目录，不共享同一个 HERMES_HOME
 ```
 
 三个 Hermes 都使用自己网络命名空间内的 `8642`，不映射到宿主机；只有 FastAPI
@@ -89,7 +91,13 @@ chmod 600 xpd-report-agent.env
 `0.0.0.0:8642`，FastAPI 使用 `HERMES_GATEWAY_NODES` 连接
 `hermes-1`、`hermes-2` 和 `hermes-3`，并用 `XPD_HERMES_SCHEDULER_NODE=hermes-1`
 固定调度节点。Compose 还会向每个 Hermes 注入唯一的 `XPD_HERMES_NODE_ID`，用于日志和运维审计。
-不要在共享环境文件中添加或覆盖节点池、节点 ID、主机名、监听端口和内部回调地址。
+FastAPI 的 `HERMES_HOME` 固定为 `/var/lib/xpd-report-agent/.hermes`；三个 Hermes 的
+`HERMES_HOME` 分别固定到该根目录下的 `instances/hermes-1`、`instances/hermes-2` 和
+`instances/hermes-3`，避免 Gateway 的 PID、锁和本地状态互相冲突。所有角色同时使用
+`XPD_HERMES_SHARED_HOME=/var/lib/xpd-report-agent/.hermes`，并通过
+`XPD_MEMORY_ROOT=/var/lib/xpd-report-agent/.hermes/memories` 共享长期记忆。不要在共享环境文件中
+添加或覆盖节点池、节点 ID、`HERMES_HOME`、`XPD_HERMES_SHARED_HOME`、`XPD_MEMORY_ROOT`、
+主机名、监听端口和内部回调地址。
 
 定时报告默认关闭。若显式启用，`hermes-1` 从环境文件读取 Cron 开关并作为唯一
 Cron leader；Compose 会强制关闭 `hermes-2` 和 `hermes-3` 的定时任务及 Cron 补丁，
@@ -169,8 +177,9 @@ docker run --rm --entrypoint sh xpd-report-agent-hermes:dev \
 ```
 
 Hermes 固定运行时仅存在于 `xpd-report-agent-hermes:dev` 的 `/opt/hermes-agent`；FastAPI 镜像
-不包含该运行时。可变的会话状态仍保存在四个容器共享的 `$HOME/.hermes` 本地卷，
-因此重建镜像不会丢失历史。
+不包含该运行时。可变数据仍保存在 `hermes-state` 本地卷：FastAPI 使用共享根目录，长期记忆
+保存在共享的 `memories/`，每个 Hermes 的会话和本地运行状态保存在自己的稳定
+`instances/hermes-N/` 子目录。因此重建镜像或重建同名容器不会丢失对应实例的历史。
 
 构建完成后，可在启动前单独检查配置：
 
@@ -210,7 +219,7 @@ XPD_SPLIT_BACKUP_DIR="/opt/xpd-before-split-$(date +%Y%m%d%H%M%S)"
 install -d -m 700 "$XPD_SPLIT_BACKUP_DIR/hermes-state"
 install -d -m 700 "$XPD_SPLIT_BACKUP_DIR/report-files"
 
-docker stop --time 60 xpd-report-agent
+docker stop --timeout 60 xpd-report-agent
 docker cp xpd-report-agent:/var/lib/xpd-report-agent/.hermes/. \
   "$XPD_SPLIT_BACKUP_DIR/hermes-state/"
 docker cp xpd-report-agent:/app/data/report-files/. \
@@ -220,8 +229,44 @@ test -n "$(find "$XPD_SPLIT_BACKUP_DIR/hermes-state" -mindepth 1 -print -quit)" 
        docker start xpd-report-agent; false; }
 ```
 
-只有输出 `active_tasks=0` 且备份成功时才能继续。保持原部署目录和 Compose project 名不变，新的
-四个服务会继续使用原 `hermes-state` 与 `report-files` 本地卷：
+只有输出 `active_tasks=0` 且备份成功时才能继续。此时所有旧进程都必须保持停止；在启动新服务前，
+用新镜像提供的一次性容器把旧根目录中的 Hermes 会话、Cron 和其他实例状态复制到
+`instances/hermes-1`。命令只接受空目标目录，不会删除或移动旧数据：
+
+```bash
+docker compose run --rm --no-deps --entrypoint sh hermes-1 -ec '
+shared="$XPD_HERMES_SHARED_HOME"
+target="$shared/instances/hermes-1"
+mkdir -p "$target"
+test -z "$(find "$target" -mindepth 1 -print -quit)" || {
+  echo "目标实例目录不是空目录，拒绝覆盖：$target" >&2
+  exit 1
+}
+tar -C "$shared" \
+  --exclude="./instances" \
+  --exclude="./xpd-report-agent" \
+  --exclude="./memories" \
+  --exclude="./scripts" \
+  --exclude="./gateway.pid" \
+  --exclude="./gateway.lock" \
+  --exclude="./gateway_state.json" \
+  --exclude="./gateway-starts.log" \
+  --exclude="./cron.pid" \
+  --exclude="./processes.json" \
+  --exclude="./.env" \
+  --exclude="./logs" \
+  --exclude="./.xpd-bootstrap.lock" \
+  --exclude="./state/gateway.heartbeat" \
+  -cf - . | tar -C "$target" -xf -
+'
+```
+
+`memories/`、`scripts/` 和 `xpd-report-agent/` 继续保留在共享根目录；旧的
+Gateway PID/锁/状态、Cron PID、进程注册表、启动计数、旧 `.env`、日志和心跳属于失效或
+容器本地运行数据，不能复制到新实例目录。Compose 不会自动执行这项迁移，确认备份与复制结果后才能继续。保持原部署目录和
+Compose project 名不变，新的
+四个服务会继续使用原 `hermes-state` 与 `report-files` 本地卷；首次启动会在状态卷中创建三个
+稳定的 `instances/hermes-N/` 实例目录：
 
 ```bash
 docker compose up -d --force-recreate
@@ -261,7 +306,7 @@ docker image tag "$(docker inspect -f '{{.Image}}' xpd-report-agent-hermes)" \
 新镜像构建完成后，先通过 `/health` 确认 `active_tasks=0`，再停止旧的两个容器并备份卷内数据：
 
 ```bash
-docker stop --time 60 xpd-report-agent xpd-report-agent-hermes
+docker stop --timeout 60 xpd-report-agent xpd-report-agent-hermes
 
 umask 077
 XPD_POOL_BACKUP_DIR="/opt/xpd-before-hermes-pool-$(date +%Y%m%d%H%M%S)"
@@ -273,7 +318,10 @@ docker cp xpd-report-agent-hermes:/app/data/report-files/. \
   "$XPD_POOL_BACKUP_DIR/report-files/"
 ```
 
-保持原部署目录、Compose project 名和卷名不变，启动新拓扑并移除已停止的旧
+保持两个旧容器停止，并按上一节相同的离线复制规则，把共享根中的旧 Hermes 会话和 Cron 状态
+复制到空的 `instances/hermes-1`；`memories/`、`scripts/` 和 `xpd-report-agent/` 留在共享根，
+Gateway PID、锁、状态与心跳文件不得复制。该步骤不会由 Compose 自动执行。确认备份和离线复制
+成功后，保持原部署目录、Compose project 名和卷名不变，启动新拓扑并移除已停止的旧
 `hermes` orphan 容器：
 
 ```bash
@@ -515,8 +563,9 @@ docker compose logs --since=10m \
   | grep -E 'ERROR|Traceback|AuthError|RuntimeError'
 ```
 
-Hermes 会话、记忆、任务和 FastAPI 节点粘性路由都由 `xpd-report-agent-hermes-state`
-命名卷保存；Compose 的 `report-files` 卷由四个容器共同使用，并将报告上传 OSS。
+FastAPI 节点粘性路由保存在 `xpd-report-agent-hermes-state` 命名卷根目录；Hermes 会话和本地
+任务状态分别保存在 `instances/hermes-N/`，长期记忆由所有角色通过根目录下的 `memories/`
+共享。Compose 的 `report-files` 卷由四个容器共同使用，并将报告上传 OSS。
 `docker compose down` 不会删除命名卷；不要在生产环境执行 `docker compose down -v`。
 应定期备份状态卷，并实际验证 OSS 上传和下载。这两个共享卷只能使用当前单机 Docker
 local volume，不能将目录换成 NFS/NAS 后把 Hermes 分布到多台主机。
