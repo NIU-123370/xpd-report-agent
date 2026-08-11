@@ -48,6 +48,7 @@ MEDIA_TYPES = {
 }
 MAX_TEXT_CHARS = 20_000
 MAX_LIST_ITEMS = 30
+MAX_TREND_ITEMS = 100
 MAX_COLUMNS = 256
 MAX_FILENAME_BYTES = 200
 EXCEL_MAX_CELL_CHARS = 32_767
@@ -58,6 +59,8 @@ CHINESE_COLUMN_LABELS = {
     "caliber": "统计口径",
     "grain": "统计粒度",
     "period_label": "统计时间",
+    "period_type": "对比周期",
+    "comparison_period": "对比周期",
     "start_date": "直播开始日期",
     "start_time": "开始时间",
     "end_time": "结束时间",
@@ -529,7 +532,12 @@ def _clean_analysis_type(value: Any, *, required: bool = False) -> str:
     return normalized
 
 
-def _clean_analysis_value(value: Any, *, depth: int = 0) -> Any:
+def _clean_analysis_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    list_limit: int = MAX_LIST_ITEMS,
+) -> Any:
     if depth > 4:
         return None
     if value is None or isinstance(value, (bool, int, float, Decimal, date, datetime)):
@@ -539,7 +547,7 @@ def _clean_analysis_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, list):
         return [
             cleaned
-            for item in value[:MAX_LIST_ITEMS]
+            for item in value[:list_limit]
             if (cleaned := _clean_analysis_value(item, depth=depth + 1)) is not None
         ]
     if isinstance(value, dict):
@@ -797,7 +805,7 @@ def _normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
                     "anomaly": anomaly,
                 }
             )
-    normalized["trends"] = trends[:MAX_LIST_ITEMS]
+    normalized["trends"] = trends[:MAX_TREND_ITEMS]
 
     drivers: list[dict[str, Any]] = []
     driver_source = analysis.get("drivers", []) if isinstance(analysis.get("drivers"), list) else []
@@ -919,7 +927,12 @@ def _clean_analysis(value: Any) -> dict[str, Any]:
         "data_quality",
     }
     cleaned = {
-        key: _clean_analysis_value(raw_value) for key, raw_value in value.items() if key in allowed
+        key: _clean_analysis_value(
+            raw_value,
+            list_limit=MAX_TREND_ITEMS if key == "trends" else MAX_LIST_ITEMS,
+        )
+        for key, raw_value in value.items()
+        if key in allowed
     }
     return _normalize_analysis(cleaned)
 
@@ -976,6 +989,22 @@ def _xlsx_display_value(value: Any) -> Any:
         "UNFAVORABLE": "不利",
     }
     return localized.get(value.strip().upper(), value)
+
+
+def _xlsx_detail_display_value(column: str, value: Any) -> Any:
+    normalized_column = str(column).strip().strip("`\"'").lower()
+    if normalized_column in {"period_type", "comparison_period"} and isinstance(value, str):
+        localized_period = {
+            "CURRENT": "当前周期",
+            "CURRENT_PERIOD": "当前周期",
+            "BASELINE": "基准周期",
+            "BASELINE_PERIOD": "基准周期",
+            "PREVIOUS": "基准周期",
+            "PREVIOUS_PERIOD": "基准周期",
+        }
+        if localized := localized_period.get(value.strip().upper()):
+            return localized
+    return _xlsx_display_value(value)
 
 
 def _column_label(column: str) -> str:
@@ -1400,7 +1429,7 @@ def _xlsx_bytes(
         :MAX_LIST_ITEMS
     ]
     trends = [item for item in analysis.get("trends", []) if isinstance(item, dict)][
-        :MAX_LIST_ITEMS
+        :MAX_TREND_ITEMS
     ]
     drivers = [item for item in analysis.get("drivers", []) if isinstance(item, dict)][
         :MAX_LIST_ITEMS
@@ -2426,7 +2455,7 @@ def _xlsx_bytes(
             max_wrapped_lines = 1
             for column_index, column in enumerate(detail_columns, start=1):
                 source_value = row.get(column)
-                display_value = _xlsx_display_value(source_value)
+                display_value = _xlsx_detail_display_value(column, source_value)
                 identifier_column = _is_identifier_column(column)
                 safe_value = _xlsx_safe_value(
                     display_value,

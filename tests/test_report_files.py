@@ -350,6 +350,127 @@ def test_xlsx_detail_maps_period_comparison_aliases_and_formats_values():
     workbook.close()
 
 
+def test_xlsx_detail_maps_comparison_period_type_and_localizes_values():
+    content = report_export._xlsx_bytes(
+        title="场次周期明细",
+        summary="",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT session comparison data",
+        columns=["session_title", "period_type", "pay_amt", "note"],
+        rows=[
+            {
+                "session_title": "基准场次",
+                "period_type": "baseline",
+                "pay_amt": 100,
+                "note": "current",
+            },
+            {
+                "session_title": "当前场次",
+                "period_type": "current",
+                "pay_amt": 120,
+                "note": "baseline",
+            },
+        ],
+        truncated=False,
+        analysis_type="comparison",
+    )
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    detail = workbook["数据明细"]
+    assert [detail.cell(1, column).value for column in range(1, 5)] == [
+        "直播标题",
+        "对比周期",
+        "成交金额",
+        "备注",
+    ]
+    assert [detail.cell(row, 2).value for row in range(2, 4)] == ["基准周期", "当前周期"]
+    assert [detail.cell(row, 4).value for row in range(2, 4)] == ["current", "baseline"]
+    assert report_export._column_label("period") == "其他数据字段"
+    assert report_export._column_label("period_flag") == "其他数据字段"
+    workbook.close()
+
+
+def test_xlsx_preserves_complete_fourteen_day_multi_metric_trend():
+    periods = [
+        (datetime(2026, 7, 19) + timedelta(days=offset)).date().isoformat()
+        for offset in range(14)
+    ]
+    metrics = [
+        ("成交金额", "元"),
+        ("支付订单数", "单"),
+        ("成交件数", "件"),
+        ("退款金额", "元"),
+        ("退款率", "%"),
+    ]
+    trends = [
+        {
+            "period": period,
+            "metric": metric,
+            "current_value": (period_index + 1) * (metric_index + 1),
+            "unit": unit,
+        }
+        for period_index, period in enumerate(periods)
+        for metric_index, (metric, unit) in enumerate(metrics)
+    ]
+    cleaned_analysis = report_export._clean_analysis(
+        {
+            "comparisons": [
+                {
+                    "metric": "成交金额",
+                    "current_value": 200,
+                    "baseline_value": 100,
+                    "absolute_change": 100,
+                    "relative_change": 1,
+                    "unit": "元",
+                }
+            ],
+            "trends": trends,
+            "drivers": [
+                {"statement": f"因素{index}", "evidence": f"证据{index}"}
+                for index in range(31)
+            ],
+        }
+    )
+    assert len(cleaned_analysis["trends"]) == 70
+    assert len(cleaned_analysis["drivers"]) == 30
+
+    content = report_export._xlsx_bytes(
+        title="14天完整趋势",
+        summary="",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT daily comparison data",
+        columns=[],
+        rows=[],
+        truncated=False,
+        analysis_type="comparison",
+        analysis=cleaned_analysis,
+    )
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    trend_sheet = workbook["趋势与对比"]
+    trend_header = next(
+        row
+        for row in range(1, trend_sheet.max_row + 1)
+        if trend_sheet.cell(row, 1).value == "周期"
+    )
+    visible_rows = [
+        row
+        for row in range(trend_header + 1, trend_header + 1 + len(trends))
+        if trend_sheet.cell(row, 1).value is not None
+    ]
+    assert len(visible_rows) == 70
+    assert [
+        trend_sheet.cell(row, 9).value
+        for row in range(trend_header + 1, trend_header + 1 + len(periods))
+    ] == periods
+    assert trend_sheet._charts[0].anchor._from.row >= trend_header + len(trends) + 1
+    workbook.close()
+
+
 def test_xlsx_summary_matches_period_and_unit_qualified_metric_names():
     content = report_export._xlsx_bytes(
         title="摘要指标匹配",
