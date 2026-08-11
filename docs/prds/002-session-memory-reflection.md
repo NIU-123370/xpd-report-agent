@@ -1,18 +1,22 @@
-# xpd-report-agent 会话记忆与反思能力 PRD
+# xpd-report-agent 会话记忆与反思能力 PRD（历史需求快照）
 
 ## 文档信息
 
-- 版本：V1.5
-- 状态：实施中
-- 日期：2026-08-04
-- 对应分支：`feature/session-memory-reflection`
-- 范围：需求定义与一期实现跟踪
+- 版本：V1.5（历史冻结）
+- 状态：核心能力已落地，本文不再作为当前部署与接口契约
+- 原始日期：2026-08-04
+- 当时对应分支：`feature/session-memory-reflection`（已合并）
+- 当前实现差异核对：2026-08-11
+- 范围：保留需求决策和一期验收背景；当前行为以根 `README.md`、
+  `docs/archs/system-overview.md` 和 `docs/api/` 为准
 
 ## 一期实现记录（2026-08-04）
 
 本分支已完成本轮要求的后端核心能力与历史记录前端：
 
-- Hermes API Server 已开启 `db_query`、`session_search`、`memory`，健康检查将三者作为必需能力。
+- 当时本地 `session_key` 模式的 Hermes API Server 已开启 `db_query`、
+  `session_search`、`memory`；当前生产 `user_id` 模式默认禁用不具备 owner 过滤的
+  `session_search`，健康检查也只要求当前身份模式应暴露的记忆工具。
 - FastAPI 已封装 Hermes 原生 Session 创建、列表、详情、消息、聊天、重命名、关闭和删除接口。
 - 前端不再发送完整 `history`，仅发送当前消息、session-id 和本地 session-key。
 - session-key 经服务端 HMAC 转换为 owner scope，未授权的 session-id 在访问 Hermes 前即被拒绝。
@@ -31,6 +35,57 @@
   同时显示字符容量、整理水位、文件状态和最后更新时间，并支持手动刷新观察反思写入。
 - 根据 2026-08-04 的范围确认，本期不提供人工编辑、删除、清空或逐条记忆治理能力。
   Hermes 原生 `memory` 仍是长期记忆的唯一写入方。
+
+## 当前实现差异（2026-08-11）
+
+本节是对历史 PRD 的强制补充。后续“功能需求”、“逻辑数据模型”、“验收标准”和
+“待确认事项”保留 2026-08-04 的需求快照；与本节或当前架构文档冲突时，不得将
+历史文字当作现行契约。
+
+### 身份、会话搜索与路由
+
+- 本地网页仍可使用 `session_key`。正式中台已使用 `user_id`：已鉴权后端通过
+  `X-User-Id` 传入稳定用户标识，FastAPI 将它签名为不可逆 `owner_scope`。
+- Hermes 原生 `session_search` 没有 owner scope 过滤。它只在本地 `session_key`
+  模式开启；多用户 `user_id` 模式默认移除该工具，历史会话由 FastAPI 校验
+  owner 后访问 Hermes 原生 Session API。
+- 当前多 Hermes 调度使用 `owner_scope -> Hermes node` 持久粘性绑定。同一用户
+  的所有 session 在同一 Hermes，一个 Hermes 可服务多个用户。新 owner 按健康节点的
+  已绑定 owner 数量均衡，不按实时任务负载迁移已绑定用户。
+- 当前禁止自动 route rebind。所属 Hermes 不可用时请求失败关闭，不会切到没有
+  该用户会话历史的其他实例。
+
+### 多实例状态与长期记忆
+
+- ECS 测试/回退拓扑为 `1 FastAPI + 3 Hermes`。ACK 为 1 个 FastAPI Pod 加
+  Hermes StatefulSet，最少 2 个、最多 10 个；HPA 只自动扩容，自动缩容已禁用。
+  两种拓扑都只对调用方开放 FastAPI `8000`，Hermes `8642` 只在容器网络内开放。
+- 当前没有 drain、实例状态迁移和 owner 路由原子迁移控制器。在这套工具实现
+  并验收前，ACK 禁止人工降低副本数或永久移除已承载用户的 Hermes ordinal；同名 Pod
+  故障重建仍复用原实例目录。
+- 每个 Hermes 必须使用独立 `HERMES_HOME=instances/<node-id>`，其 `state.db`、Gateway 锁和
+  本地任务状态不在实例之间共享。路由、Agent Run/反思/定时映射、`memories/` 与
+  报告文件位于共享持久化根目录或共享报告卷。
+- `user_id` 模式的个人记忆位于 `memories/users/<owner_scope>/MEMORY.md` 和
+  `USER.md`。`memories/merchant/MEMORY.md` 是向所有用户注入的商家公共经营规则，
+  对 Agent 只读。这是有限的跨用户共享，取代了原 PRD“不建设任何跨用户共享记忆”
+  的绝对表述。
+
+### Cron 与澄清
+
+- 定时报告默认关闭。显式开启时只允许一个 Cron leader 运行 ticker：Compose 为
+  `hermes-1`，ACK 为 `hermes-0`；其他 Hermes 使用 no-op scheduler。leader 不可用时定时任务暂停，
+  不自动切主。
+- 网页 Session SSE 的澄清注册表仍在 Hermes 进程内，owner 粘性路由保证提问与回答进入
+  同一实例。中台持久化 Run 的澄清则保存为 `waiting_input`，等待
+  `POST /api/v1/agent/runs/{run_id}/input` 后续执行。
+
+### 仍属历史需求、不应当作已落地契约的内容
+
+- L0/L1 的 90/180 天默认保留期、逐条 memory ID/版本/冲突状态、默认最多检索 8 条记忆等
+  为产品逻辑模型，不等同于当前文件型 Hermes memory 的全部实现。
+- 当前前端只读展示记忆文件，不提供逐条编辑、删除、冲突处理或来源回溯界面。
+- 后续未勾选的验收项只表示历史需求，不能替代自动化测试和现行 API 文档。
 
 ## 背景
 

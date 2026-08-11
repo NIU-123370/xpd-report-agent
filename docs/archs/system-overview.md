@@ -4,22 +4,51 @@
 
 ```text
 中台后端（Bearer 服务凭证 + X-User-Id）/本地静态调试页
-  -> FastAPI Wrapper（服务鉴权、owner 校验、全局 Agent 并发上限 3、幂等任务状态）
-  -> Hermes Gateway（Session、memory、clarify、受限 file read；session_search 仅本地安全模式）
-      -> db-query Plugin -> MySQL -> 短期查询结果注册表
-                         -> report_file -> CSV / XLSX / Markdown / PDF / JSON -> OSS
-      -> state.db        -> 会话历史
-      -> memories/       -> MEMORY.md / USER.md
-      -> report-files/   -> 按 session-id 隔离的导出文件
+  -> FastAPI Wrapper（单副本；服务鉴权、owner 校验、幂等 Run、可配并发上限）
+      -> 持久粘性路由：owner_scope -> Hermes node
+      -> Hermes 实例池（容器/Pod 内网 8642）
+          -> db-query Plugin -> MySQL/RDS -> 当前实例的短期查询结果注册表
+                             -> report_file -> CSV / XLSX / Markdown / PDF / JSON -> OSS
+          -> instances/<node-id>/state.db -> 该实例承载的会话历史
+
+共享持久化根目录
+  -> xpd-report-agent/hermes-routes.json -> owner/session 与实例映射
+  -> memories/                          -> 商家只读记忆与用户长期记忆
+  -> xpd-report-agent/                  -> Agent Run、反思与定时映射状态
+  -> report-files/                      -> 按 session-id 隔离的导出文件
 ```
 
 FastAPI 不直接生成或执行 SQL，也不建立第二套消息数据库。数据库理解、JOIN 路径发现、SQL
-校验和执行由 Hermes Plugin 完成；原始会话消息以 Hermes `state.db` 为唯一事实源。
+校验和执行由 Hermes Plugin 完成；原始会话消息以所属 Hermes 实例的 `state.db` 为
+唯一事实源。
 
 Session SSE、本地同步兼容接口和中台 Run 复用同一套 turn 路径、payload、系统提示词和提交前
 上下文准备。中台 Run 额外用持久化状态机提供幂等、重试与
 `pending/running/waiting_input/succeeded/failed`；旧的无 Session `/api/chat*` 仅保留为已弃用的
 迁移入口。
+
+## 部署拓扑与粘性路由
+
+- ECS/Docker Compose 固定运行 `1 个 FastAPI + 3 个 Hermes`；ACK 固定运行
+  1 个 FastAPI Pod，Hermes StatefulSet 从 2 个 Pod 按需扩容到最多 10 个。
+  HPA 自动缩容已禁用。当前项目没有 drain、实例状态迁移和 owner 路由原子迁移
+  控制器；在这套工具实现并通过验收前，禁止人工降低副本数或永久移除已承载用户的
+  Hermes ordinal。同名 Pod 故障重建仍复用原实例目录，不属于路由迁移。
+- 只有 FastAPI `8000` 对调用方开放。Hermes `8642` 仅存在于 Compose 或 Kubernetes
+  内部网络；ACK NetworkPolicy 只允许 FastAPI Pod 访问。
+- 生产 `user_id` 模式下，FastAPI 对 `X-User-Id` 做服务端签名，生成 20 位十六进制
+  `owner_scope`。路由单位是 owner，不是独立 session：同一用户的所有 session 绑定
+  到同一 Hermes，一个 Hermes 可同时承载多个用户。
+- 新 owner 先在健康节点中选择“已绑定 owner 数量最少”的实例，数量相同时再用
+  稳定哈希决定。这不是实时负载调度：已绑定用户不会因为其当前任务较重而迁移。
+- 每个 Hermes 使用独立 `HERMES_HOME=instances/<node-id>`，不共享 Gateway 锁、PID、
+  `state.db` 和本地任务状态。所有角色通过 `XPD_MEMORY_ROOT` 读写共享的用户长期记忆，
+  报告文件也使用共享报告卷。
+- `XPD_HERMES_ROUTE_REBINDING_ENABLED=false` 是当前安全默认。已绑定节点不健康或
+  不再可发现时，该 owner 请求返回可重试的 `503 HERMES_POOL_UNAVAILABLE`，不会静默改绑
+  到没有会话历史的其他实例。
+- 多节点环境的 FastAPI Agent 并发上限默认为 20，单节点默认为 3，均可配置。
+  该上限是 FastAPI 进程级任务槽，不等于实际可承载用户数；正式容量必须经压测确认。
 
 ## 预设经营分析
 
@@ -39,6 +68,11 @@ Session SSE、本地同步兼容接口和中台 Run 复用同一套 turn 路径�
 微服务默认设置 `XPD_SCHEDULES_ENABLED=false`、`XPD_HERMES_CRON_PATCH=false`，前端隐藏入口；
 `/health` 将主动关闭视为健康。以下为需要时可重新开启的保留实现：
 
+- 多 Hermes 部署中仅允许一个 Cron leader 运行原生 ticker：Compose 固定为
+  `hermes-1`，ACK 固定为 `hermes-0`。其他 worker 通过 no-op scheduler 禁止恢复、扫描和
+  触发任务，避免多 Gateway 重复执行。
+- leader 不可用时定时任务暂停，不自动切换到 worker。恢复或迁移 leader 状态前
+  不得同时启动第二个 ticker。
 - 前端只调用 owner-scoped `/api/schedules`，不会接触 Hermes 全局 `/api/jobs` Bearer 或其他
   用户的任务。映射持久化为 `schedule_id -> native_job_id -> owner_scope/report_type`。
 - Hermes 原生 Cron 是唯一计时器，使用 `jobs.json`、`executions.db`、文件锁和每 60 秒 ticker。
@@ -46,7 +80,7 @@ Session SSE、本地同步兼容接口和中台 Run 复用同一套 turn 路径�
 - 原生 Cron 强制使用 `cron_*` Session，而查询结果与附件安全模型只接受 `xpd_<scope>_*`。
   因此原生任务使用受限 `no_agent` 回调：到点后调用 FastAPI 内部接口，由后端创建真正的
   `xpd_*_scheduled_*` Session，再走现有 Agent 查询与导出链路。
-- 回调脚本位于 Hermes Home 的 `scripts/`，权限为 `0600`，携带每任务随机 capability token；
+- 回调脚本位于共享根目录 `<XPD_HERMES_SHARED_HOME>/scripts/`，权限为 `0600`，携带每任务随机 capability token；
   原生任务自身不加载模型、memory、terminal 或 file。
 - 运行使用“任务 + 自然日/自然周”幂等键；重复 ticker/补跑不会重复生成。成功必须检测到真实
   artifact，而不以模型文本作为成功依据。自动报告 Session 在 API 和前端均只读，不触发结束
@@ -65,7 +99,13 @@ Session SSE、本地同步兼容接口和中台 Run 复用同一套 turn 路径�
   CSV 和 XLSX 保留查询明细；Markdown 和 PDF 增加经营结论、洞察、假设、SQL 和注意事项；
   JSON 保留结构化元数据与查询明细。生成器内部验证 UTF-8/JSON/ZIP/XML/PDF 结构，不把整份报表
   重新灌入模型上下文。
-- 文件生成并通过格式校验后上传到 `starpartner-biz/public/dev/agent-report-files/`。
+- 商家版 XLSX 按已确认的分析类型构建：简单查询为“经营摘要、数据明细、
+  口径与提示”；对比分析增加“趋势与对比”；诊断分析在此基础上再增加“异常与建议”。
+  XLSX 不展示 SQL、数据表名、原始字段名或查询审计信息。
+- 趋势图使用可解析日期的升序辅助区间，保证小日期在左、大日期在右；图表锚定在
+  所有可见对比/趋势表格之后，不与数据区重叠。
+- 文件生成并通过格式校验后上传到由 `XPD_REPORT_OSS_BUCKET` 和
+  `XPD_REPORT_OSS_PREFIX` 配置的 OSS 位置。
   对象按北京时间使用 `YYYYMMDD/uid-traceid-秒级Unix时间戳.扩展名`。本地只保存
   非敏感对象元数据，API 每次读取时重新签发短期下载 URL，不持久化长期有效的公开链接。
 - Hermes 原生 `file` toolset 仅保留 `read_file`，且 session-id 内嵌 scope 必须与
@@ -79,12 +119,16 @@ Session SSE、本地同步兼容接口和中台 Run 复用同一套 turn 路径�
 
 ## 会话所有权
 
-一期无账号系统，浏览器生成高熵 `X-XPD-Session-Key`。FastAPI 使用服务端签名密钥计算不可逆
-owner scope，并把它编码到服务端生成的 session-id 中。历史、消息和会话操作先校验 scope；
-不匹配统一返回 404，避免通过 session-id 探测其他会话。
+本地调试默认使用 `session_key` 模式：浏览器生成高熵 `X-XPD-Session-Key`。
+生产中台使用 `user_id` 模式：已鉴权的中台后端传入稳定 `X-User-Id`。FastAPI
+在两种模式下都使用服务端签名密钥计算不可逆 `owner_scope`，并把它编码到服务端
+生成的 session-id 中。历史、消息、会话操作和文件先校验 scope；不匹配统一返回
+404，避免通过 session-id 探测其他会话。传给 Hermes 的 `X-Hermes-Session-Key` 是
+`owner_scope`，不是浏览器键或原始 user-id。
 
-传给 Hermes 的 `X-Hermes-Session-Key` 是 owner scope，不是浏览器原始键。该方案用于一期
-本地/单用户部署；接入账号系统后应以认证 user-id 替代本地键。
+Hermes 原生 `session_search` 尚不具备 owner scope 过滤，因此只在本地 `session_key`
+模式开启。生产 `user_id` 模式默认从工具面移除，会话列表由 FastAPI 按已鉴权
+scope 查询当前粘性 Hermes；多用户部署不得开启不安全的兼容开关。
 
 ## 交互式澄清
 
@@ -99,8 +143,8 @@ owner scope，并把它编码到服务端生成的 session-id 中。历史、消
   session-id owner scope，再携带不可逆的 `X-Hermes-Session-Key` 转发给 Hermes；Hermes 同时
   校验 Bearer Token、session-id 和 owner scope，任一所有权不匹配均返回 404。
 - 待回答问题保存在 Hermes 进程内的线程安全注册表，默认超时 300 秒，答案最长 2000 字符。
-  因此澄清期间不能重启 Hermes；一期只运行一个 Hermes 实例。多实例部署必须将流式请求与
-  回答请求粘滞到同一实例，或把待回答状态迁移到带原子状态转换的共享存储。
+  当前多实例部署通过 owner 粘性路由保证 Session SSE 与回答请求进入同一实例。
+  交互式澄清期间仍不能重启所属 Hermes；实例不可用时不会改绑到其他节点。
 - Session SSE 断开或同一归属的 session-id 发起新流式请求时，旧待回答问题会立即过期并中断
   原 Agent，避免刷新页面后遗留一个继续占用执行线程的孤儿澄清任务。
 - 补丁同时让 Session SSE 复用 Hermes 的 `gateway.api_server.max_concurrent_runs` 限流（Hermes
@@ -116,8 +160,9 @@ owner scope，并把它编码到服务端生成的 session-id 中。历史、消
 ## 反思与长期记忆
 
 - `memory.nudge_interval=3` 复用 Hermes 原生后台 memory review。
-- 会话关闭时 FastAPI 创建幂等最终反思任务，状态持久化到
-  `~/.hermes/xpd-report-agent/reflections.json`，失败最多重试 3 次。
+- 会话关闭时 FastAPI 创建幂等最终反思任务。单实例默认持久化到
+  `<HERMES_HOME>/xpd-report-agent/reflections.json`；多实例持久化到
+  `<XPD_HERMES_SHARED_HOME>/xpd-report-agent/reflections.json`，失败最多重试 3 次。
 - 最终反思默认最多运行 180 秒，可通过 `XPD_FINAL_REFLECTION_TIMEOUT_SECONDS` 调整；超时会
   释放共享 Agent 槽位，不阻塞后续用户分析。
 - 最终反思将脱敏后的会话交给临时 Hermes Session，系统提示明确限制其只形成结构化结论，
@@ -138,20 +183,26 @@ owner scope，并把它编码到服务端生成的 session-id 中。历史、消
 
 ## 部署持久化
 
-服务器或容器部署必须持久化完整 Hermes Home，至少包括：
+单实例 systemd/本地部署必须持久化完整 `HERMES_HOME` 和
+`XPD_FILE_STORAGE_PATH`。多实例 Compose/ACK 部署必须区分三类状态：
 
-- `state.db`：Session 和消息历史；
-- `memories/MEMORY.md`、`memories/USER.md`：本地模式跨会话长期记忆；
-- `memories/users/<owner_scope>/MEMORY.md`、`USER.md`：中台用户个人长期记忆；
-- `memories/merchant/MEMORY.md`：中台商家公共经营规则，只读注入；
-- `xpd-report-agent/reflections.json`：最终反思任务与审计状态；
-- `xpd-report-agent/schedules.json`：定时配置、owner 映射和运行状态；
-- `cron/jobs.json`、`cron/executions.db`：Hermes 原生任务与执行审计；
-- `XPD_FILE_STORAGE_PATH`：CSV/XLSX/Markdown/PDF/JSON 导出文件（默认项目内 `data/report-files`）；
-- Hermes 配置、插件和 Skill。
+1. 共享根目录 `XPD_HERMES_SHARED_HOME`：
+   - `xpd-report-agent/hermes-routes.json`：持久的 owner/session 粘性路由；
+   - `xpd-report-agent/agent-runs.json`、`reflections.json`、`schedules.json`：中台 Run、反思和定时映射状态；
+   - `memories/users/<owner_scope>/MEMORY.md`、`USER.md`：中台用户长期记忆；
+   - `memories/merchant/MEMORY.md`：所有用户可读、Agent 不可写的商家公共经营规则；
+   - `memories/MEMORY.md`、`USER.md`：本地 `session_key` 模式记忆；
+   - `scripts/`：需要时由 Cron leader 调用的内部回调脚本。
+2. 实例目录 `instances/<node-id>/`：每个 Hermes 独立保存 `state.db`、Gateway 运行状态、
+   配置、插件和 Skill。仅 Cron leader 的实例目录保存有效的 `cron/jobs.json` 与
+   `cron/executions.db`。
+3. 报告目录 `XPD_FILE_STORAGE_PATH`：保存 CSV/XLSX/Markdown/PDF/JSON 导出文件和
+   OSS 对象元数据，供 FastAPI 和全部 Hermes 共享。
 
-一期建议只运行一个 Hermes/FastAPI 实例。多实例部署前需要将 Session、反思队列和长期记忆
-迁移到支持并发的一致共享存储，不能让多个实例各自维护不同的本地文件。
+多个 Gateway 绝对不能使用同一个 `HERMES_HOME`，否则 PID、运行锁和 SQLite 会互相冲突。
+当前 Compose 使用单机 Docker local volume；ACK 使用单工作节点的 RWO 云盘，不提供跨节点高可用。
+不得为了跨节点共享 SQLite 而将状态目录改成 NFS/NAS/RWX 盘。备份和迁移必须同时覆盖
+共享根目录、全部实例目录、报告目录与路由映射，并在所有写入进程停止时执行。
 
 ## 代码边界
 

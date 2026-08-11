@@ -1,5 +1,8 @@
 # xpd-report-agent 初始化迁移 PRD
 
+> 状态：已完成并归档。本文仅记录项目初始化迁移时的目标和约束，不代表当前生产架构；
+> 现行说明请阅读根目录 `README.md` 与 `docs/archs/system-overview.md`。
+
 ## 背景
 
 历史项目 `/Users/gjh/claude-code/hermes-sqlite-demo` 已完成 Hermes Agent、SQLite
@@ -34,4 +37,3 @@
 - 可生成并检查包含 7 张业务表的 SQLite 示例库。
 - FastAPI 首页、健康检查、非流式和流式代理接口保持兼容。
 - `start|stop|restart|status [all|hermes|fastapi]` 生命周期语义保持兼容。
-

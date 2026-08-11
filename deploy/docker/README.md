@@ -1,6 +1,6 @@
 # Docker Compose 单机备用部署指南（阿里云 ECS / Linux）
 
-生产环境已改用“一条流水线 + ACK 动态 Hermes 实例池”，请优先阅读
+目标生产架构使用“一条流水线 + ACK 动态 Hermes 实例池”，请优先阅读
 [`deploy/kubernetes/README.md`](../kubernetes/README.md)。本文保留的固定三个 Hermes
 拓扑只用于单台 ECS 回退或本地验证，不具备 HPA 动态扩缩能力。
 
@@ -22,6 +22,17 @@ instances/hermes-3 稳定子目录，不共享同一个 HERMES_HOME
 
 三个 Hermes 都使用自己网络命名空间内的 `8642`，不映射到宿主机；只有 FastAPI
 对宿主机发布 `8000`。数据库和 OSS 不部署在容器内，分别连接阿里云 RDS 和 OSS。
+
+节点池的粘性调度单位是经服务端签名后的 `owner_scope`，在 `user_id` 模式下就是一个
+`X-User-Id` 对应的用户范围，不是单个 `session_id`：
+
+- 同一用户的所有会话固定到同一个 Hermes，会话不会在三个节点间随机跳转。
+- 一个 Hermes 可以同时服务多个用户；新用户按已绑定 owner 数量尽量均衡分配，不是按实时 CPU
+  或单个用户的任务数量重新平衡。
+- 用户的长期记忆按 owner 保存在共享 `memories/` 中；会话历史和运行状态保存在被绑定的
+  `instances/hermes-N/` 中。
+- 已绑定节点暂时不健康时，该用户的请求会失败关闭，不会被静默切到没有其会话历史的
+  其他 Hermes。
 
 ## 1. 部署前检查
 
@@ -393,6 +404,9 @@ echo
 分配新 owner；所有 Hermes 都不健康时 `/ready` 返回 HTTP `503`。`/health` 是运维诊断接口，
 中台业务方只需要使用 `/ready`。
 
+`/ready=200` 只表示“至少一个 Hermes 可用”，不代表每个已绑定 owner 的节点都可用。完整验收还必须
+确认三个 Hermes 全部 `healthy`，并执行第 8 节真实业务测试。
+
 ## 8. 真实业务接口测试
 
 服务密钥从容器环境读取，不在终端输出：
@@ -464,7 +478,7 @@ http://<ECS内网IP>:8000
 
 ### 从 Codeup 更新
 
-发布前先确认没有运行中的长任务，仓库没有未处理的服务器本地改动。真实
+发布前先从内部网关/上游服务停止新任务入口，确认没有运行中的长任务，仓库没有未处理的服务器本地改动。真实
 `xpd-report-agent.env` 是 Git 忽略文件，不会被拉取覆盖。
 
 ```bash
@@ -474,24 +488,61 @@ git fetch origin master
 git merge --ff-only origin/master
 
 cd deploy/docker
+# 回滚标签必须来自当前运行容器，而不是可能已被提前构建覆盖的 :dev 标签。
+running_fastapi_image="$(docker inspect -f '{{.Image}}' xpd-report-agent)"
+running_hermes_image="$(docker inspect -f '{{.Image}}' xpd-report-agent-hermes-1)"
+test "$(docker inspect -f '{{.Image}}' xpd-report-agent-hermes-2)" = "$running_hermes_image"
+test "$(docker inspect -f '{{.Image}}' xpd-report-agent-hermes-3)" = "$running_hermes_image"
 docker image tag \
-  xpd-report-agent-fastapi:dev \
+  "$running_fastapi_image" \
   xpd-report-agent-fastapi:rollback-last
 docker image tag \
-  xpd-report-agent-hermes:dev \
+  "$running_hermes_image" \
   xpd-report-agent-hermes:rollback-last
 
 docker compose build --progress=plain
 docker compose run --rm --no-deps \
   --entrypoint /app/.venv/bin/python xpd-report-agent \
   -m xpd_report_agent.runtime.deployment_preflight
+
+# 构建可以在旧服务运行时完成；替换容器前必须紧邻执行这个失败关闭门禁。
+curl -fsS http://127.0.0.1:8000/health | python3 -c '
+import json, sys
+active = int(json.load(sys.stdin)["agent_runs"]["active_tasks"])
+print(f"active_tasks={active}")
+raise SystemExit(0 if active == 0 else 1)
+'
+
 docker compose up -d --force-recreate
+
+# 确认运行容器确实使用刚构建的两个镜像，而不是旧的无标签镜像。
+expected_fastapi="$(docker image inspect -f '{{.Id}}' xpd-report-agent-fastapi:dev)"
+expected_hermes="$(docker image inspect -f '{{.Id}}' xpd-report-agent-hermes:dev)"
+test "$(docker inspect -f '{{.Image}}' xpd-report-agent)" = "$expected_fastapi"
+for container in \
+  xpd-report-agent-hermes-1 \
+  xpd-report-agent-hermes-2 \
+  xpd-report-agent-hermes-3; do
+  test "$(docker inspect -f '{{.Image}}' "$container")" = "$expected_hermes"
+done
+
 docker compose ps
+ready=false
+for _attempt in $(seq 1 60); do
+  if curl -fsS http://127.0.0.1:8000/ready >/dev/null; then
+    ready=true
+    break
+  fi
+  sleep 5
+done
+test "$ready" = true
 ```
 
 如果 `git status --short` 有输出，先确认改动来源，不要在服务器上盲目执行
 `git reset --hard`。`docker compose restart` 只会重启当前容器，不会加载新代码或新镜像；
 代码或镜像更新必须使用 `docker compose up -d --force-recreate`。
+上述 `active_tasks=0` 门禁同样适用于下面的 FastAPI 或 Hermes 局部发布；任务未清空时不得重建任何
+运行容器。
 
 如果只修复 FastAPI，可以只构建和替换 FastAPI 容器，三个 Hermes 不会被重建或重启：
 
@@ -520,7 +571,13 @@ docker compose ps
 
 ### 回滚镜像
 
-如果新版启动失败或真实业务验收不通过，使用发布前保留的两份镜像一起回滚：
+下面的快速回滚只适用于新版没有修改 SQLite、JSON、报表元数据格式、Compose 结构或持久化路径，
+且新旧版本确认向后兼容的情况。如果发布可能写入新状态格式，替换容器前必须在停止新流量、
+`active_tasks=0` 且所有容器停止后，对 `hermes-state` 和 `report-files` 做一致性快照或离线备份。
+这类发布回滚时必须同时恢复与旧镜像匹配的状态快照和 Compose/配置；没有可用快照时不得让旧镜像
+直接打开已被新版写入的卷。
+
+确认状态格式兼容后，如果新版启动失败或真实业务验收不通过，才使用发布前保留的两份运行镜像一起回滚：
 
 ```bash
 cd /opt/xpd-report-agent/deploy/docker
@@ -538,7 +595,8 @@ docker compose ps
 curl -fsS http://127.0.0.1:8000/ready
 ```
 
-首次从单容器拆分时使用第 5 节的专用回滚流程。日常的双镜像回滚只恢复运行服务，服务器 Git
+首次从单容器拆分或涉及状态格式变化时，使用对应迁移流程和发布前状态快照。日常兼容版本的双镜像
+回滚只恢复运行服务，服务器 Git
 工作树仍保留新版代码；确认原因后，通过新的 Codeup 修复提交再次发布，不在生产机上直接改代码。
 
 ### 日常命令

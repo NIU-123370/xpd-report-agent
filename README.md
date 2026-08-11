@@ -8,19 +8,32 @@ Excel、CSV、Markdown、PDF、JSON 报告导出。
 
 | 场景 | 文档 |
 |---|---|
-| 阿里云 ECS / Docker 部署 | [`deploy/docker/README.md`](deploy/docker/README.md) |
+| 生产 ACK / 云容器流水线部署 | [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md) |
+| 阿里云 ECS / Docker 测试与单机回退 | [`deploy/docker/README.md`](deploy/docker/README.md) |
 | 中台后端接入 5 个稳定接口 | [`docs/api/middle-platform-agent-api.md`](docs/api/middle-platform-agent-api.md) |
 | 内部测试与网页接口 | [`docs/api/internal-test-api.md`](docs/api/internal-test-api.md) |
-| Linux systemd 部署 | [`deploy/systemd/README.md`](deploy/systemd/README.md) |
+| Linux systemd 单实例部署 | [`deploy/systemd/README.md`](deploy/systemd/README.md) |
 
-生产部署采用一个 Docker 容器运行 FastAPI 和 Hermes Gateway，外部依赖使用阿里云 RDS、
-模型服务和 OSS：
+生产推荐使用 ACK：一个 FastAPI Pod 调度 Hermes StatefulSet。Hermes 最少 2 个
+Pod，HPA 可按任务需求和 CPU 压力扩容到 10 个；由于每个 Hermes 保有独立会话状态，
+自动缩容已禁用。当前没有经验收的 drain、状态和路由迁移工具，因此 ACK 也禁止
+人工降低副本数或永久移除已承载用户的 Hermes ordinal。同名 Pod 的故障重建会继续使用原实例目录，
+但计划重启前仍需停止新流量并等待运行任务结束。ECS 测试/回退环境固定为一个 FastAPI 容器加三个 Hermes 容器，
+不会动态增减实例。两种部署都只对调用方开放 FastAPI `8000`；Hermes `8642`
+只在容器/Pod 网络内开放：
 
 ```text
-中台后端 → FastAPI :8000 → Hermes Gateway :8642 → 模型
-                               ├→ RDS（只读查询）
-                               └→ OSS（报告文件）
+中台后端 → FastAPI :8000 → Hermes 实例池（内网 :8642） → 模型
+                                      ├→ RDS（只读查询）
+                                      └→ OSS（报告文件）
 ```
+
+生产 `user_id` 身份模式会先将 `X-User-Id` 签名为不可逆的 `owner_scope`，再按
+`owner_scope -> Hermes` 持久粘性路由。同一用户的所有 `session_id` 都进入同一个
+Hermes，一个 Hermes 可同时服务多个用户。新用户会优先分配给已绑定 owner 数量较少的
+健康实例，这是按绑定数均衡，不是按当前任务耗时或实时 CPU 负载迁移用户。
+实例会话状态不共享，因此默认禁止自动改绑；已绑定实例暂时不可用时请求失败关闭，
+不会静默切到没有历史的其他实例。
 
 容器达到 `healthy`、`GET /ready` 返回 `{"ok":true,"status":"ready"}`，并且
 `checks.runtime`、`checks.mysql` 都为 `true`，是服务可接收流量的必要条件。正式发布还必须
@@ -93,8 +106,8 @@ cp configs/local.env.example configs/local.env
 
 会话与记忆默认开启：
 
-- Hermes API Server 暴露 `db_query`、`report_file`、`file`、`session_search`、`memory`、
-  `clarify`。
+- Hermes API Server 暴露 `db_query`、`report_file`、`file`、`memory`和 `clarify`；
+  `session_search` 只在本地 `session_key` 安全模式开启，生产 `user_id` 模式默认关闭。
 - 浏览器使用本地随机 session-key，FastAPI 只向 Hermes 转发不可逆的作用域标识。
 - Hermes `state.db` 是会话消息事实源，前端请求不再重复发送完整历史。
 - 每 3 轮由 Hermes 原生后台复盘；结束会话时由持久化任务补做最终复盘。
@@ -129,8 +142,9 @@ cp configs/local.env.example configs/local.env
 预设分析仍复用同一条 Hermes Session 流式链路，完整执行 Schema 检查、SQL 校验和只读查询；
 普通分析不会自动生成文件，用户明确要求导出时才走现有文件导出流程。
 
-生产环境必须单独设置高熵 `XPD_SESSION_SIGNING_SECRET`，并将 Hermes 状态目录
-（默认 `~/.hermes`）挂载到持久卷；不要只持久化项目目录。Docker 镜像中的固定
+生产环境必须单独设置高熵 `XPD_SESSION_SIGNING_SECRET`。单实例部署需持久化完整
+Hermes Home（默认 `~/.hermes`）；多实例部署需同时持久化共享根目录、
+`instances/<node-id>/` 实例目录和报告目录，不要只持久化项目目录。Docker 镜像中的固定
 Hermes 运行时位于 `/opt/hermes-agent`，与持久化状态分离，避免旧数据卷遮住新版运行时。
 
 ## 启动
@@ -223,7 +237,7 @@ DMS/RDS 账号和权限由云端管理；应用要求 MySQL 5.7.8 或更高版�
 MySQL 连接参数，不会自动创建、修改或强制检查云数据库账号。
 
 ```text
-<HERMES_HOME>/memories/
+<XPD_MEMORY_ROOT>/
 ├── MEMORY.md                         # 当前本地模式
 ├── USER.md                           # 当前本地模式
 ├── merchant/MEMORY.md                # 中台模式，商家公共经营规则，只读注入
@@ -245,13 +259,16 @@ Session SSE、同步 Session 兼容入口和持久化 Run 共用同一套 turn p
 session，也不参与 `user_id` 身份隔离。切换到 `user_id` 模式后，
 本地随机 session-key 创建的旧历史不会自动归到任何中台用户，这是预期的安全隔离行为。
 
-定时配置和运行映射默认保存在 `~/.hermes/xpd-report-agent/schedules.json`，Hermes 原生任务保存在
-`~/.hermes/cron/jobs.json`。生产环境应将它们与 `state.db` 和报表目录一起持久化；可通过
+定时配置和运行映射默认保存在共享根目录的
+`xpd-report-agent/schedules.json`。单实例时 Hermes 原生任务位于 `<HERMES_HOME>/cron/`；
+多实例时只有 Cron leader 读写自己实例目录下的 `cron/`，Compose 为 `hermes-1`，
+ACK 为 `hermes-0`，其他 worker 的 ticker 被禁用。生产环境应将这些状态与各实例
+`state.db` 和报表目录一起持久化；可通过
 `XPD_SCHEDULE_STATE_PATH`、`XPD_CRON_SCRIPT_DIR` 配置路径。Hermes 与 FastAPI 分容器时，还需
 把 `XPD_CRON_CALLBACK_ORIGIN` 设置为仅内部可达的 FastAPI 地址。
 
-导出文件先安全生成在 `data/report-files/`，配置 OSS 凭据后会上传至
-`oss://starpartner-biz/public/dev/agent-report-files/`。接口结果始终返回 Agent 服务内的稳定下载
+导出文件先安全生成在 `data/report-files/`，配置 OSS 凭据后会上传至由
+`XPD_REPORT_OSS_BUCKET` 和 `XPD_REPORT_OSS_PREFIX` 指定的 OSS 位置。接口结果始终返回 Agent 服务内的稳定下载
 地址；访问该地址时才生成临时 OSS 签名并返回 `307`，或在 `Accept: application/json` 时返回
 签名 URL 及过期时间。重新查询任务状态不会刷新 OSS 签名。
 对象按北京时间建立 `YYYYMMDD` 日目录，文件名为

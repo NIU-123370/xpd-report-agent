@@ -233,9 +233,11 @@ spec:
           lifecycle:
             preStop:
               exec:
-                # EndpointSlice marks this Pod terminating before SIGTERM. The
-                # delay gives in-flight HTTP work time to finish while FastAPI
-                # stops assigning new work and migrates durable sticky routes.
+                # EndpointSlice marks this Pod terminating before SIGTERM. This
+                # delay only gives already-running HTTP work time to finish; it
+                # does not drain sessions, migrate instance state, or rewrite
+                # durable owner routes. Automatic and manual scale-down remain
+                # prohibited until those operations have a verified controller.
                 command: ["/bin/sh", "-c", "sleep 300"]
           volumeMounts:
             - name: hermes-state

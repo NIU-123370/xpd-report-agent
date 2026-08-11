@@ -82,8 +82,8 @@ PDF 导出会将中文字体子集嵌入文件，避免服务器和下载端出�
 一个可嵌入的中文 TrueType 字体（例如 `fonts-wqy-zenhei`），并在
 `XPD_PDF_FONT_PATH` 中填写字体文件的绝对路径。
 
-报表默认上传到 `starpartner-biz/public/dev/agent-report-files/`。OSS 账号需要该前缀的
-上传和读取权限，并建议配置对象生命周期；接口返回有限时效的签名下载 URL。
+报表上传位置由 `XPD_REPORT_OSS_BUCKET` 和 `XPD_REPORT_OSS_PREFIX` 决定。OSS 账号只需
+目标前缀的上传和读取权限，并建议配置对象生命周期；接口返回有限时效的签名下载 URL。
 对象按北京时间使用 `YYYYMMDD/uid-traceid-秒级Unix时间戳.扩展名`。
 
 `user_id` 模式下默认不暴露 Hermes 原生 `session_search`，因为它尚未按 owner scope 过滤。
