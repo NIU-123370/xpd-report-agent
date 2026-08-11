@@ -291,6 +291,106 @@ def test_xlsx_detail_maps_real_refund_aliases_and_places_id_last():
     workbook.close()
 
 
+def test_xlsx_detail_maps_period_comparison_aliases_and_formats_values():
+    columns = [
+        "item_id",
+        "item_title",
+        "current_pay_amt",
+        "baseline_pay_amt",
+        "pay_amt_change",
+        "current_refund_amt",
+        "baseline_refund_amt",
+        "current_pay_ord_cnt",
+        "baseline_pay_ord_cnt",
+    ]
+    content = report_export._xlsx_bytes(
+        title="周期对比明细",
+        summary="",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT comparison data",
+        columns=columns,
+        rows=[
+            {
+                "item_id": "640317167806",
+                "item_title": "商品A",
+                "current_pay_amt": 120,
+                "baseline_pay_amt": 100,
+                "pay_amt_change": 20,
+                "current_refund_amt": 12,
+                "baseline_refund_amt": 15,
+                "current_pay_ord_cnt": 6,
+                "baseline_pay_ord_cnt": 5,
+            }
+        ],
+        truncated=False,
+        analysis_type="comparison",
+    )
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    detail = workbook["数据明细"]
+    assert [detail.cell(1, column).value for column in range(1, 10)] == [
+        "商品标题",
+        "当前周期成交金额",
+        "基准周期成交金额",
+        "成交金额绝对变化",
+        "当前周期退款金额",
+        "基准周期退款金额",
+        "当前周期支付订单数",
+        "基准周期支付订单数",
+        "商品ID",
+    ]
+    assert all(detail.cell(2, column).number_format.startswith("¥") for column in range(2, 7))
+    assert all(detail.cell(2, column).number_format.startswith("#,##0") for column in (7, 8))
+    assert detail["I2"].number_format == "@"
+    assert report_export._column_label("current_period_pay_amt") == "当前周期成交金额"
+    assert report_export._column_label("pay_amt_delta") == "成交金额绝对变化"
+    assert report_export._column_label("current_secret_token") == "其他数据字段"
+    workbook.close()
+
+
+def test_xlsx_summary_matches_period_and_unit_qualified_metric_names():
+    content = report_export._xlsx_bytes(
+        title="摘要指标匹配",
+        summary="",
+        insights=[],
+        assumptions=[],
+        notes=[],
+        sql="SELECT 1",
+        columns=[],
+        rows=[],
+        truncated=False,
+        analysis_type="comparison",
+        analysis={
+            "metrics": [
+                {"name": "成交金额（当前周期）", "current_value": 120, "unit": "元"}
+            ],
+            "comparisons": [
+                {
+                    "metric": "成交金额（元）",
+                    "current_value": 120,
+                    "baseline_value": 100,
+                    "absolute_change": 20,
+                    "relative_change": 0.2,
+                    "unit": "元",
+                }
+            ],
+        },
+    )
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    assert workbook["经营摘要"]["A8"].value == "基准 100元｜变化 20元｜变化率 20.00%"
+    assert workbook["趋势与对比"]["A4"].value == "成交金额（元）"
+    workbook.close()
+
+
+def test_xlsx_summary_does_not_merge_distinct_business_qualifiers():
+    metric = {"name": "成交金额（支付口径）", "unit": "元"}
+    comparisons = [{"metric": "成交金额（下单口径）", "unit": "元"}]
+    assert report_export._matching_comparison(metric, comparisons) == {}
+
+
 @pytest.mark.parametrize(
     ("analysis_type", "expected_sheets"),
     [

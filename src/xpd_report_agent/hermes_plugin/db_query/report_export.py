@@ -170,7 +170,14 @@ CHINESE_COLUMN_LABELS = {
     "reward_rate": "打赏率",
     "rank": "排名",
     "ranking": "排名",
+    "rn": "排名",
+    "row_num": "排名",
+    "row_number": "排名",
     "row_count": "数据行数",
+    "current_value": "当前值",
+    "baseline_value": "基准值",
+    "absolute_change": "绝对变化",
+    "relative_change": "变化率",
     "exact_decimal": "高精度小数",
     "huge_count": "大整数值",
     "note": "备注",
@@ -587,6 +594,65 @@ def _analysis_metric_label(value: Any) -> str:
     return _column_label(text) if text else "未命名指标"
 
 
+_ANALYSIS_METRIC_PERIOD_QUALIFIERS = frozenset(
+    {
+        "当前周期",
+        "当前期",
+        "当前值",
+        "本期",
+        "当期",
+        "基准周期",
+        "基准期",
+        "对比周期",
+        "对比期",
+        "上一周期",
+        "上期",
+    }
+)
+_ANALYSIS_METRIC_TRAILING_QUALIFIER = re.compile(r"\(([^()]*)\)\s*$")
+
+
+def _analysis_metric_match_key(value: Any, unit: Any) -> tuple[str, str]:
+    """Return a conservative key used only to associate KPI and comparison records."""
+
+    text = unicodedata.normalize("NFKC", _clean_text(value, limit=160)).strip()
+    unit_text = unicodedata.normalize("NFKC", _clean_text(unit, limit=40)).strip()
+    while match := _ANALYSIS_METRIC_TRAILING_QUALIFIER.search(text):
+        qualifier = re.sub(r"\s+", "", match.group(1))
+        normalized_unit = re.sub(r"\s+", "", unit_text)
+        if qualifier not in _ANALYSIS_METRIC_PERIOD_QUALIFIERS and not (
+            normalized_unit and qualifier.casefold() == normalized_unit.casefold()
+        ):
+            break
+        text = text[: match.start()].rstrip()
+    return (
+        re.sub(r"\s+", "", text).casefold(),
+        re.sub(r"\s+", "", unit_text).casefold(),
+    )
+
+
+def _matching_comparison(
+    metric: dict[str, Any], comparisons: list[dict[str, Any]]
+) -> dict[str, Any]:
+    name = _analysis_record_value(metric, "name", "metric")
+    for item in comparisons:
+        if _cell_text(_analysis_record_value(item, "metric", "name")) == _cell_text(name):
+            return item
+
+    match_key = _analysis_metric_match_key(name, metric.get("unit"))
+    if not match_key[0]:
+        return {}
+    normalized_matches = [
+        item
+        for item in comparisons
+        if _analysis_metric_match_key(
+            _analysis_record_value(item, "metric", "name"), item.get("unit")
+        )
+        == match_key
+    ]
+    return normalized_matches[0] if len(normalized_matches) == 1 else {}
+
+
 def _normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
     """Normalize canonical and legacy Agent payloads into the XLSX table contract."""
 
@@ -917,36 +983,100 @@ def _column_label(column: str) -> str:
     if re.search(r"[\u3400-\u9fff]", raw):
         return raw
     normalized = raw.strip("`\"'").lower()
-    if normalized in CHINESE_COLUMN_LABELS:
-        return CHINESE_COLUMN_LABELS[normalized]
 
-    aggregate_prefixes = {
-        "total_": "总",
-        "sum_": "合计",
-        "avg_": "平均",
-        "average_": "平均",
-        "max_": "最高",
-        "min_": "最低",
-    }
-    for prefix, label in aggregate_prefixes.items():
-        if normalized.startswith(prefix):
-            remainder = normalized[len(prefix) :]
-            if remainder in CHINESE_COLUMN_LABELS:
-                return f"{label}{CHINESE_COLUMN_LABELS[remainder]}"
+    def known_label(identifier: str) -> str | None:
+        if identifier in CHINESE_COLUMN_LABELS:
+            return CHINESE_COLUMN_LABELS[identifier]
 
-    aggregate_suffixes = {
-        "_total": "合计",
-        "_sum": "合计",
-        "_avg": "平均值",
-        "_average": "平均值",
-        "_max": "最高值",
-        "_min": "最低值",
-    }
-    for suffix, label in aggregate_suffixes.items():
-        if normalized.endswith(suffix):
-            remainder = normalized[: -len(suffix)]
-            if remainder in CHINESE_COLUMN_LABELS:
-                return f"{CHINESE_COLUMN_LABELS[remainder]}{label}"
+        period_prefixes = (
+            ("current_period_", "当前周期"),
+            ("current_", "当前周期"),
+            ("baseline_period_", "基准周期"),
+            ("baseline_", "基准周期"),
+            ("previous_period_", "基准周期"),
+            ("previous_", "基准周期"),
+            ("prev_period_", "基准周期"),
+            ("prev_", "基准周期"),
+        )
+        for prefix, label in period_prefixes:
+            if identifier.startswith(prefix):
+                remainder_label = known_label(identifier[len(prefix) :])
+                if remainder_label:
+                    return f"{label}{remainder_label}"
+
+        period_suffixes = (
+            ("_current_period", "当前周期"),
+            ("_current", "当前周期"),
+            ("_baseline_period", "基准周期"),
+            ("_baseline", "基准周期"),
+            ("_previous_period", "基准周期"),
+            ("_previous", "基准周期"),
+            ("_prev_period", "基准周期"),
+            ("_prev", "基准周期"),
+        )
+        for suffix, label in period_suffixes:
+            if identifier.endswith(suffix):
+                remainder_label = known_label(identifier[: -len(suffix)])
+                if remainder_label:
+                    return f"{label}{remainder_label}"
+
+        change_prefixes = (
+            ("absolute_change_", "绝对变化"),
+            ("abs_change_", "绝对变化"),
+            ("change_", "绝对变化"),
+            ("delta_", "绝对变化"),
+            ("diff_", "绝对变化"),
+        )
+        for prefix, label in change_prefixes:
+            if identifier.startswith(prefix):
+                remainder_label = known_label(identifier[len(prefix) :])
+                if remainder_label:
+                    return f"{remainder_label}{label}"
+
+        change_suffixes = (
+            ("_absolute_change", "绝对变化"),
+            ("_abs_change", "绝对变化"),
+            ("_change", "绝对变化"),
+            ("_delta", "绝对变化"),
+            ("_diff", "绝对变化"),
+        )
+        for suffix, label in change_suffixes:
+            if identifier.endswith(suffix):
+                remainder_label = known_label(identifier[: -len(suffix)])
+                if remainder_label:
+                    return f"{remainder_label}{label}"
+
+        aggregate_prefixes = (
+            ("total_", "总"),
+            ("sum_", "合计"),
+            ("avg_", "平均"),
+            ("average_", "平均"),
+            ("max_", "最高"),
+            ("min_", "最低"),
+        )
+        for prefix, label in aggregate_prefixes:
+            if identifier.startswith(prefix):
+                remainder_label = known_label(identifier[len(prefix) :])
+                if remainder_label:
+                    return f"{label}{remainder_label}"
+
+        aggregate_suffixes = (
+            ("_total", "合计"),
+            ("_sum", "合计"),
+            ("_avg", "平均值"),
+            ("_average", "平均值"),
+            ("_max", "最高值"),
+            ("_min", "最低值"),
+        )
+        for suffix, label in aggregate_suffixes:
+            if identifier.endswith(suffix):
+                remainder_label = known_label(identifier[: -len(suffix)])
+                if remainder_label:
+                    return f"{remainder_label}{label}"
+        return None
+
+    if label := known_label(normalized):
+        return label
 
     # Keep unknown technical identifiers in the cell comment only.  A raw SQL
     # alias must not leak back into the user-facing Chinese header.
@@ -1724,14 +1854,7 @@ def _xlsx_bytes(
                 end_row=card_row + 2,
                 end_column=end_column,
             )
-            comparison_item = next(
-                (
-                    item
-                    for item in comparisons
-                    if _cell_text(record_value(item, "metric", "name")) == _cell_text(name)
-                ),
-                {},
-            )
+            comparison_item = _matching_comparison(metric, comparisons)
             baseline = record_value(metric, "baseline_value")
             if baseline is None:
                 baseline = record_value(comparison_item, "baseline_value")
