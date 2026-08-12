@@ -444,6 +444,11 @@ curl -N --max-time 300 \
 正常会收到 `progress`、`answer.delta`，最后收到 `run.completed`。完整的 5 个中台接口、澄清续答
 和文件下载流程见 [`../../docs/api/middle-platform-agent-api.md`](../../docs/api/middle-platform-agent-api.md)。
 
+直连 `127.0.0.1:8000` 时，事件必须在任务执行过程中逐条到达，不能等到终态一次性出现。若 ECS 前面还有
+Nginx、网关或中台转发层，应使用同一个运行中的 `run_id` 从最终入口重复测试并比较事件到达时间；代理需关闭
+该路径的响应缓冲、缓存和压缩，流式后端必须逐块刷新，读取超时必须大于 15 秒心跳周期。应用返回的
+`X-Accel-Buffering: no` 和 `Cache-Control: no-cache, no-transform` 不能保证外部代理自动遵循这些要求。
+
 再创建一个明确要求“查询数据并生成 Excel”的任务，验收 OSS 链路。该任务必须同时
 满足：
 

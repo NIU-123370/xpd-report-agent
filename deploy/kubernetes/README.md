@@ -252,7 +252,7 @@ kubectl -n xpd-report-agent get pods \
   -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[0].ready,IMAGE:.spec.containers[0].image,IMAGE_ID:.status.containerStatuses[0].imageID,NODE:.spec.nodeName'
 ```
 
-确认所有 FastAPI/Hermes Pod 的 `NODE` 列完全相同，第二条权限检查应返回 `yes`，Secret 检查应返回 `no`。`hermes-headless` 必须显示 `CLUSTER-IP: None`，且不存在 Hermes LoadBalancer/NodePort；只有 FastAPI 8000 拥有私网 LoadBalancer。若调用方跨越 VPC 或其他信任边界，应在前置 API 网关/Ingress 终止 TLS，不要把这个私网 HTTP Service 改成公网裸露。
+确认所有 FastAPI/Hermes Pod 的 `NODE` 列完全相同，第二条权限检查应返回 `yes`，Secret 检查应返回 `no`。`hermes-headless` 必须显示 `CLUSTER-IP: None`，且不存在 Hermes LoadBalancer/NodePort；只有 FastAPI 8000 拥有私网 LoadBalancer。若调用方跨越 VPC 或其他信任边界，应在前置 API 网关/Ingress 终止 TLS，不要把这个私网 HTTP Service 改成公网裸露。API 网关、Ingress 和中台转发层还必须对 Run SSE 关闭响应缓冲、缓存和压缩，逐块刷新响应，且读取超时大于 15 秒心跳周期；切流前必须从最终中台入口确认 `progress`、`answer.delta` 等事件在任务执行过程中逐条到达，而不是在终态成批出现。
 
 镜像核对输出中不得再出现 `REPLACE_` 或可变的 `latest` 标签；FastAPI 和全部 Hermes 的 `IMAGE`
 必须是本次流水线渲染的两个镜像 digest，同一类 Pod 的 `IMAGE_ID` 必须一致且 `READY=true`。

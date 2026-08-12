@@ -205,9 +205,11 @@ event: run.completed
 data: {"run_id":"run_xxx","status":"succeeded","attempt_count":1,"session_id":"xpd_xxx","content":"最终完整答案","analysis":{},"usage":{}}
 ```
 
-该接口不会发送模型原始 `reasoning`、`thinking` 或工具内部参数。中台服务端需要关闭
-响应缓冲并保持长连接。没有业务事件时，服务约每 15 秒发送一次 `: keep-alive`
-注释心跳；客户端忽略该注释，网关和代理的空闲超时应大于心跳周期。收到终止事件后关闭连接。
+该接口不会发送模型原始 `reasoning`、`thinking` 或工具内部参数。应用响应包含
+`Cache-Control: no-cache, no-transform` 和 `X-Accel-Buffering: no`。这两个响应头不能替代逐跳配置：
+中台后端必须逐块读取并立即刷新响应，Nginx、网关和 CDN 必须关闭该路径的响应缓冲、缓存、压缩与内容聚合。
+没有业务事件时，服务约每 15 秒发送一次 `: keep-alive` 注释心跳；客户端忽略该注释，所有代理的空闲超时
+必须大于心跳周期。收到终止事件后关闭连接。
 
 每个数据事件都有稳定的 `id`。断线重连时将最后
 收到的 `id` 通过 `Last-Event-ID` 请求头传回，服务只续发之后的事件，不得重复追加旧的

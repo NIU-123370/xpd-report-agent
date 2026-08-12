@@ -756,6 +756,8 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={
             "Deprecation": "true",
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
             "Warning": (
                 '299 xpd-report-agent "Legacy stateless chat; use the Session or Agent Run API"'
             ),

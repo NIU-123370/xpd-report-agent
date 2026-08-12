@@ -280,6 +280,8 @@ def test_middle_platform_run_stream_returns_safe_progress_and_answer(
 
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["cache-control"] == "no-cache, no-transform"
+        assert response.headers["x-accel-buffering"] == "no"
         assert "event: progress" in response.text
         assert "已完成分析并整理结论" in response.text
         assert "event: answer.delta" in response.text

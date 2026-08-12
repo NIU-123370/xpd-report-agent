@@ -1826,7 +1826,7 @@ function toolProgressText(event, data) {
 async function sendStreamingRequest(url, payload, assistantView, requestSessionId) {
   const response = await fetch(url, {
     method: "POST",
-    headers: sessionHeaders(true),
+    headers: { ...sessionHeaders(true), Accept: "text/event-stream" },
     body: JSON.stringify(payload),
   });
   if (!response.ok || !response.body) {
@@ -1864,13 +1864,21 @@ async function sendStreamingRequest(url, payload, assistantView, requestSessionI
       currentSession.session_id = data.session_id;
       localStorage.setItem(CURRENT_SESSION_STORAGE, data.session_id);
     }
-    if (event === "artifact.ready") {
+    if (event === "progress") {
+      appendAssistantProgress(
+        assistantView,
+        typeof data?.step === "string" ? data.step : "正在处理分析任务…",
+      );
+    } else if (event === "artifact.ready") {
       renderArtifactCard(assistantView, data, requestSessionId);
     } else if (event === "tool.started" && data?.tool_name === "_xpd_clarify") {
       renderClarificationCard(assistantView, data.args, requestSessionId);
     } else if (event === "tool.completed" && data?.tool_name === "_xpd_clarify") {
       updateClarificationCard(assistantView, data.args);
-    } else if (event === "assistant.delta" && typeof data?.delta === "string") {
+    } else if (
+      (event === "assistant.delta" || event === "answer.delta") &&
+      typeof data?.delta === "string"
+    ) {
       content += data.delta;
       assistantView.contentEl.textContent = sanitizeInternalTermsForDisplay(content);
     } else if (event === "assistant.completed" && typeof data?.content === "string") {
@@ -1886,6 +1894,10 @@ async function sendStreamingRequest(url, payload, assistantView, requestSessionI
       reasoning += data.delta;
       setAssistantReasoning(assistantView, reasoning, { live: true });
     } else if (event === "run.completed") {
+      if (typeof data?.content === "string") {
+        content = data.content;
+        renderAssistantContent(assistantView.contentEl, content, { final: true });
+      }
       const completedReasoning = reasoningFromMessages(data?.messages);
       if (completedReasoning) {
         reasoning = completedReasoning;
@@ -1984,6 +1996,7 @@ async function handleSubmit(event) {
   input.value = "";
   addMessage("user", message);
   const assistantView = addAssistantMessage();
+  appendAssistantProgress(assistantView, "任务已提交，正在等待分析资源…");
   setBusy(true);
 
   try {
@@ -2106,6 +2119,7 @@ async function handleAnalysisSubmit(event) {
     showChatView();
     addMessage("user", `发起${preset.title}：${requestParts.join("·")}`);
     const assistantView = addAssistantMessage();
+    appendAssistantProgress(assistantView, "任务已提交，正在等待分析资源…");
     setBusy(true);
     try {
       const result = await sendPresetAnalysis(payload, assistantView, requestSessionId);

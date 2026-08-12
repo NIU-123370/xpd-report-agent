@@ -3153,6 +3153,17 @@ async def session_chat_stream(
     async def events():
         emitted_artifact_ids: set[str] = set()
         try:
+            yield (
+                "event: progress\ndata: "
+                + json.dumps(
+                    {
+                        "session_id": session_id,
+                        "step": "任务已提交，正在等待分析资源…",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
             try:
                 async with agent_capacity_slot():
                     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
@@ -3216,7 +3227,11 @@ async def session_chat_stream(
     return StreamingResponse(
         events(),
         media_type="text/event-stream",
-        headers={"X-XPD-Session-Id": session_id, "Cache-Control": "no-cache"},
+        headers={
+            "X-XPD-Session-Id": session_id,
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
