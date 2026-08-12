@@ -6,7 +6,7 @@
 
 1. 同步历史项目
 
-将 /Users/gjh/claude-code/hermes-sqlite-demo 项目同步到本项目
+将 hermes-sqlite-demo 项目同步到本项目
 
 2. 重新整理项目目录
 - ./src：服务代码

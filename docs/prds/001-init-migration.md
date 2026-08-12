@@ -5,7 +5,7 @@
 
 ## 背景
 
-历史项目 `/Users/gjh/claude-code/hermes-sqlite-demo` 已完成 Hermes Agent、SQLite
+历史项目 `hermes-sqlite-demo` 已完成 Hermes Agent、SQLite
 查询插件、FastAPI Wrapper、静态聊天页和本地进程管理验证。当前仓库需要在保留既有
 行为的前提下完成一次性迁移，并建立可维护的工程结构。
 
