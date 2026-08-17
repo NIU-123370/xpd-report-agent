@@ -8,6 +8,7 @@ Excel、CSV、Markdown、PDF、JSON 报告导出。
 
 | 场景 | 文档 |
 |---|---|
+| 系统架构总览 | [`docs/archs/system-overview.md`](docs/archs/system-overview.md) |
 | 生产 ACK / 云容器流水线部署 | [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md) |
 | 阿里云 ECS / Docker 测试与单机回退 | [`deploy/docker/README.md`](deploy/docker/README.md) |
 | 中台后端接入 5 个稳定接口 | [`docs/api/middle-platform-agent-api.md`](docs/api/middle-platform-agent-api.md) |
